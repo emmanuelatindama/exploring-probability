@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exploring Probability — when expected value lies to you</title>
+<meta name="description" content="Interactive simulations of multiplicative betting games: why a coin flip with positive expected value still ruins almost everyone who plays it.">
+
+<!-- Pinned so a CDN release can never change the page under us. -->
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+
+<style>
+  /* Palette: the dataviz reference instance, validated by lab/validate_palette.py.
+     Dark values are declared under BOTH scopes -- the media query covers the OS
+     setting, the [data-theme] scope covers the in-page toggle, and the toggle
+     must win either way. */
+  :root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --muted:          #898781;
+    --gridline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11, 11, 11, 0.10);
+    --series-1:       #2a78d6;  /* blue   — median / primary */
+    --series-2:       #eb6834;  /* orange — mean */
+    --series-3:       #1baf7a;  /* aqua   — reserved for a 3rd overlay */
+    --diverging-neg:  #e34948;  /* red    — the shrinking arm of the sweep */
+    --deemphasis:     #898781;
+    --cloud:          rgba(137, 135, 129, 0.30);
+    --ghost:          rgba(11, 11, 11, 0.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --muted:          #898781;
+      --gridline:       #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255, 255, 255, 0.10);
+      --series-1:       #3987e5;
+      --series-2:       #d95926;
+      --series-3:       #199e70;
+      --diverging-neg:  #e66767;
+      --deemphasis:     #898781;
+      --cloud:          rgba(137, 135, 129, 0.32);
+      --ghost:          rgba(255, 255, 255, 0.06);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --muted:          #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255, 255, 255, 0.10);
+    --series-1:       #3987e5;
+    --series-2:       #d95926;
+    --series-3:       #199e70;
+    --diverging-neg:  #e66767;
+    --deemphasis:     #898781;
+    --cloud:          rgba(137, 135, 129, 0.32);
+    --ghost:          rgba(255, 255, 255, 0.06);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--text-primary);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 24px 72px; }
+
+  /* -- header ------------------------------------------------------------- */
+  header.top { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 8px; }
+  header.top h1 {
+    margin: 0; font-size: 26px; font-weight: 600; letter-spacing: -0.01em; flex: 1;
+  }
+  .sub { color: var(--text-secondary); margin: 0 0 28px; max-width: 68ch; }
+
+  button.ghost {
+    background: transparent; color: var(--text-secondary);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 7px 12px; font: inherit; font-size: 13px; cursor: pointer;
+    min-height: 36px;
+  }
+  button.ghost:hover { background: var(--ghost); color: var(--text-primary); }
+  button.ghost:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+
+  /* -- scenario picker ---------------------------------------------------- */
+  nav.scenarios {
+    display: flex; flex-wrap: wrap; gap: 8px;
+    border-bottom: 1px solid var(--border); padding-bottom: 14px; margin-bottom: 20px;
+  }
+  nav.scenarios button {
+    background: transparent; border: 1px solid var(--border); border-radius: 999px;
+    padding: 7px 14px; font: inherit; font-size: 13px; cursor: pointer;
+    color: var(--text-secondary); min-height: 36px;
+  }
+  nav.scenarios button:hover { background: var(--ghost); }
+  nav.scenarios button[aria-selected="true"] {
+    background: var(--series-1); border-color: var(--series-1); color: #fff;
+  }
+  nav.scenarios button:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+  nav.scenarios button .soon { opacity: 0.7; font-size: 11px; margin-left: 6px; }
+
+  h2.scenario-title { margin: 0 0 6px; font-size: 20px; font-weight: 600; }
+  p.blurb { color: var(--text-secondary); margin: 0 0 24px; max-width: 72ch; }
+
+  /* -- one filter row, above everything it scopes ------------------------- */
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 18px 26px; align-items: flex-end;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px 18px; margin-bottom: 22px;
+  }
+  .ctl { display: flex; flex-direction: column; gap: 5px; min-width: 168px; }
+  .ctl label { font-size: 12px; color: var(--text-secondary); }
+  .ctl .val {
+    font-size: 13px; color: var(--text-primary); font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+  .ctl input[type="range"] { width: 100%; accent-color: var(--series-1); min-height: 24px; }
+  .ctl-actions { display: flex; gap: 8px; margin-left: auto; }
+
+  /* -- KPI row ------------------------------------------------------------ */
+  .tiles {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(196px, 1fr));
+    gap: 12px; margin-bottom: 24px;
+  }
+  .tile {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 14px 16px;
+  }
+  .tile .label { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
+  /* Proportional figures, not tabular: tabular-nums makes a big number look loose. */
+  .tile .value { font-size: 27px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.15; }
+  .tile .note { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  /* -- chart cards -------------------------------------------------------- */
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px; margin-bottom: 18px;
+  }
+  .card h3 { margin: 0 0 2px; font-size: 15px; font-weight: 600; }
+  .card .cap { margin: 0 0 14px; font-size: 12.5px; color: var(--text-secondary); }
+  /* Height includes the x-axis band, so the card never gets a nested scrollbar. */
+  .plot { width: 100%; height: 420px; }
+  .plot.short { height: 320px; }
+
+  /* HTML legend: line-keys mirroring the marks, never color-alone identity. */
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 12px 0 0; }
+  .legend .item {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 12.5px; color: var(--text-secondary);
+  }
+  .legend .key { width: 16px; height: 2px; border-radius: 1px; flex: none; }
+
+  .note {
+    color: var(--text-secondary); font-size: 14px; max-width: 74ch;
+    border-left: 2px solid var(--border); padding-left: 16px; margin: 22px 0 0;
+  }
+
+  /* -- table view (the WCAG-clean twin; every value reachable) ------------ */
+  details.table-view { margin-top: 14px; }
+  details.table-view summary {
+    cursor: pointer; font-size: 13px; color: var(--text-secondary);
+    padding: 6px 0; min-height: 24px;
+  }
+  details.table-view summary:hover { color: var(--text-primary); }
+  table {
+    border-collapse: collapse; width: 100%; margin-top: 10px; font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+  th:first-child, td:first-child { text-align: left; font-variant-numeric: normal; }
+  thead th { color: var(--text-secondary); font-weight: 500; }
+
+  .planned { color: var(--text-secondary); }
+  .planned .badge {
+    display: inline-block; font-size: 11px; color: var(--text-secondary);
+    border: 1px solid var(--border); border-radius: 999px; padding: 2px 9px;
+    margin-bottom: 12px;
+  }
+
+  footer {
+    margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--border);
+    font-size: 12.5px; color: var(--muted);
+  }
+  footer a { color: var(--text-secondary); }
+
+  .busy { opacity: 0.55; transition: opacity 120ms ease; }
+
+  @media (max-width: 640px) {
+    .wrap { padding: 22px 16px 56px; }
+    .plot { height: 340px; }
+    .ctl { min-width: 100%; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <h1>Exploring Probability</h1>
+    <button class="ghost" id="theme-toggle" type="button" aria-live="polite">Dark mode</button>
+  </header>
+  <p class="sub">
+    Multiplicative games where the average outcome and the typical outcome
+    disagree — and what that does to anyone who actually plays them.
+    Every figure below is simulated in your browser; nothing is precomputed.
+  </p>
+
+  <nav class="scenarios" id="picker" role="tablist" aria-label="Scenario"></nav>
+
+  <h2 class="scenario-title" id="sc-title"></h2>
+  <p class="blurb" id="sc-blurb"></p>
+
+  <div id="scenario-body"></div>
+
+  <footer>
+    Simulation and closed-form analytics in
+    <code>js/engine.js</code>, mirrored by <code>lab/analytics.py</code> and
+    cross-checked in <a href="tests.html">tests.html</a>.
+    Colour palette validated with <code>lab/validate_palette.py</code>.
+  </footer>
+
+</div>
+
+<script src="js/engine.js"></script>
+<script src="js/scenarios.js"></script>
+<script src="js/charts.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

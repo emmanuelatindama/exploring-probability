@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda activate web-dev)",
+      "Bash(conda run -n web-dev:*)",
+      "Bash(python lab/verify.py)",
+      "Bash(python lab/analytics.py)",
+      "Bash(python lab/validate_palette.py:*)",
+      "Bash(python -m http.server:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}
