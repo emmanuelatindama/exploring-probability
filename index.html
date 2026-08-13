@@ -27,10 +27,16 @@
     --series-1:       #2a78d6;  /* blue   — median / primary */
     --series-2:       #eb6834;  /* orange — mean */
     --series-3:       #1baf7a;  /* aqua   — reserved for a 3rd overlay */
+    --series-4:       #a01a6e;  /* magenta — 4th categorical slot */
     --diverging-neg:  #e34948;  /* red    — the shrinking arm of the sweep */
     --deemphasis:     #898781;
     --cloud:          rgba(137, 135, 129, 0.30);
     --ghost:          rgba(11, 11, 11, 0.04);
+    /* Label inks for text sitting *on* a filled mark (heatmap cells). Both are
+       declared in both modes: which one applies is a per-cell luminance
+       decision made in charts.js, not a theme decision. */
+    --ink-on-light:   #0b0b0b;
+    --ink-on-dark:    #ffffff;
   }
   @media (prefers-color-scheme: dark) {
     :root:where(:not([data-theme="light"])) {
@@ -46,10 +52,13 @@
       --series-1:       #3987e5;
       --series-2:       #d95926;
       --series-3:       #199e70;
+    --series-4:       #c026a8;
       --diverging-neg:  #e66767;
       --deemphasis:     #898781;
       --cloud:          rgba(137, 135, 129, 0.32);
       --ghost:          rgba(255, 255, 255, 0.06);
+    --ink-on-light:   #0b0b0b;
+    --ink-on-dark:    #ffffff;
     }
   }
   :root[data-theme="dark"] {
@@ -65,10 +74,13 @@
     --series-1:       #3987e5;
     --series-2:       #d95926;
     --series-3:       #199e70;
+    --series-4:       #c026a8;
     --diverging-neg:  #e66767;
     --deemphasis:     #898781;
     --cloud:          rgba(137, 135, 129, 0.32);
     --ghost:          rgba(255, 255, 255, 0.06);
+    --ink-on-light:   #0b0b0b;
+    --ink-on-dark:    #ffffff;
   }
 
   * { box-sizing: border-box; }
@@ -158,6 +170,22 @@
   /* Height includes the x-axis band, so the card never gets a nested scrollbar. */
   .plot { width: 100%; height: 420px; }
   .plot.short { height: 320px; }
+  .plot.tall { height: 500px; }
+
+  /* -- origin story ------------------------------------------------------- */
+  /* Set apart from the analysis: this is where the game comes from, not what
+     the numbers say. Measure held near 66ch, which is why it is not full width. */
+  aside.story {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-left: 2px solid var(--series-1);
+    border-radius: 12px; padding: 16px 20px; margin-bottom: 22px;
+    max-width: 76ch;
+  }
+  aside.story h3 {
+    margin: 0 0 6px; font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+  }
+  aside.story p { margin: 0; color: var(--text-secondary); font-size: 14.5px; }
 
   /* HTML legend: line-keys mirroring the marks, never color-alone identity. */
   .legend { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 12px 0 0; }

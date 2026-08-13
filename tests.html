@@ -158,6 +158,96 @@
     check(`path 1, round ${t}`, sim.paths[t], want, { relTol: 1e-12 });
   });
 
+  // -- 5. gambler's ruin ----------------------------------------------------
+  for (const c of G.ruin) {
+    const p = c.params;
+    group(`Gambler's ruin — $${p.bankroll} → $${p.target}, $${p.bet} bets, p=${p.p}`);
+    const got = EP.ruinSummary(p);
+    for (const key of Object.keys(c.expect)) {
+      const isProb = /Prob|Unbounded/.test(key);
+      check(key, got[key], c.expect[key],
+            isProb ? { absTol: 1e-12 } : { relTol: 1e-9 });
+    }
+    // Absorption is certain: the two exits must exhaust the probability.
+    check("ruin + reach = 1", got.ruinProb + got.reachProb, 1, { absTol: 1e-12 });
+  }
+
+  group("Seeded ruin walk — absorbing barriers must line up exactly");
+  const rcfg = G.ruinSim.config;
+  const rsim = EP.simulateRuin(rcfg);
+  check("k (start, in bets)", rsim.k, G.ruinSim.k, { exact: true });
+  check("n (target, in bets)", rsim.n, G.ruinSim.n, { exact: true });
+  G.ruinSim.terminal.forEach((want, i) => {
+    check(`walk ${i + 1} terminal`, rsim.terminal[i], want, { exact: true });
+  });
+  G.ruinSim.firstPath.forEach((want, t) => {
+    check(`walk 1, round ${t}`, rsim.paths[t], want, { exact: true });
+  });
+
+  // -- 6. St Petersburg -----------------------------------------------------
+  for (const c of G.stpete) {
+    const p = c.params;
+    group(`St Petersburg — p=${p.p}, m=${p.m}, cap ${p.tiers} tosses (m·p=${(p.m * p.p).toFixed(2)})`);
+    const got = EP.spSummary(p);
+    // The two tier-indexed values are not summary fields -- they are the
+    // per-tier functions the octave chart calls, so check them at their source.
+    const TIER_KEYS = { survival5: 1, contribution5: 1 };
+    for (const key of Object.keys(c.expect)) {
+      if (TIER_KEYS[key]) continue;
+      // `expected` is +Infinity for the divergent cases; check() handles that
+      // via its non-finite equality branch.
+      check(key, got[key], c.expect[key], { relTol: 1e-9 });
+    }
+    check("survival(tier 5)", EP.spSurvival(5, p.p), c.expect.survival5,
+          { relTol: 1e-9 });
+    check("tierContribution(tier 5)", EP.spTierContribution(5, p.p, p.m),
+          c.expect.contribution5, { relTol: 1e-9 });
+  }
+
+  group("Seeded St Petersburg play-out — payout draws must reproduce exactly");
+  const spcfg = G.stpeteSim.config;
+  const spsim = EP.simulateStPetersburg(spcfg);
+  G.stpeteSim.firstPayouts.forEach((want, i) => {
+    check(`payout ${i + 1}`, spsim.firstPayouts[i], want, { exact: true });
+  });
+  G.stpeteSim.means.forEach((want, i) => {
+    check(`run ${i + 1} mean over ${spcfg.plays} plays`, spsim.means[i], want,
+          { relTol: 1e-12 });
+  });
+
+  // -- 7. iterated prisoner's dilemma ---------------------------------------
+  for (const c of G.pd) {
+    const p = c.params;
+    group(`Prisoner's dilemma — ${p.rounds} rounds, T=${p.t}, noise=${p.noise}`);
+    const got = EP.pdSummary(p);
+    G.strategies.forEach((si, i) => {
+      G.strategies.forEach((sj, j) => {
+        check(`A[${si}][${sj}]`, got.matrix[i][j], c.expect.matrix[i][j],
+              { relTol: 1e-9 });
+      });
+    });
+    c.expect.scores.forEach((want, i) => {
+      check(`score ${G.strategies[i]}`, got.scores[i], want, { relTol: 1e-9 });
+    });
+    check("tournament winner", got.winner, c.expect.winner, { exact: true });
+    check("TFT vs ALLD", got.tftVsAlld, c.expect.tftVsAlld, { relTol: 1e-9 });
+    check("ALLD vs TFT", got.alldVsTft, c.expect.alldVsTft, { relTol: 1e-9 });
+    c.expect.finalShares.forEach((want, i) => {
+      check(`share after ${p.generations} gens — ${G.strategies[i]}`,
+            got.shares[got.shares.length - 1][i], want, { absTol: 1e-9 });
+    });
+    // The shares are a distribution at every generation, not just the last.
+    const drift = got.shares.reduce((worst, row) => {
+      const tot = row.reduce((a, b) => a + b, 0);
+      return Math.max(worst, Math.abs(tot - 1));
+    }, 0);
+    check("replicator shares sum to 1 (worst generation)", 1 + drift, 1,
+          { absTol: 1e-9 });
+    // The strategy order the page relies on must match the Python side's.
+    check("strategy order", EP.STRATEGIES.join(","), G.strategies.join(","),
+          { exact: true });
+  }
+
   // -- summary --------------------------------------------------------------
   const s = document.getElementById("summary");
   s.textContent = failed === 0

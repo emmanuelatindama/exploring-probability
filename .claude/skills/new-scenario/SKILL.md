@@ -74,13 +74,39 @@ profile directory.
 
 ### 4. Add the registry entry in `js/scenarios.js`
 
-Replace the `planned` stub with a full entry: `controls`, `fixed`, `charts`,
-`tiles`, `note`. Nothing outside this file knows the scenario list.
+Replace the `planned` stub with a full entry: `controls`, `fixed`, `compute`,
+`charts`, `tiles`, `note`, plus `derive` if any parameter is computed from
+another. Nothing outside this file knows the scenario list.
+
+- **Keep the `story`.** A planned stub already has one, and it carries over
+  unchanged — it is the reader's way in, and it is the same 100 words whether or
+  not the charts exist yet.
+- **`compute(params)` is the scenario's only call into the engine.** It returns
+  `{ stats, ...chart data }`; the chart forms read that by name. If a chart needs
+  something new, compute it there rather than reaching for the engine from
+  `charts.js`.
 
 - **Tiles carry the punchline.** Put the two numbers that disagree side by side.
 - **Label exactness.** If a tile is closed-form, its note should say so, because
   a chart's empirical version of the same quantity will differ.
 - **The note explains the mechanism**, not just the result.
+
+### 4b. The origin story
+
+Every entry carries a `story`, rendered above the controls, and it has a house
+style worth matching:
+
+- **Open with the hook, not the history.** A question the reader will get wrong,
+  or an offer that sounds good: *"Does a coin that pays +50% on heads and −40% on
+  tails sound like a good deal?"* The date and the names come second.
+- **Then the real provenance** — who posed it, when, and what they were actually
+  working on. These are checkable claims, so keep them checkable and do not
+  invent precision. "Around ten thousand readers" is right; a specific figure
+  presented as exact is not.
+- **Land on what it costs to misread it.** The story ends where the lesson
+  starts.
+- **100 words, hard limit.** Roughly 85–95 is the working range. It is one
+  paragraph in a card, not an essay.
 
 ### 5. Chart forms
 
@@ -89,16 +115,40 @@ a new form, pick it by the data's job (see the `dataviz` skill) before picking
 colour, and add it to `charts.js` reading colour from the CSS custom properties —
 never a literal hex.
 
-Guidance for the planned scenarios:
+Existing forms and what they are for: `trajectory` and `histogram` (log-scale
+wealth), `sweep` (a closed-form curve over one parameter with a meaningful zero,
+drawn in the diverging pair), `ruin-paths` (a linear-axis walk between reference
+lines), `ruin-curve` / `ruin-bet` (a probability against a parameter, with the
+reader's own position marked), `sp-mean` (the emphasis form: a cloud of runs with
+one highlighted), `sp-octaves` (a decomposition into per-outcome bars),
+`pd-scores` (ranked horizontal bars), `pd-matrix` (single-hue sequential heatmap
+with a label in every cell), `pd-shares` (stacked area, fixed slot order).
 
-- **Gambler's ruin** — additive, absorbing at 0. Hitting probability vs starting
-  bankroll is a line chart; the barrier deserves a reference line, not a series.
-- **St. Petersburg** — the point is non-convergence, so plot the running sample
-  mean against the number of plays on a log x-axis. Several independent runs as
-  a de-emphasised cloud, one highlighted: this is the emphasis form.
-- **Iterated prisoner's dilemma** — a payoff matrix is a heatmap (sequential, one
-  hue). Strategy shares over generations are a stacked area with categorical
-  slots in fixed order. Cumulative score per strategy is a bar chart.
+Guidance for the scenarios still marked `planned`:
+
+- **Monty Hall** — the whole mechanism is the host's knowledge, so the comparison
+  that matters is a knowing host against a random one. Two lines, not one.
+- **Parrondo's paradox** — three capital curves on one axis (A, B, and the
+  alternation). Nothing new is needed beyond a linear-axis line chart.
+- **Shannon's demon** — buy-and-hold against rebalancing on the *same* seeded
+  price path, plus a sweep over the rebalancing interval. Say out loud that the
+  effect needs trendless prices and zero costs, and reverses on a trend.
+- **Insurance and risk pooling** — the deliverable is the band of premiums where
+  *both* sides improve their growth rate, which is the thing expected value
+  cannot produce. That band is a shaded region between two closed-form curves.
+- **Base rates** — draw the same situation twice, as probabilities and as a grid
+  of a thousand people. The second framing is the intervention; demonstrate it
+  rather than asserting it.
+- **The birthday problem** — collision probability and the pair count belong on
+  the same chart, because the quadratic pair growth is the explanation.
+- **The secretary problem** — sweep the threshold; the flat optimum at 1/e is the
+  point, and so is how little a wrong threshold costs.
+- **The two-envelope paradox** — needs a real prior to be dissolved. Plot the
+  expected gain from swapping against what you found: positive low, negative
+  high, zero on average.
+- **Optional stopping** — this is the ruin picture again, with the p-value as the
+  walk and 0.05 as the barrier. Reuse `ruin-paths` if it fits rather than adding
+  a form, and end on the corrections, not on despair.
 
 ### 6. Check it renders
 
@@ -120,7 +170,8 @@ in plain dollars, legend present with the right key shape, table view populated.
 - [ ] `lab/verify.py` case added; `python lab/verify.py` passes
 - [ ] `js/golden.js` regenerated (do not hand-edit it)
 - [ ] `js/engine.js` mirrors the formulas; `tests.html` all green
-- [ ] Registry entry replaces the `planned` stub
+- [ ] Registry entry replaces the `planned` stub, `compute()` is its only engine call
+- [ ] `story` present, hook first, under 100 words, claims checkable
 - [ ] Charts read colour from CSS variables only
 - [ ] Legend + table view present for every chart
 - [ ] Screenshotted in light and dark, and actually looked at

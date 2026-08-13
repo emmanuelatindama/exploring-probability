@@ -35,9 +35,15 @@ window.EP = window.EP || {};
       s1: v("--series-1"),
       s2: v("--series-2"),
       s3: v("--series-3"),
+      s4: v("--series-4"),
       neg: v("--diverging-neg"),
       deemph: v("--deemphasis"),
       cloud: v("--cloud"),
+      // The two inks a filled mark can carry a label in. Which one applies is a
+      // luminance decision made per cell (see readableInk), but the values
+      // themselves still come from the stylesheet.
+      inkOnLight: v("--ink-on-light"),
+      inkOnDark: v("--ink-on-dark"),
     };
   }
 
@@ -399,14 +405,621 @@ window.EP = window.EP || {};
     return Plotly.react(el, data, layout, CONFIG);
   }
 
+  // ==========================================================================
+  // Gambler's ruin
+  // ==========================================================================
+  /**
+   * The walk itself: a linear-axis bankroll chart between two absorbing lines.
+   *
+   * Linear, unlike every wealth axis on the multiplicative tabs, and that is the
+   * point of the contrast -- this game moves by a fixed number of dollars, so a
+   * log axis would misrepresent the step size and squash the region near $0
+   * where all the interesting behaviour is.
+   *
+   * The barriers are reference lines in chrome ink rather than series: they are
+   * the rules of the game, not measurements taken from it.
+   */
+  function ruinWalks(el, d, pr) {
+    const t = theme();
+    const { sim, walk } = d;
+    const { paths, stride, nPaths, rounds, bet, n } = sim;
+    const drawn = Math.min(nPaths, RUIN_PATHS);
+    const xs = Array.from({ length: stride }, (_, k) => k);
+    const dollars = (arr) => Array.from(arr, (v) => v * bet);
+    const target = n * bet;
+
+    // No quantile bands here, deliberately, though the table view still carries
+    // the percentiles. Once absorption dominates, the 5th percentile is pinned
+    // at $0 and the 95th at the target, so the bands inflate to a solid block
+    // covering the whole board -- true, and completely uninformative. Individual
+    // walks are the readable form for an additive process: unlike the
+    // multiplicative tabs there is no binomial lattice in log space to moire, so
+    // a couple of dozen paths can be drawn without turning into texture.
+    const data = [];
+
+    for (let i = 0; i < drawn; i++) {
+      const base = i * stride;
+      const y = new Array(stride);
+      for (let k = 0; k < stride; k++) y[k] = paths[base + k] * bet;
+      data.push({
+        x: xs, y, type: "scatter", mode: "lines",
+        line: { color: t.cloud, width: 1 },
+        hoverinfo: "skip", showlegend: false,
+      });
+    }
+
+    data.push({
+      x: xs, y: dollars(walk.median), type: "scatter", mode: "lines",
+      line: { color: t.s1, width: 2 },
+      name: "Median player",
+      hovertemplate: "<b>%{y:$,.0f}</b>  median<extra></extra>",
+    });
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Round", font: { color: t.textSecondary, size: 12 } },
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "Bankroll", font: { color: t.textSecondary, size: 12 } },
+        tickprefix: "$", tickformat: ",d",
+        // Both barriers always visible, with a little air above the target so
+        // its label is not clipped by the plot edge.
+        range: [-target * 0.04, target * 1.08],
+      }),
+      hovermode: "x unified",
+      shapes: [
+        // $0 and the target: absorbing, so a path that touches either stops.
+        { type: "line", xref: "paper", x0: 0, x1: 1, yref: "y", y0: 0, y1: 0,
+          line: { color: t.neg, width: 1 }, layer: "below" },
+        { type: "line", xref: "paper", x0: 0, x1: 1, yref: "y",
+          y0: target, y1: target,
+          line: { color: t.s3, width: 1 }, layer: "below" },
+        { type: "line", xref: "paper", x0: 0, x1: 1, yref: "y",
+          y0: pr.bankroll, y1: pr.bankroll,
+          line: { color: t.axis, width: 1 }, layer: "below" },
+      ],
+      annotations: [
+        { x: 0, y: 0, xref: "paper", yref: "y", text: "broke — absorbing",
+          showarrow: false, xanchor: "left", yanchor: "bottom", xshift: 4,
+          font: { family: FONT, size: 11, color: t.textPrimary },
+          bgcolor: t.surface, borderpad: 3 },
+        { x: 0, y: target, xref: "paper", yref: "y",
+          text: `target ${EP.fmt.money(target)} — absorbing`,
+          showarrow: false, xanchor: "left", yanchor: "top", xshift: 4,
+          font: { family: FONT, size: 11, color: t.textPrimary },
+          bgcolor: t.surface, borderpad: 3 },
+        { x: rounds, y: 0.02, xref: "x", yref: "paper",
+          text: `${EP.fmt.pct(sim.ruined / sim.nPaths)} of these ` +
+                `${EP.fmt.count(sim.nPaths)} players went broke`,
+          showarrow: false, xanchor: "right", yanchor: "bottom",
+          font: { family: FONT, size: 11, color: t.textSecondary },
+          bgcolor: t.surface, borderpad: 3 },
+      ],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /** Individual walks drawn on the ruin chart. Many more than the multiplicative
+   *  tabs get: an additive walk does not sit on a lattice that moires, and the
+   *  pile-up of absorbed paths along each wall is the picture. */
+  const RUIN_PATHS = 24;
+
+  /**
+   * P(ruin) against starting bankroll, closed form.
+   *
+   * Two series: the game as configured, and the same board with a fair coin, so
+   * the vertical gap between them is what the house edge is worth. The player's
+   * own position is a marker with a direct label rather than a third series.
+   */
+  function ruinOdds(el, d, pr) {
+    const t = theme();
+    const { curve, stats } = d;
+    const xs = curve.ks.map((k) => k * curve.bet);
+    const fair = curve.ks.map((k) =>
+      k === 0 ? 1 : k === curve.n ? 0 : 1 - k / curve.n);
+
+    const data = [
+      { x: xs, y: fair, type: "scatter", mode: "lines",
+        line: { color: t.deemph, width: 1 },
+        name: "Fair coin",
+        hovertemplate: "<b>%{y:.1%}</b> with a fair coin<extra></extra>" },
+      { x: xs, y: curve.ruin, type: "scatter", mode: "lines",
+        line: { color: t.s1, width: 2 },
+        name: "This coin",
+        hovertemplate: "<b>%{y:.1%}</b> chance of ruin<extra></extra>" },
+      { x: [pr.bankroll], y: [stats.ruinProb], type: "scatter", mode: "markers",
+        marker: { color: t.s1, size: 9, line: { color: t.surface, width: 2 } },
+        name: "You",
+        hovertemplate: "<b>you: %{y:.1%}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: {
+          text: "Starting bankroll",
+          font: { color: t.textSecondary, size: 12 },
+        },
+        tickprefix: "$", tickformat: ",d",
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: {
+          text: "Chance of going broke first",
+          font: { color: t.textSecondary, size: 12 },
+        },
+        tickformat: ".0%", range: [0, 1.02],
+      }),
+      hovermode: "x unified",
+      annotations: [
+        { x: pr.bankroll, y: stats.ruinProb,
+          text: `you: ${EP.fmt.pct(stats.ruinProb)}`,
+          showarrow: false, xanchor: "left", yanchor: "bottom",
+          xshift: 8, yshift: 4,
+          font: { family: FONT, size: 11, color: t.textPrimary },
+          bgcolor: t.surface, borderpad: 3 },
+      ],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /**
+   * P(ruin) against bet size -- the bold-play curve.
+   *
+   * The direction of this curve flips with the sign of the edge, so it is drawn
+   * in the diverging pair: red where betting bigger is safer (the edge is
+   * against you) and blue where patience pays. Colour here encodes which lesson
+   * applies, and the annotation names it in words as well.
+   */
+  function ruinBoldness(el, d, pr) {
+    const t = theme();
+    const { betCurve, stats } = d;
+    const adverse = pr.p < 0.5;
+    const color = adverse ? t.neg : t.s1;
+
+    const data = [
+      { x: betCurve.sizes, y: betCurve.ruin, type: "scatter", mode: "lines",
+        line: { color, width: 2 },
+        fill: "tozeroy", fillcolor: hexA(color, 0.1),
+        name: "Chance of ruin",
+        hovertemplate: "<b>%{y:.1%}</b> ruin at %{x:$,.0f} a round<extra></extra>" },
+      { x: [pr.bet], y: [stats.ruinProb], type: "scatter", mode: "markers",
+        marker: { color, size: 9, line: { color: t.surface, width: 2 } },
+        name: "Your bet",
+        hovertemplate: "<b>your bet: %{y:.1%}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: {
+          text: "Bet per round",
+          font: { color: t.textSecondary, size: 12 },
+        },
+        tickprefix: "$", tickformat: ",d",
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: {
+          text: "Chance of going broke first",
+          font: { color: t.textSecondary, size: 12 },
+        },
+        tickformat: ".0%", rangemode: "tozero",
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", x0: pr.bet, x1: pr.bet, yref: "paper", y0: 0, y1: 1,
+        line: { color: t.muted, width: 1 }, layer: "below",
+      }],
+      annotations: [
+        { x: pr.bet, y: 0, yref: "paper", text: "your bet",
+          showarrow: false, xanchor: "center", yanchor: "bottom", yshift: 2,
+          font: { family: FONT, size: 11, color: t.muted },
+          bgcolor: t.surface, borderpad: 2 },
+        { x: 1, y: 1, xref: "paper", yref: "paper",
+          text: adverse
+            ? "edge against you — bolder is safer"
+            : "edge in your favour — patience is safer",
+          showarrow: false, xanchor: "right", yanchor: "top",
+          font: { family: FONT, size: 11, color: t.textPrimary },
+          bgcolor: t.surface, borderpad: 4 },
+      ],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  // ==========================================================================
+  // St Petersburg
+  // ==========================================================================
+  /**
+   * Running average payout against games played, log-log.
+   *
+   * This is the emphasis form: every player is drawn, one is highlighted, and a
+   * reference line marks where the average is expected to be loitering. Log x
+   * because the interesting structure is per decade of play, log y because a
+   * single deep run can move the average by orders of magnitude -- which is
+   * exactly the behaviour on show.
+   */
+  function spRunningMean(el, d, pr) {
+    const t = theme();
+    const { sim, stats } = d;
+    const xs = sim.xs;
+
+    // The cloud is one trace with null separators, not one trace per run: the
+    // legend is written by hand anyway and 24 traces would slow the redraw.
+    const cx = [], cy = [];
+    for (let r = 1; r < sim.curves.length; r++) {
+      for (let i = 0; i < xs.length; i++) {
+        cx.push(xs[i]);
+        cy.push(clampFloor(sim.curves[r][i]));
+      }
+      cx.push(null); cy.push(null);
+    }
+
+    const lead = Array.from(sim.curves[0], clampFloor);
+    let yLo = Infinity, yHi = -Infinity;
+    for (const c of sim.curves) {
+      for (let i = 0; i < xs.length; i++) {
+        const v = clampFloor(c[i]);
+        if (v < yLo) yLo = v;
+        if (v > yHi) yHi = v;
+      }
+    }
+    yHi = Math.max(yHi, stats.typicalMean);
+    yLo = Math.min(yLo, stats.median);
+
+    const data = [
+      { x: cx, y: cy, type: "scatter", mode: "lines",
+        line: { color: t.cloud, width: 1 },
+        hoverinfo: "skip", showlegend: false },
+      { x: xs, y: xs.map(() => stats.typicalMean), type: "scatter", mode: "lines",
+        line: { color: t.s2, width: 2 },
+        name: "Where it loiters",
+        hovertemplate: `<b>${EP.fmt.money(stats.typicalMean)}</b> predicted<extra></extra>` },
+      { x: xs, y: lead, type: "scatter", mode: "lines",
+        line: { color: t.s1, width: 2 },
+        name: "One player",
+        hovertemplate: "<b>%{y:$,.2f}</b> average so far<extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, Object.assign({
+        type: "log",
+        title: {
+          text: "Games played (log scale)",
+          font: { color: t.textSecondary, size: 12 },
+        },
+      }, plainDecadeTicks(1, pr.plays))),
+      yaxis: axis(t, Object.assign({
+        type: "log",
+        title: {
+          text: "Average payout so far (log scale)",
+          font: { color: t.textSecondary, size: 12 },
+        },
+      }, decadeTicks(yLo, yHi, true))),
+      hovermode: "x unified",
+      annotations: [{
+        x: Math.log10(pr.plays), y: Math.log10(clampFloor(stats.typicalMean)),
+        text: `predicted ${EP.fmt.money(stats.typicalMean)}`,
+        showarrow: false, xanchor: "right", yanchor: "bottom",
+        font: { family: FONT, size: 11, color: t.textPrimary },
+        bgcolor: t.surface, borderpad: 3,
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /**
+   * Each outcome's contribution to the expected payout.
+   *
+   * The paradox, drawn. Bar height is payout times probability, so a flat row of
+   * bars is a divergent series: every further toss doubles the prize and halves
+   * the odds, and the two cancel forever. One series, one colour.
+   */
+  function spContributions(el, d, pr) {
+    const t = theme();
+    const { tiers, stats } = d;
+
+    const data = [{
+      x: tiers.map((r) => r.tier),
+      y: tiers.map((r) => r.contribution),
+      type: "bar",
+      marker: { color: t.s1 },
+      hovertemplate:
+        "<b>%{customdata[0]}</b> toward the expected value<br>" +
+        "pays %{customdata[1]}, happens %{customdata[2]} of the time<extra></extra>",
+      customdata: tiers.map((r) => [
+        EP.fmt.money(r.contribution), EP.fmt.money(r.payout),
+        `${(r.prob * 100).toFixed(r.prob < 0.001 ? 4 : 2)}%`,
+      ]),
+    }];
+
+    const layout = baseLayout(t, {
+      // 2px of surface between bars, per the mark spec.
+      bargap: 0.18,
+      xaxis: axis(t, {
+        title: {
+          text: "Tosses before the coin fails",
+          font: { color: t.textSecondary, size: 12 },
+        },
+        tickmode: "linear", dtick: tiers.length > 12 ? 2 : 1,
+        showgrid: false,
+      }),
+      yaxis: axis(t, {
+        title: {
+          text: "Contribution to expected payout",
+          font: { color: t.textSecondary, size: 12 },
+        },
+        tickprefix: "$", tickformat: ",.2f", rangemode: "tozero",
+      }),
+      hovermode: "closest",
+      annotations: [{
+        x: 1, y: 1, xref: "paper", yref: "paper",
+        text: stats.divergent
+          ? `m·p = ${EP.fmt.num(stats.mp)} — the bars never shrink, so the sum never ends`
+          : `m·p = ${EP.fmt.num(stats.mp)} — the bars shrink, so the sum converges to ${EP.fmt.money(stats.expected)}`,
+        showarrow: false, xanchor: "right", yanchor: "top",
+        font: { family: FONT, size: 11, color: t.textPrimary },
+        bgcolor: t.surface, borderpad: 4,
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /**
+   * Plain-integer decade ticks, for a count axis rather than a money axis.
+   *
+   * The range stops at the data rather than at the next whole decade -- 20,000
+   * games would otherwise leave a third of the axis empty out to 100,000. Ticks
+   * are still on whole decades, so the last one can sit inside the range.
+   * `tickvals` in data units, `range` in log10: Plotly's two conventions.
+   */
+  function plainDecadeTicks(lo, hi) {
+    const dLo = Math.floor(Math.log10(Math.max(lo, 1)));
+    const dHi = Math.floor(Math.log10(Math.max(hi, 10)));
+    const tickvals = [], ticktext = [];
+    for (let dd = dLo; dd <= dHi; dd++) {
+      tickvals.push(Math.pow(10, dd));
+      ticktext.push(Math.pow(10, dd).toLocaleString("en-US"));
+    }
+    return {
+      tickmode: "array", tickvals, ticktext,
+      range: [dLo, Math.log10(Math.max(hi, 10))],
+    };
+  }
+
+  // ==========================================================================
+  // Iterated prisoner's dilemma
+  // ==========================================================================
+  /** Fixed colour per strategy, so identity survives across all three charts.
+   *
+   *  Four validated categorical slots plus the neutral ink for the random
+   *  player, which is the honest slot for it: it is the null baseline, not a
+   *  strategy with a position to defend. */
+  function strategyColors(t) {
+    return { tft: t.s1, grim: t.s4, allc: t.s3, alld: t.s2, rand: t.deemph };
+  }
+
+  /**
+   * Score per strategy, horizontal bars.
+   *
+   * Horizontal because the category labels are words, and sorted by value
+   * because rank is the question the chart answers. One measure, one colour --
+   * except that colour is already spoken for by strategy identity here, so each
+   * bar keeps its own.
+   */
+  function pdScores(el, d) {
+    const t = theme();
+    const cols = strategyColors(t);
+    const rows = EP.STRATEGIES
+      .map((id, i) => ({ id, score: d.stats.scores[i] }))
+      .sort((a, b) => a.score - b.score); // ascending: Plotly draws bottom-up
+
+    const data = [{
+      x: rows.map((r) => r.score),
+      y: rows.map((r) => EP.STRATEGY_LABELS[r.id]),
+      type: "bar", orientation: "h",
+      marker: { color: rows.map((r) => cols[r.id]) },
+      text: rows.map((r) => EP.fmt.num(r.score)),
+      textposition: "outside",
+      textfont: { family: FONT, size: 11, color: t.textPrimary },
+      cliponaxis: false,
+      hovertemplate: "<b>%{x:.3f}</b> per round<br>%{customdata}<extra></extra>",
+      customdata: rows.map((r) => EP.STRATEGY_NOTES[r.id]),
+    }];
+
+    const layout = baseLayout(t, {
+      margin: { l: 148, r: 48, t: 8, b: 48 },
+      bargap: 0.28,
+      xaxis: axis(t, {
+        title: {
+          text: "Average points per round, whole tournament",
+          font: { color: t.textSecondary, size: 12 },
+        },
+        rangemode: "tozero",
+      }),
+      yaxis: axis(t, { showgrid: false, ticks: "" }),
+      hovermode: "closest",
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /**
+   * The pairwise payoff matrix, as a heatmap.
+   *
+   * Sequential single hue built from the theme's own surface and primary, so it
+   * inverts correctly with the mode instead of being a fixed Plotly colorscale.
+   * Every cell carries its number, which is what makes the low-contrast end of
+   * the ramp acceptable -- colour is the ordering cue, the label is the value.
+   */
+  function pdHeatmap(el, d) {
+    const t = theme();
+    const labels = EP.STRATEGIES.map((s) => EP.STRATEGY_LABELS[s]);
+    const z = d.stats.matrix;
+    let lo = Infinity, hi = -Infinity;
+    for (const row of z) for (const v of row) {
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    const span = hi - lo || 1;
+
+    const data = [{
+      z, x: labels, y: labels,
+      type: "heatmap",
+      colorscale: [[0, hexA(t.s1, 0.08)], [1, t.s1]],
+      showscale: false,
+      xgap: 2, ygap: 2, // the 2px surface gap, same as the bar charts
+      hovertemplate:
+        "<b>%{y}</b> vs <b>%{x}</b><br>%{z:.3f} points per round<extra></extra>",
+    }];
+
+    // Direct labels in every cell. Ink is chosen from the interpolated cell
+    // colour's luminance, so it stays legible at both ends of the ramp and in
+    // both themes -- the two ink values come from CSS, never hardcoded here.
+    const annotations = [];
+    for (let i = 0; i < z.length; i++) {
+      for (let j = 0; j < z[i].length; j++) {
+        const frac = (z[i][j] - lo) / span;
+        const cell = mixHex(t.surface, t.s1, 0.08 + 0.92 * frac);
+        annotations.push({
+          x: labels[j], y: labels[i], text: EP.fmt.num(z[i][j]),
+          showarrow: false,
+          font: { family: FONT, size: 11, color: readableInk(cell, t) },
+        });
+      }
+    }
+
+    const layout = baseLayout(t, {
+      margin: { l: 148, r: 24, t: 8, b: 132 },
+      xaxis: axis(t, {
+        // standoff clears the rotated tick labels; without it the axis title
+        // lands in the middle of them.
+        title: { text: "…against this strategy", standoff: 34,
+                 font: { color: t.textSecondary, size: 12 } },
+        showgrid: false, ticks: "", tickangle: -30,
+      }),
+      yaxis: axis(t, {
+        title: { text: "This strategy scores…",
+                 font: { color: t.textSecondary, size: 12 } },
+        showgrid: false, ticks: "", autorange: "reversed",
+      }),
+      annotations,
+      hovermode: "closest",
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /**
+   * Strategy shares over generations, stacked area.
+   *
+   * Stacked because the five shares are parts of a whole that always sums to
+   * one; fixed slot order so a strategy keeps its colour and its band position
+   * as the mix changes. Direct labels at the right edge for whichever strategies
+   * still hold enough of the population to label.
+   */
+  function pdShares(el, d, pr) {
+    const t = theme();
+    const cols = strategyColors(t);
+    const hist = d.stats.shares;
+    const gens = hist.map((_, g) => g);
+
+    const data = EP.STRATEGIES.map((id, i) => ({
+      x: gens,
+      y: hist.map((row) => row[i]),
+      type: "scatter", mode: "lines",
+      stackgroup: "one",
+      line: { color: cols[id], width: 1 },
+      fillcolor: hexA(cols[id], 0.85),
+      name: EP.STRATEGY_LABELS[id],
+      hovertemplate: `<b>%{y:.1%}</b> ${EP.STRATEGY_LABELS[id]}<extra></extra>`,
+    }));
+
+    // Label position is the middle of each band at the last generation, so the
+    // labels sit on the thing they name. A band too thin to hold a label, or one
+    // whose label would land on top of the last one drawn, is left to the legend
+    // and the table view rather than allowed to collide.
+    const final = hist[hist.length - 1];
+    const annotations = [];
+    let acc = 0, lastY = -Infinity;
+    EP.STRATEGIES.forEach((id, i) => {
+      const share = final[i];
+      const mid = acc + share / 2;
+      acc += share;
+      if (share < 0.06 || mid - lastY < 0.07) return;
+      lastY = mid;
+      annotations.push({
+        x: gens[gens.length - 1], y: mid,
+        text: `${EP.STRATEGY_LABELS[id]} ${EP.fmt.pct(share)}`,
+        showarrow: false, xanchor: "right", xshift: -6,
+        font: { family: FONT, size: 11, color: t.textPrimary },
+        bgcolor: t.surface, borderpad: 3,
+      });
+    });
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Generation", font: { color: t.textSecondary, size: 12 } },
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: {
+          text: "Share of the population",
+          font: { color: t.textSecondary, size: 12 },
+        },
+        tickformat: ".0%", range: [0, 1], showgrid: false,
+      }),
+      hovermode: "x unified",
+      annotations,
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  // -- colour helpers --------------------------------------------------------
   /** rgba() from a hex the browser resolved for us, for 10% area washes. */
   function hexA(hex, alpha) {
-    const h = hex.replace("#", "");
-    const n = h.length === 3
-      ? h.split("").map((c) => parseInt(c + c, 16))
-      : [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+    const n = rgbOf(hex);
     return `rgba(${n[0]},${n[1]},${n[2]},${alpha})`;
   }
 
-  Object.assign(EP, { trajectory, histogram, sweep, theme, FLOOR, SAMPLE_PATHS });
+  function rgbOf(hex) {
+    const h = hex.replace("#", "").trim();
+    return h.length === 3
+      ? h.split("").map((c) => parseInt(c + c, 16))
+      : [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+  }
+
+  /** Linear blend of two hexes, for previewing a point on a colorscale. */
+  function mixHex(a, b, tt) {
+    const x = rgbOf(a), y = rgbOf(b);
+    const mix = x.map((v, i) => Math.round(v + (y[i] - v) * tt));
+    return `#${mix.map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+  }
+
+  /** Whichever of the theme's two ink values reads on this background. */
+  function readableInk(bg, t) {
+    const [r, g, b] = rgbOf(bg).map((v) => {
+      const c = v / 255;
+      return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    });
+    const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    // 0.18 is where the two candidate inks cross over on contrast ratio.
+    return lum > 0.18 ? t.inkOnLight : t.inkOnDark;
+  }
+
+  Object.assign(EP, {
+    trajectory, histogram, sweep, theme, FLOOR, SAMPLE_PATHS, RUIN_PATHS,
+    ruinWalks, ruinOdds, ruinBoldness, spRunningMean, spContributions,
+    pdScores, pdHeatmap, pdShares, strategyColors,
+  });
 })(window.EP);

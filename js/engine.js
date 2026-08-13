@@ -286,11 +286,452 @@ window.EP = window.EP || {};
     return { fs, g, fStar: kellyFraction(p, up, down) };
   }
 
+  // ==========================================================================
+  // Gambler's ruin -- mirrors lab/analytics.py section 2
+  // ==========================================================================
+  /** `amount` as a whole number of bets, at least one.
+   *
+   *  Math.round matches the Python side's floor(x + 0.5) deliberately: Python's
+   *  round() is banker's rounding and would disagree on exact .5 ties. */
+  function bets(amount, bet) {
+    return Math.max(1, Math.round(amount / Math.max(bet, 1e-12)));
+  }
+
+  /** [k, n]: start and target in whole bets, clamped so 0 < k < n. */
+  function ruinUnits(bankroll, target, bet) {
+    const k = bets(bankroll, bet);
+    return [k, Math.max(k + 1, bets(target, bet))];
+  }
+
+  /**
+   * P(hit 0 before n) for a walk starting at k. The exact core.
+   *
+   * The r > 1 branch is algebraically rearranged to use only negative powers of
+   * r; written directly, r^n overflows for a long unfavourable walk and the
+   * ratio of two infinities is NaN where the true answer is ~1.
+   *
+   * Taking (k, n) rather than dollars is what lets the bet-size sweep stay
+   * exact -- see ruinBetCurve.
+   */
+  function ruinProbUnits(k, n, p) {
+    if (p <= 0) return 1;
+    if (p >= 1) return 0;
+    if (Math.abs(p - 0.5) < 1e-15) return 1 - k / n;
+    const r = (1 - p) / p;
+    if (r > 1) return (1 - Math.pow(r, k - n)) / (1 - Math.pow(r, -n));
+    return (Math.pow(r, k) - Math.pow(r, n)) / (1 - Math.pow(r, n));
+  }
+
+  /** P(hit $0 before the target), in dollars. Exact. */
+  function ruinProb(bankroll, target, p, bet) {
+    const [k, n] = ruinUnits(bankroll, target, bet);
+    return ruinProbUnits(k, n, p);
+  }
+
+  const reachTargetProb = (bankroll, target, p, bet) =>
+    1 - ruinProb(bankroll, target, p, bet);
+
+  /** P(eventual ruin) with no target, against a house with unlimited money. */
+  function ruinProbUnbounded(bankroll, p, bet) {
+    if (p <= 0.5) return 1;
+    return Math.pow((1 - p) / p, bets(bankroll, bet));
+  }
+
+  /** E[steps until either barrier is hit] for a walk starting at k. Exact. */
+  function ruinDurationUnits(k, n, p) {
+    if (p <= 0) return k;
+    if (p >= 1) return n - k;
+    if (Math.abs(p - 0.5) < 1e-15) return k * (n - k);
+    const r = (1 - p) / p, q = 1 - p;
+    const ratio = r > 1
+      ? (Math.pow(r, k - n) - Math.pow(r, -n)) / (1 - Math.pow(r, -n))
+      : (1 - Math.pow(r, k)) / (1 - Math.pow(r, n));
+    return (k - n * ratio) / (q - p);
+  }
+
+  /** E[rounds until one barrier is hit], in dollars. Exact. */
+  function ruinDuration(bankroll, target, p, bet) {
+    const [k, n] = ruinUnits(bankroll, target, bet);
+    return ruinDurationUnits(k, n, p);
+  }
+
+  function ruinSummary(pr) {
+    const { bankroll, target, p, bet } = pr;
+    const [k, n] = ruinUnits(bankroll, target, bet);
+    return {
+      k, n,
+      ruinProb: ruinProb(bankroll, target, p, bet),
+      reachProb: reachTargetProb(bankroll, target, p, bet),
+      duration: ruinDuration(bankroll, target, p, bet),
+      ruinUnbounded: ruinProbUnbounded(bankroll, p, bet),
+      fairRuinProb: ruinProb(bankroll, target, 0.5, bet),
+      edge: 2 * p - 1,
+    };
+  }
+
+  /** P(ruin) against starting bankroll, in bets, across the whole board. */
+  function ruinCurve(pr, maxPoints) {
+    const { target, p, bet } = pr;
+    const n = Math.max(2, bets(target, bet));
+    const step = Math.max(1, Math.ceil(n / (maxPoints || n)));
+    const ks = [], ruin = [];
+    for (let k = 0; k <= n; k += step) {
+      ks.push(k);
+      ruin.push(k === 0 ? 1 : k === n ? 0 : ruinProb(k * bet, n * bet, p, bet));
+    }
+    if (ks[ks.length - 1] !== n) { ks.push(n); ruin.push(0); }
+    return { ks, ruin, n, bet };
+  }
+
+  /**
+   * P(ruin) against bet size -- the bold-play curve.
+   *
+   * For an unfavourable coin this falls as the bet grows: each extra round is
+   * another chance for the edge to bite, so the way to survive a bad game is to
+   * play it as few times as possible. A favourable coin reverses it.
+   */
+  function ruinBetCurve(pr, steps) {
+    const { bankroll, target, p } = pr;
+    // Swept over the integer number of bets the bankroll is worth, not over
+    // dollar bet sizes. A dollar sweep divides and rounds twice -- once for k,
+    // once for n -- and the two roundings beat against each other, printing a
+    // sawtooth on a curve that is genuinely smooth. Here k is exact by
+    // construction and only the target rounds.
+    const goal = target / Math.max(bankroll, 1e-12);
+    const top = Math.max(2, Math.round(bankroll));
+    const stride = Math.max(1, Math.ceil((top - 1) / (steps || top)));
+    const sizes = [], ruin = [];
+    for (let k = top; k >= 2; k -= stride) { // descending k, ascending bet size
+      const n = Math.max(k + 1, Math.round(k * goal));
+      sizes.push(bankroll / k);
+      ruin.push(ruinProbUnits(k, n, p));
+    }
+    // The boldest playable bet -- half the bankroll -- is the end of the story,
+    // so it is never allowed to fall off the end of a strided sweep.
+    if (sizes[sizes.length - 1] !== bankroll / 2) {
+      sizes.push(bankroll / 2);
+      ruin.push(ruinProbUnits(2, Math.max(3, Math.round(2 * goal)), p));
+    }
+    return { sizes, ruin };
+  }
+
+  /**
+   * Random walk with both barriers absorbing, in units of one bet.
+   *
+   * Draws exactly one number per live round and none once absorbed, matching
+   * lab/analytics.py:simulate_ruin so the seeded paths agree bit for bit.
+   */
+  function simulateRuin(pr) {
+    const { bankroll, target, p, bet, rounds, nPaths, seed } = pr;
+    const [k, n] = ruinUnits(bankroll, target, bet);
+    const rand = mulberry32(seed);
+    const stride = rounds + 1;
+    const paths = new Float64Array(nPaths * stride);
+    const terminal = new Float64Array(nPaths);
+    let ruined = 0, reached = 0;
+    // Absorption round per path, or -1 for the ones still walking at the end.
+    const absorbedAt = new Int32Array(nPaths).fill(-1);
+
+    for (let i = 0; i < nPaths; i++) {
+      const base = i * stride;
+      let x = k;
+      paths[base] = x;
+      for (let t = 1; t <= rounds; t++) {
+        if (x > 0 && x < n) {
+          x += rand() < p ? 1 : -1;
+          if ((x <= 0 || x >= n) && absorbedAt[i] < 0) absorbedAt[i] = t;
+        }
+        paths[base + t] = x;
+      }
+      terminal[i] = x;
+      if (x <= 0) ruined++;
+      else if (x >= n) reached++;
+    }
+    return {
+      paths, terminal, stride, nPaths, rounds, k, n, bet, absorbedAt,
+      ruined, reached, undecided: nPaths - ruined - reached,
+    };
+  }
+
+  // ==========================================================================
+  // St Petersburg -- mirrors lab/analytics.py section 3
+  // ==========================================================================
+  /** E[payout] = (1-p)/(1-mp), or Infinity once m*p >= 1. Exact. */
+  function spExpected(p, m) {
+    if (m * p >= 1) return Infinity;
+    return (1 - p) / (1 - m * p);
+  }
+
+  /** Exact q-quantile of the payout: the payout is monotone in the toss count. */
+  function spQuantile(q, p, m) {
+    if (p <= 0) return 1;
+    const n = Math.max(1, Math.ceil(Math.log1p(-q) / Math.log(p)));
+    return Math.pow(m, n - 1);
+  }
+
+  const spMedian = (p, m) => spQuantile(0.5, p, m);
+
+  /** P(payout >= m^(tier-1)) = p^(tier-1). Exact. */
+  const spSurvival = (tier, p) => Math.pow(p, Math.max(1, tier) - 1);
+
+  /** This tier's share of E[payout]: (1-p)(mp)^(tier-1). Flat iff m*p = 1. */
+  const spTierContribution = (tier, p, m) =>
+    (1 - p) * Math.pow(m * p, Math.max(1, tier) - 1);
+
+  const spCapAmount = (m, tiers) => Math.pow(m, Math.max(1, tiers) - 1);
+
+  /** E[payout] when the house pays at most m^(tiers-1). Exact. */
+  function spCappedExpected(p, m, tiers) {
+    const L = Math.max(1, Math.round(tiers));
+    const x = m * p;
+    const geo = Math.abs(x - 1) < 1e-15 ? L : (1 - Math.pow(x, L)) / (1 - x);
+    return (1 - p) * geo + Math.pow(p, L) * Math.pow(m, L - 1);
+  }
+
+  /** APPROXIMATION -- see the docstring in lab/analytics.py:sp_typical_mean. */
+  function spTypicalMean(plays, p, m) {
+    if (plays < 1 || p <= 0 || p >= 1) return spCappedExpected(p, m, 1);
+    const L = Math.floor(Math.log(plays) / Math.log(1 / p)) + 1;
+    return spCappedExpected(p, m, Math.max(1, L));
+  }
+
+  function spSummary(pr) {
+    const { p, m, tiers, plays } = pr;
+    return {
+      expected: spExpected(p, m),
+      median: spMedian(p, m),
+      q95: spQuantile(0.95, p, m),
+      capped: spCappedExpected(p, m, tiers),
+      capAmount: spCapAmount(m, tiers),
+      typicalMean: spTypicalMean(plays, p, m),
+      divergent: m * p >= 1,
+      mp: m * p,
+    };
+  }
+
+  /**
+   * Play the game out: `runs` independent players, `plays` games each.
+   *
+   * One random number per toss, matching the Python reference's draw order.
+   * Running means are sampled at log-spaced plays because that is the axis the
+   * chart uses -- keeping all `plays` points per run would be tens of millions
+   * of numbers to plot a line that is smooth in log x anyway.
+   */
+  function simulateStPetersburg(pr) {
+    const { runs, plays, p, m, seed } = pr;
+    const rand = mulberry32(seed);
+    const xs = logSpacedIndices(plays, 140);
+    const curves = [], means = [], firstPayouts = [];
+    let biggest = 0, longest = 0;
+
+    for (let r = 0; r < runs; r++) {
+      let total = 0, at = 0;
+      const curve = new Float64Array(xs.length);
+      for (let i = 0; i < plays; i++) {
+        let tosses = 1;
+        while (rand() < p) tosses++;
+        const payout = Math.pow(m, tosses - 1);
+        total += payout;
+        if (payout > biggest) biggest = payout;
+        if (tosses > longest) longest = tosses;
+        if (r === 0 && i < 10) firstPayouts.push(payout);
+        // xs is ascending and every play advances i by one, so a single cursor
+        // walks it -- no search per play.
+        while (at < xs.length && xs[at] === i + 1) {
+          curve[at] = total / (i + 1);
+          at++;
+        }
+      }
+      while (at < xs.length) { curve[at] = total / plays; at++; }
+      curves.push(curve);
+      means.push(total / plays);
+    }
+    return { xs, curves, means, firstPayouts, biggest, longest, plays };
+  }
+
+  /** Ascending, de-duplicated, log-spaced integers in [1, n]. */
+  function logSpacedIndices(n, count) {
+    const out = [];
+    const hi = Math.log10(Math.max(2, n));
+    for (let i = 0; i < count; i++) {
+      const v = Math.round(Math.pow(10, (hi * i) / (count - 1)));
+      const c = Math.min(Math.max(1, v), n);
+      if (!out.length || c > out[out.length - 1]) out.push(c);
+    }
+    if (out[out.length - 1] !== n) out.push(n);
+    return out;
+  }
+
+  // ==========================================================================
+  // Iterated prisoner's dilemma -- mirrors lab/analytics.py section 4
+  // ==========================================================================
+  const STRATEGIES = ["tft", "grim", "allc", "alld", "rand"];
+
+  const STRATEGY_LABELS = {
+    tft: "Tit for tat",
+    grim: "Grim trigger",
+    allc: "Always cooperate",
+    alld: "Always defect",
+    rand: "Random",
+  };
+
+  const STRATEGY_NOTES = {
+    tft: "cooperates first, then copies you",
+    grim: "cooperates until you defect once, then never again",
+    allc: "always cooperates",
+    alld: "always defects",
+    rand: "cooperates half the time, at random",
+  };
+
+  const pdPayoffs = (t) => ({ T: t, R: 3, P: 1, S: 0 });
+
+  /** T > R > P > S and 2R > T + S -- what makes it a dilemma at all. */
+  const pdIsDilemma = (pay) =>
+    pay.T > pay.R && pay.R > pay.P && pay.P > pay.S &&
+    2 * pay.R > pay.T + pay.S;
+
+  /** P(this strategy intends to cooperate) given what it can see. */
+  function pCooperate(strategy, first, oppDefectedLast, triggered) {
+    switch (strategy) {
+      case "allc": return 1;
+      case "alld": return 0;
+      case "rand": return 0.5;
+      case "tft": return first ? 1 : (oppDefectedLast ? 0 : 1);
+      case "grim": return triggered ? 0 : 1;
+      default: throw new Error(`unknown strategy: ${strategy}`);
+    }
+  }
+
+  const payoffFor = (pay, meCoop, themCoop) =>
+    meCoop ? (themCoop ? pay.R : pay.S) : (themCoop ? pay.T : pay.P);
+
+  // Joint-state bits. Everything any of the five strategies can condition on
+  // fits in four: 16 states, so the expectation is an exact forward pass.
+  const B_LAST_D = 1;  // B defected last round     -> drives A's tit-for-tat
+  const A_LAST_D = 2;  // A defected last round     -> drives B's tit-for-tat
+  const B_EVER_D = 4;  // B has ever defected       -> has A's grim trigger fired
+  const A_EVER_D = 8;  // A has ever defected       -> has B's grim trigger fired
+
+  /**
+   * Exact expected per-round score for each side of one iterated match.
+   *
+   * No Monte Carlo: the pair's joint state is one of 16, so the whole match is a
+   * forward pass over a 16-vector. `noise` is a trembling hand -- each intended
+   * move is flipped with that probability, and the flipped move is what both the
+   * payoff and the opponent's memory see.
+   */
+  function pdPair(sa, sb, rounds, pay, noise) {
+    const e = noise || 0;
+    let dist = new Float64Array(16);
+    let next = new Float64Array(16);
+    dist[0] = 1;
+    let totalA = 0, totalB = 0;
+
+    for (let rnd = 0; rnd < rounds; rnd++) {
+      const first = rnd === 0;
+      next.fill(0);
+      for (let s = 0; s < 16; s++) {
+        const w = dist[s];
+        if (w <= 0) continue;
+        const bl = (s & B_LAST_D) !== 0, al = (s & A_LAST_D) !== 0;
+        const be = (s & B_EVER_D) !== 0, ae = (s & A_EVER_D) !== 0;
+        const ca = pCooperate(sa, first, bl, be);
+        const cb = pCooperate(sb, first, al, ae);
+        const pa = ca * (1 - e) + (1 - ca) * e;
+        const pb = cb * (1 - e) + (1 - cb) * e;
+        for (let ai = 0; ai < 2; ai++) {
+          const aCoop = ai === 0;
+          const wa = aCoop ? pa : 1 - pa;
+          if (wa <= 0) continue;
+          for (let bi = 0; bi < 2; bi++) {
+            const bCoop = bi === 0;
+            const wb = bCoop ? pb : 1 - pb;
+            if (wb <= 0) continue;
+            const ww = w * wa * wb;
+            totalA += ww * payoffFor(pay, aCoop, bCoop);
+            totalB += ww * payoffFor(pay, bCoop, aCoop);
+            let key = 0;
+            if (!bCoop) key |= B_LAST_D | B_EVER_D;
+            if (!aCoop) key |= A_LAST_D | A_EVER_D;
+            if (be) key |= B_EVER_D;
+            if (ae) key |= A_EVER_D;
+            next[key] += ww;
+          }
+        }
+      }
+      const swap = dist; dist = next; next = swap;
+    }
+    return [totalA / rounds, totalB / rounds];
+  }
+
+  /** A[i][j] = expected per-round score of strategy i against strategy j. */
+  function pdMatrix(rounds, pay, noise, strategies) {
+    const list = strategies || STRATEGIES;
+    return list.map((si) =>
+      list.map((sj) => pdPair(si, sj, rounds, pay, noise)[0]));
+  }
+
+  /** Round robin including self-play, as in Axelrod's 1980 tournament. */
+  function pdTournament(rounds, pay, noise, strategies) {
+    const matrix = pdMatrix(rounds, pay, noise, strategies);
+    const scores = matrix.map((row) => row.reduce((a, b) => a + b, 0) / row.length);
+    return { matrix, scores };
+  }
+
+  /** Discrete replicator dynamics on the tournament matrix. */
+  function pdReplicator(matrix, generations, x0) {
+    const n = matrix.length;
+    let x = x0 ? x0.slice() : new Array(n).fill(1 / n);
+    const history = [x.slice()];
+    for (let g = 0; g < Math.max(0, Math.round(generations)); g++) {
+      const fit = matrix.map((row) =>
+        row.reduce((acc, v, j) => acc + x[j] * v, 0));
+      const tot = fit.reduce((acc, f, i) => acc + x[i] * f, 0);
+      if (tot <= 0) { history.push(x.slice()); continue; }
+      x = x.map((xi, i) => (xi * fit[i]) / tot);
+      history.push(x.slice());
+    }
+    return history;
+  }
+
+  function pdSummary(pr) {
+    const { rounds, t, noise, generations } = pr;
+    const pay = pdPayoffs(t);
+    const { matrix, scores } = pdTournament(rounds, pay, noise);
+    const shares = pdReplicator(matrix, generations);
+    const argmax = (arr) =>
+      arr.reduce((best, v, i) => (v > arr[best] ? i : best), 0);
+    const best = argmax(scores);
+    const final = shares[shares.length - 1];
+    const dom = argmax(final);
+    return {
+      matrix, scores, shares, pay,
+      winner: STRATEGIES[best],
+      winnerScore: scores[best],
+      dominant: STRATEGIES[dom],
+      dominantShare: final[dom],
+      tftVsAlld: pdPair("tft", "alld", rounds, pay, noise)[0],
+      alldVsTft: pdPair("alld", "tft", rounds, pay, noise)[0],
+      isDilemma: pdIsDilemma(pay),
+    };
+  }
+
   Object.assign(EP, {
     mulberry32,
     binomPmf, binomCdf, binomPpf,
     multipliers, ensembleGrowth, timeGrowth, expectedFinal,
     medianFinal, quantileFinal, probBelow, kellyFraction, sigmaLog, summary,
     simulatePaths, pathStats, logHistogram, kellySweep, quantileSorted,
+    // gambler's ruin
+    bets, ruinUnits, ruinProbUnits, ruinProb, reachTargetProb,
+    ruinProbUnbounded, ruinDurationUnits, ruinDuration, ruinSummary,
+    ruinCurve, ruinBetCurve, simulateRuin,
+    // St Petersburg
+    spExpected, spQuantile, spMedian, spSurvival, spTierContribution,
+    spCapAmount, spCappedExpected, spTypicalMean, spSummary,
+    simulateStPetersburg, logSpacedIndices,
+    // prisoner's dilemma
+    STRATEGIES, STRATEGY_LABELS, STRATEGY_NOTES, pdPayoffs, pdIsDilemma,
+    pdPair, pdMatrix, pdTournament, pdReplicator, pdSummary,
   });
 })(window.EP);
