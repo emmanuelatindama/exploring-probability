@@ -394,12 +394,24 @@
 
   // -- render ---------------------------------------------------------------
   let pending = null;
+  let inFlight = false;
+  let dirty = false;
 
-  /** Coalesce slider input into one render per frame; hold the old chart at
-   *  reduced opacity meanwhile rather than flashing a skeleton. */
+  /**
+   * Coalesce slider input into one render, and never start a second render
+   * while the first is still drawing.
+   *
+   * A frame here is tens of milliseconds of simulation plus a Plotly redraw,
+   * which is longer than the gap between two `input` events from a dragged
+   * slider. Without the in-flight latch every drag queued renders faster than
+   * they could retire and the page locked up mid-gesture; with it, the
+   * intermediate states are dropped and the last one always draws. The chart
+   * is held at reduced opacity meanwhile rather than flashing a skeleton.
+   */
   function scheduleRender() {
     const body = $("#scenario-body");
     body.classList.add("busy");
+    if (inFlight) { dirty = true; return; }
     if (pending) cancelAnimationFrame(pending);
     pending = requestAnimationFrame(() => {
       pending = null;
@@ -427,7 +439,12 @@
       buildTable(`table-${kind}`, out.table.head, out.table.rows);
     }
 
+    inFlight = true;
     Promise.all(jobs).then(() => {
+      inFlight = false;
+      // Whatever the sliders did while this frame was drawing, draw it now:
+      // the reader's last input must always be the state on screen.
+      if (dirty) { dirty = false; scheduleRender(); return; }
       $("#scenario-body").classList.remove("busy");
     });
   }

@@ -18,8 +18,105 @@ window.EP = window.EP || {};
    *  so in log space the paths live on a binomial lattice; drawing hundreds of
    *  them produces a diamond moire that reads as decorative texture and hides
    *  the distribution. A few paths answer "what does one player experience?"
-   *  and the bands answer "where is everybody?". */
-  const SAMPLE_PATHS = 8;
+   *  and the bands answer "where is everybody?".
+   *
+   *  Owned by engine.js, because the simulator keeps exactly this many
+   *  trajectories and discards the rest. Re-declaring it here would put two
+   *  numbers in one namespace and let the chart ask for paths that were never
+   *  stored. */
+  const SAMPLE_PATHS = EP.SAMPLE_PATHS;
+
+  /**
+   * Points per drawn line, before the renderer starts paying for detail it
+   * cannot show.
+   *
+   * A chart is ~1000 CSS pixels wide, so a 2000-round walk is putting two
+   * vertices in every pixel column. Decimation below keeps the envelope (the
+   * min and the max of each bucket) rather than sampling one value per bucket,
+   * so spikes survive even though the vertex count halves.
+   */
+  const MAX_LINE_POINTS = 1200;
+
+  /**
+   * Envelope-preserving decimation of one series onto shared x positions.
+   *
+   * Returns null when the series is already short enough, so the caller can
+   * skip the copy entirely in the common case.
+   */
+  function decimated(xs, ys, limit) {
+    const n = ys.length;
+    const cap = limit || MAX_LINE_POINTS;
+    if (n <= cap) return null;
+    const buckets = Math.floor(cap / 2);
+    const width = n / buckets;
+    const ox = [], oy = [];
+    for (let b = 0; b < buckets; b++) {
+      const from = Math.floor(b * width);
+      const to = Math.min(n, Math.floor((b + 1) * width));
+      if (to <= from) continue;
+      let lo = from, hi = from;
+      for (let i = from + 1; i < to; i++) {
+        if (ys[i] < ys[lo]) lo = i;
+        if (ys[i] > ys[hi]) hi = i;
+      }
+      // Emitted in index order so the line still reads left to right.
+      const a = Math.min(lo, hi), z = Math.max(lo, hi);
+      ox.push(xs[a], xs[z]);
+      oy.push(ys[a], ys[z]);
+    }
+    return { x: ox, y: oy };
+  }
+
+  /**
+   * Integer x positions 0..n-1, cached.
+   *
+   * Every trajectory chart shares one round axis, and rebuilding it per trace
+   * per frame allocated tens of thousands of numbers a second for a value that
+   * never changes. Handed out read-only by convention: Plotly does not mutate
+   * the arrays it is given.
+   */
+  const rangeCache = new Map();
+  function indices(n) {
+    let a = rangeCache.get(n);
+    if (!a) {
+      a = new Array(n);
+      for (let i = 0; i < n; i++) a[i] = i;
+      rangeCache.set(n, a);
+    }
+    return a;
+  }
+
+  /**
+   * The de-emphasised cloud of individual paths, as ONE trace.
+   *
+   * Plotly charges per trace as well as per point, and two dozen traces that
+   * share a colour, a width and a hover setting are two dozen lots of that
+   * overhead for one visual object. A null x/y pair breaks the line between
+   * paths, so a single trace draws them all without joining the end of one to
+   * the start of the next.
+   */
+  function cloudTrace(seriesList, xs, color) {
+    const cx = [], cy = [];
+    for (const ys of seriesList) {
+      const thin = decimated(xs, ys);
+      const px = thin ? thin.x : xs, py = thin ? thin.y : ys;
+      for (let i = 0; i < py.length; i++) { cx.push(px[i]); cy.push(py[i]); }
+      cx.push(null); cy.push(null);
+    }
+    return {
+      x: cx, y: cy, type: "scatter", mode: "lines",
+      line: { color, width: 1 },
+      hoverinfo: "skip", showlegend: false,
+    };
+  }
+
+  /** A band/median/mean line, decimated if it is longer than the axis is wide. */
+  function lineTrace(xs, ys, rest) {
+    const thin = decimated(xs, ys);
+    return Object.assign(
+      { x: thin ? thin.x : xs, y: thin ? thin.y : ys, type: "scatter", mode: "lines" },
+      rest);
+  }
 
   /** Read the live theme values off the document. */
   function theme() {
@@ -97,18 +194,20 @@ window.EP = window.EP || {};
    */
   function trajectory(el, sim, stats, pr) {
     const t = theme();
-    const { paths, stride, nPaths, rounds } = sim;
-    const drawn = Math.min(nPaths, SAMPLE_PATHS);
+    const { paths, stride, nPaths, rounds, stored } = sim;
+    // Only the stored trajectories exist; the rest were summarised into the
+    // histogram the bands come from and never materialised.
+    const drawn = Math.min(stored === undefined ? nPaths : stored,
+                           nPaths, SAMPLE_PATHS);
 
-    const xs = Array.from({ length: stride }, (_, k) => k);
+    const xs = indices(stride);
     const band = (arr) => Array.from(arr, clampFloor);
     const median = band(stats.median);
     const mean = band(stats.mean);
 
     // Band pairs are drawn lower-then-upper so the upper trace can fill down to
     // the one before it. Wider band first, so the narrower sits on top of it.
-    const bandTrace = (arr, fill) => ({
-      x: xs, y: band(arr), type: "scatter", mode: "lines",
+    const bandTrace = (arr, fill) => lineTrace(xs, band(arr), {
       line: { color: "rgba(0,0,0,0)", width: 0 },
       fill: fill ? "tonexty" : undefined,
       fillcolor: fill || undefined,
@@ -136,6 +235,7 @@ window.EP = window.EP || {};
 
     // A few real paths: the bands say where everyone is, these say what the ride
     // feels like for one person.
+    const sample = [];
     for (let i = 0; i < drawn; i++) {
       const base = i * stride;
       const y = new Array(stride);
@@ -145,27 +245,22 @@ window.EP = window.EP || {};
         if (v > yHi) yHi = v;
         if (v < yLo) yLo = v;
       }
-      data.push({
-        x: xs, y, type: "scatter", mode: "lines",
-        line: { color: t.cloud, width: 1 },
-        hoverinfo: "skip", showlegend: false,
-      });
+      sample.push(y);
     }
+    if (sample.length) data.push(cloudTrace(sample, xs, t.cloud));
 
     // Linear interpolation, not spline: smoothing a stochastic median would draw
     // curvature that is not in the data.
-    data.push({
-      x: xs, y: mean, type: "scatter", mode: "lines",
+    data.push(lineTrace(xs, mean, {
       line: { color: t.s2, width: 2 },
       name: "Mean of these players",
       hovertemplate: "<b>%{y:$,.2f}</b>  mean of these players<extra></extra>",
-    });
-    data.push({
-      x: xs, y: median, type: "scatter", mode: "lines",
+    }));
+    data.push(lineTrace(xs, median, {
       line: { color: t.s1, width: 2 },
       name: "Median (typical player)",
       hovertemplate: "<b>%{y:$,.2f}</b>  median<extra></extra>",
-    });
+    }));
 
     // Selective direct labels: the two endpoints, which are the whole story.
     const annot = (y, text, color) => ({
@@ -424,7 +519,7 @@ window.EP = window.EP || {};
     const { sim, walk } = d;
     const { paths, stride, nPaths, rounds, bet, n } = sim;
     const drawn = Math.min(nPaths, RUIN_PATHS);
-    const xs = Array.from({ length: stride }, (_, k) => k);
+    const xs = indices(stride);
     const dollars = (arr) => Array.from(arr, (v) => v * bet);
     const target = n * bet;
 
@@ -437,23 +532,22 @@ window.EP = window.EP || {};
     // a couple of dozen paths can be drawn without turning into texture.
     const data = [];
 
+    const sample = [];
     for (let i = 0; i < drawn; i++) {
       const base = i * stride;
       const y = new Array(stride);
       for (let k = 0; k < stride; k++) y[k] = paths[base + k] * bet;
-      data.push({
-        x: xs, y, type: "scatter", mode: "lines",
-        line: { color: t.cloud, width: 1 },
-        hoverinfo: "skip", showlegend: false,
-      });
+      sample.push(y);
     }
+    // One trace, not two dozen: at 2000 rounds that was 48,000 vertices spread
+    // over 24 traces, and the per-trace overhead alone dominated the redraw.
+    if (sample.length) data.push(cloudTrace(sample, xs, t.cloud));
 
-    data.push({
-      x: xs, y: dollars(walk.median), type: "scatter", mode: "lines",
+    data.push(lineTrace(xs, dollars(walk.median), {
       line: { color: t.s1, width: 2 },
       name: "Median player",
       hovertemplate: "<b>%{y:$,.0f}</b>  median<extra></extra>",
-    });
+    }));
 
     const layout = baseLayout(t, {
       xaxis: axis(t, {
@@ -1018,7 +1112,8 @@ window.EP = window.EP || {};
   }
 
   Object.assign(EP, {
-    trajectory, histogram, sweep, theme, FLOOR, SAMPLE_PATHS, RUIN_PATHS,
+    // SAMPLE_PATHS is engine.js's -- charts.js only reads it.
+    trajectory, histogram, sweep, theme, FLOOR, RUIN_PATHS,
     ruinWalks, ruinOdds, ruinBoldness, spRunningMean, spContributions,
     pdScores, pdHeatmap, pdShares, strategyColors,
   });

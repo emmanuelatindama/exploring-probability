@@ -155,41 +155,76 @@ window.EP = window.EP || {};
   }
 
   // -- path simulation ------------------------------------------------------
+  /** Individual paths kept in full and drawn on top of the quantile fan.
+   *
+   *  Deliberately small, for a reason that is about legibility rather than
+   *  speed: every round multiplies wealth by one of two constants, so in log
+   *  space the paths live on a binomial lattice and hundreds of them overplot
+   *  into a diamond moire. charts.js reads this rather than defining its own. */
+  const SAMPLE_PATHS = 8;
+
   /**
    * Simulate `nPaths` wealth trajectories.
    *
-   * Returns flat Float64Arrays (nPaths x (rounds+1)) rather than nested arrays:
-   * at 2000 paths x 500 rounds that is a million numbers, and the flat layout
-   * keeps it a single allocation.
+   * Two things come back, and the split is what keeps this cheap at 2000 paths
+   * x 500 rounds:
+   *
+   *   paths   the first `stored` trajectories in full (a flat Float64Array,
+   *           nPaths-major). Only the handful the chart actually draws are
+   *           kept -- materialising all million values cost ~8MB and a third
+   *           of the runtime to produce numbers nothing ever read.
+   *   counts  the heads-count histogram, counts[h * stride + t] = how many
+   *           players have h heads after t rounds. Indexed heads-major
+   *           because the writer walks one player forward in time, where h
+   *           barely moves and t always advances by one -- the transposed
+   *           layout jumps a whole row per round and measurably slower.
+   *
+   * `counts` is the whole distribution at every round, in (rounds+1)^2 integers
+   * instead of nPaths x (rounds+1) floats, and it is exact rather than a
+   * summary: wealth after t rounds is w0 * mu^h * md^(t-h), a value that is
+   * monotone in h, so the histogram fixes every order statistic. pathStats
+   * reads ranks straight off it and never sorts anything.
+   *
+   * Draw order is untouched -- one number per round, paths in order -- so the
+   * seeded paths still match lab/analytics.py bit for bit.
    */
   function simulatePaths(pr) {
     const { w0, rounds, p, up, down, f, nPaths, seed } = pr;
     const [mu, md] = multipliers(up, down, f);
     const rand = mulberry32(seed);
     const stride = rounds + 1;
-    const paths = new Float64Array(nPaths * stride);
+    const stored = Math.min(nPaths, SAMPLE_PATHS);
+    const paths = new Float64Array(stored * stride);
     const terminal = new Float64Array(nPaths);
+    const counts = new Int32Array(stride * stride);
 
+    // Powers of the two multipliers, accumulated the same way a path
+    // accumulates them, so a reconstructed value matches the walked one.
+    const muPow = new Float64Array(stride);
+    const mdPow = new Float64Array(stride);
+    muPow[0] = 1; mdPow[0] = 1;
+    for (let i = 1; i < stride; i++) {
+      muPow[i] = muPow[i - 1] * mu;
+      mdPow[i] = mdPow[i - 1] * md;
+    }
+
+    counts[0] += nPaths; // t = 0: everybody at zero heads
     for (let i = 0; i < nPaths; i++) {
+      const keep = i < stored;
       const base = i * stride;
-      let w = w0;
-      paths[base] = w;
+      let w = w0, h = 0;
+      if (keep) paths[base] = w;
       for (let t = 1; t <= rounds; t++) {
-        w *= rand() < p ? mu : md;
-        paths[base + t] = w;
+        if (rand() < p) { w *= mu; h++; } else { w *= md; }
+        counts[h * stride + t]++;
+        if (keep) paths[base + t] = w;
       }
       terminal[i] = w;
     }
-    return { paths, terminal, stride, nPaths, rounds };
-  }
-
-  /** Empirical quantile (linear interpolation) of an already-sorted array. */
-  function quantileSorted(sorted, q) {
-    const n = sorted.length;
-    if (!n) return NaN;
-    const pos = (n - 1) * q;
-    const lo = Math.floor(pos), hi = Math.ceil(pos);
-    return lo === hi ? sorted[lo] : sorted[lo] + (pos - lo) * (sorted[hi] - sorted[lo]);
+    return {
+      paths, terminal, stride, nPaths, rounds, stored,
+      counts, muPow, mdPow, w0, ascending: mu >= md,
+    };
   }
 
   /**
@@ -204,10 +239,10 @@ window.EP = window.EP || {};
    * The mean rides along because its divergence from the median is the story.
    */
   const BAND_Q = [0.05, 0.25, 0.5, 0.75, 0.95];
+  const BAND_KEYS = ["q05", "q25", "median", "q75", "q95"];
 
-  function pathStats(sim) {
-    const { paths, stride, nPaths } = sim;
-    const out = {
+  function emptyBands(stride) {
+    return {
       mean: new Float64Array(stride),
       q05: new Float64Array(stride),
       q25: new Float64Array(stride),
@@ -215,24 +250,115 @@ window.EP = window.EP || {};
       q75: new Float64Array(stride),
       q95: new Float64Array(stride),
     };
-    const keys = ["q05", "q25", "median", "q75", "q95"];
-    const col = new Float64Array(nPaths);
+  }
+
+  /**
+   * The integer ranks the five bands interpolate between, ascending.
+   *
+   * The empirical quantile is the value at pos = (n-1)q, linearly interpolated
+   * between its two neighbouring order statistics when pos is not whole. So
+   * each band needs the values at floor(pos) and ceil(pos): ten ranks, already
+   * ascending because the quantiles are.
+   */
+  function bandRanks(nPaths) {
+    const pos = [], lo = [], hi = [], ranks = [];
+    for (const q of BAND_Q) {
+      const x = (nPaths - 1) * q;
+      pos.push(x);
+      lo.push(Math.floor(x));
+      hi.push(Math.ceil(x));
+      ranks.push(Math.floor(x), Math.ceil(x));
+    }
+    return { pos, lo, hi, ranks };
+  }
+
+  /** Blend the ten rank values back into five band values. */
+  function fillBands(out, t, vals, r) {
+    for (let k = 0; k < BAND_KEYS.length; k++) {
+      const a = vals[2 * k], b = vals[2 * k + 1];
+      out[BAND_KEYS[k]][t] =
+        r.lo[k] === r.hi[k] ? a : a + (r.pos[k] - r.lo[k]) * (b - a);
+    }
+  }
+
+  /**
+   * Bands for the multiplicative game, read off the heads-count histogram.
+   *
+   * No sorting and no pass over the trajectories at all: at round t the whole
+   * sample is described by counts[h], and value(h) = w0 * mu^h * md^(t-h) is
+   * monotone in h, so walking the buckets in value order walks the sample in
+   * rank order. The mean falls out of the same walk as sum(count * value).
+   *
+   * That turns an O(rounds * nPaths * log nPaths) sort per frame into
+   * O(rounds^2 / 2) arithmetic over a histogram -- at the top of the sliders,
+   * ~400ms of sorting becomes a few milliseconds.
+   */
+  function pathStats(sim) {
+    const { stride, nPaths, counts, muPow, mdPow, w0, ascending } = sim;
+    const out = emptyBands(stride);
+    const r = bandRanks(nPaths);
+    const vals = new Float64Array(r.ranks.length);
 
     for (let t = 0; t < stride; t++) {
-      let acc = 0;
-      for (let i = 0; i < nPaths; i++) {
-        const v = paths[i * stride + t];
-        col[i] = v;
-        acc += v;
+      let acc = 0, cum = 0, ri = 0;
+      // Buckets in ascending *value* order. mu >= md for every reachable
+      // control setting, so that is ascending h -- but a scenario that ever
+      // configures a heads multiplier below the tails one would reverse the
+      // lattice, and reading ranks off it backwards would silently swap the
+      // 5th and 95th percentiles.
+      for (let j = 0; j <= t; j++) {
+        const h = ascending ? j : t - j;
+        const c = counts[h * stride + t];
+        if (c === 0) continue;
+        const value = w0 * muPow[h] * mdPow[t - h];
+        acc += c * value;
+        const upTo = cum + c;
+        // Ranks cum .. upTo-1 all hold this value.
+        while (ri < r.ranks.length && r.ranks[ri] < upTo) vals[ri++] = value;
+        cum = upTo;
       }
       out.mean[t] = acc / nPaths;
-      // Sorted in place -- `col` is scratch, and TypedArray.sort() with no
-      // comparator is already numeric-ascending (and much faster than passing
-      // one). The caller's `paths` buffer is untouched.
-      col.sort();
-      for (let k = 0; k < keys.length; k++) {
-        out[keys[k]][t] = quantileSorted(col, BAND_Q[k]);
+      fillBands(out, t, vals, r);
+    }
+    return out;
+  }
+
+  /**
+   * Bands for the additive walk, by counting sort over bankroll positions.
+   *
+   * The walk is already an integer number of bets in [0, n], so the positions
+   * are their own histogram buckets and no comparison sort is needed here
+   * either. Only the occupied span is scanned, and the scan clears the buckets
+   * behind it so the same scratch array serves every round.
+   */
+  function walkStats(sim) {
+    const { paths, stride, nPaths, n } = sim;
+    const out = emptyBands(stride);
+    const r = bandRanks(nPaths);
+    const vals = new Float64Array(r.ranks.length);
+    const buckets = new Int32Array(n + 1);
+
+    for (let t = 0; t < stride; t++) {
+      let acc = 0, lo = n, hi = 0;
+      for (let i = 0; i < nPaths; i++) {
+        const x = paths[i * stride + t];
+        buckets[x]++;
+        acc += x;
+        if (x < lo) lo = x;
+        if (x > hi) hi = x;
       }
+      out.mean[t] = acc / nPaths;
+
+      let cum = 0, ri = 0;
+      for (let x = lo; x <= hi; x++) {
+        const c = buckets[x];
+        if (c === 0) continue;
+        buckets[x] = 0; // cleared behind the scan, so no separate clear pass
+        const upTo = cum + c;
+        while (ri < r.ranks.length && r.ranks[ri] < upTo) vals[ri++] = x;
+        cum = upTo;
+      }
+      fillBands(out, t, vals, r);
     }
     return out;
   }
@@ -426,8 +552,11 @@ window.EP = window.EP || {};
     const [k, n] = ruinUnits(bankroll, target, bet);
     const rand = mulberry32(seed);
     const stride = rounds + 1;
-    const paths = new Float64Array(nPaths * stride);
-    const terminal = new Float64Array(nPaths);
+    // Positions, not dollars: the walk moves one whole bet at a time, so these
+    // are integers in [0, n]. Int32 halves the memory traffic of the old
+    // Float64 buffer and lets walkStats use the positions as histogram buckets.
+    const paths = new Int32Array(nPaths * stride);
+    const terminal = new Int32Array(nPaths);
     let ruined = 0, reached = 0;
     // Absorption round per path, or -1 for the ones still walking at the end.
     const absorbedAt = new Int32Array(nPaths).fill(-1);
@@ -517,12 +646,31 @@ window.EP = window.EP || {};
    * chart uses -- keeping all `plays` points per run would be tens of millions
    * of numbers to plot a line that is smooth in log x anyway.
    */
+  /**
+   * Payout by toss count, memoised.
+   *
+   * The play-out calls Math.pow once per game -- over a million times at the
+   * top of the sliders, for at most a few dozen distinct answers. The table is
+   * filled with Math.pow itself rather than by repeated multiplication, so the
+   * values are bit-identical to the ones the loop used to compute inline and
+   * the seeded payouts still match lab/analytics.py exactly.
+   */
+  function payoutTable(m, upTo) {
+    const tbl = new Float64Array(upTo + 1);
+    for (let k = 0; k <= upTo; k++) tbl[k] = Math.pow(m, k);
+    return tbl;
+  }
+
   function simulateStPetersburg(pr) {
     const { runs, plays, p, m, seed } = pr;
     const rand = mulberry32(seed);
     const xs = logSpacedIndices(plays, 140);
     const curves = [], means = [], firstPayouts = [];
     let biggest = 0, longest = 0;
+    // Deep runs are geometrically rare, so this covers every game that will
+    // realistically come up; anything past it falls back to Math.pow.
+    const POW_CAP = 256;
+    const pows = payoutTable(m, POW_CAP);
 
     for (let r = 0; r < runs; r++) {
       let total = 0, at = 0;
@@ -530,7 +678,9 @@ window.EP = window.EP || {};
       for (let i = 0; i < plays; i++) {
         let tosses = 1;
         while (rand() < p) tosses++;
-        const payout = Math.pow(m, tosses - 1);
+        const payout = tosses <= POW_CAP + 1
+          ? pows[tosses - 1]
+          : Math.pow(m, tosses - 1);
         total += payout;
         if (payout > biggest) biggest = payout;
         if (tosses > longest) longest = tosses;
@@ -716,12 +866,448 @@ window.EP = window.EP || {};
     };
   }
 
+  // ==========================================================================
+  // Shared: binomial weights by recurrence
+  // ==========================================================================
+  /**
+   * P(X = k) for k = 0..n, X ~ Binomial(n, p), by the standard recurrence
+   *
+   *     pmf(0)   = (1-p)^n
+   *     pmf(k+1) = pmf(k) * (n-k)/(k+1) * p/(1-p)
+   *
+   * lab/analytics.py gets the same n+1 values from one vectorised numpy call
+   * (binom.pmf over an array); there is no numpy here, so this is the
+   * "vectorised" form JS gets instead -- one multiply per term rather than a
+   * logGamma-based binomPmf call per term, which is what sdCycleGrowth and
+   * insPoolGrowth both sum over. Stable for the n this project sweeps (at most
+   * a few thousand): pmf(0) underflows to a hard 0 only once n exceeds ~1074
+   * at p = 0.5, far past any control range on the page.
+   */
+  function binomWeights(n, p) {
+    const w = new Float64Array(n + 1);
+    if (p <= 0) { w[0] = 1; return w; }
+    if (p >= 1) { w[n] = 1; return w; }
+    const q = 1 - p, ratio = p / q;
+    w[0] = Math.pow(q, n);
+    for (let k = 0; k < n; k++) {
+      w[k + 1] = Math.max(0, w[k] * ratio * (n - k) / (k + 1));
+    }
+    return w;
+  }
+
+  // ==========================================================================
+  // Monty Hall -- mirrors lab/analytics.py section 5
+  // ==========================================================================
+  /** [N, k]: doors and opened doors, clamped so a door remains to switch to. */
+  function mhBoard(doors, opened) {
+    const n = Math.max(3, Math.round(doors));
+    return [n, Math.min(Math.max(1, Math.round(opened)), n - 2)];
+  }
+
+  /** P(the host's k doors were all goats). Exact. */
+  function mhGoatProb(doors, opened, know) {
+    const [n, k] = mhBoard(doors, opened);
+    const q = Math.min(Math.max(know, 0), 1);
+    return q + (1 - q) * (n - k) / n;
+  }
+
+  /** P(switching wins AND only goats were revealed). Exact. */
+  function mhSwitchJoint(doors, opened, know) {
+    const [n, k] = mhBoard(doors, opened);
+    const q = Math.min(Math.max(know, 0), 1);
+    return (q * (n - 1)) / (n * (n - 1 - k)) + (1 - q) / n;
+  }
+
+  /** P(switching wins | only goats were revealed). Exact. */
+  function mhSwitchProb(doors, opened, know) {
+    return mhSwitchJoint(doors, opened, know) / mhGoatProb(doors, opened, know);
+  }
+
+  /** P(staying wins | only goats were revealed). Exact. */
+  function mhStayProb(doors, opened, know) {
+    const [n] = mhBoard(doors, opened);
+    return (1 / n) / mhGoatProb(doors, opened, know);
+  }
+
+  function mhSummary(pr) {
+    const { doors, opened, know } = pr;
+    const [n, k] = mhBoard(doors, opened);
+    const switchP = mhSwitchProb(doors, opened, know);
+    const stayP = mhStayProb(doors, opened, know);
+    return {
+      doors: n, opened: k,
+      switchProb: switchP, stayProb: stayP,
+      advantage: switchP - stayP,
+      ratio: stayP > 0 ? switchP / stayP : Infinity,
+      goatProb: mhGoatProb(doors, opened, know),
+      switchKnowing: mhSwitchProb(doors, opened, 1),
+      switchRandom: mhSwitchProb(doors, opened, 0),
+      switchUncond: mhSwitchJoint(doors, opened, know),
+      stayUncond: 1 / n,
+    };
+  }
+
+  /**
+   * Reference play-out, mirroring lab/analytics.py:simulate_monty exactly.
+   *
+   * Five draws every game, whether or not that game's outcome needs each one --
+   * drawing conditionally would make the stream depend on the outcome, and the
+   * seeded games could then only match the Python reference by branching
+   * identically at every step, the same trap simulate_ruin documents.
+   */
+  function simulateMonty(pr) {
+    const { games, doors, opened, know, seed } = pr;
+    const [n, k] = mhBoard(doors, opened);
+    const q = Math.min(Math.max(know, 0), 1);
+    const pReveal = k / (n - 1);
+    const pSwitch = 1 / (n - 1 - k);
+    const rand = mulberry32(seed);
+    let valid = 0, stayWins = 0, switchWins = 0;
+    const first = [];
+    for (let i = 0; i < games; i++) {
+      const car = Math.floor(rand() * n);
+      const pick = Math.floor(rand() * n);
+      const knows = rand() < q;
+      const rReveal = rand();
+      const rSwitch = rand();
+      const revealed = !knows && car !== pick && rReveal < pReveal;
+      let stay = false, switchWin = false;
+      if (!revealed) {
+        valid++;
+        stay = car === pick;
+        switchWin = car !== pick && rSwitch < pSwitch;
+        if (stay) stayWins++;
+        if (switchWin) switchWins++;
+      }
+      if (i < 10) first.push([car, pick, stay ? 1 : 0, switchWin ? 1 : 0]);
+    }
+    return { valid, stayWins, switchWins, first };
+  }
+
+  // ==========================================================================
+  // Shannon's demon -- mirrors lab/analytics.py section 6
+  // ==========================================================================
+  /** [up, down] for a symmetric multiplicative move, with down = 1/up. */
+  function sdMoves(vol) {
+    const v = Math.max(1e-9, vol);
+    return [1 + v, 1 / (1 + v)];
+  }
+
+  /** E[ln m] for the stock alone. Zero at p = 0.5 by construction. */
+  function sdStockGrowth(p, vol) {
+    const [up, down] = sdMoves(vol);
+    return p * Math.log(up) + (1 - p) * Math.log(down);
+  }
+
+  /** E[m] - 1 for the stock: positive even when the time-average growth above
+   *  is zero. The gap between the two is the volatility drag the demon feeds
+   *  on. */
+  function sdStockDrift(p, vol) {
+    const [up, down] = sdMoves(vol);
+    return p * up + (1 - p) * down - 1;
+  }
+
+  /** ln(1 - w + w * exp(logR)), stable for large positive logR by factoring the
+   *  exponent out first -- see lab/analytics.py:_log_mix for the same guard,
+   *  vectorised there and evaluated once per binomial term here instead. */
+  function logMix(w, logR) {
+    if (logR > 0) return logR + Math.log(w + (1 - w) * Math.exp(-logR));
+    return Math.log1p(-w + w * Math.exp(logR));
+  }
+
+  /**
+   * Expected log growth per period, rebalancing every `interval` periods.
+   *
+   * Exact: a sum over the n+1 possible cycles, weighted by binomWeights rather
+   * than by n+1 separate logGamma-based pmf calls -- see the comment on
+   * binomWeights for why that is the point.
+   */
+  function sdCycleGrowth(interval, p, vol, w, cost) {
+    const n = Math.max(1, Math.round(interval));
+    const [up, down] = sdMoves(vol);
+    const logUp = Math.log(up), logDown = Math.log(down);
+    const weights = binomWeights(n, p);
+    const doCost = cost > 0 && w > 0 && w < 1;
+    let acc = 0;
+    for (let j = 0; j <= n; j++) {
+      const wt = weights[j];
+      if (wt <= 0) continue;
+      const logR = j * logUp + (n - j) * logDown;
+      const logM = logMix(w, logR);
+      let logC = 0;
+      if (doCost) {
+        const wAfter = Math.exp(Math.log(w) + logR - logM);
+        logC = Math.log1p(-cost * Math.abs(wAfter - w));
+      }
+      acc += wt * (logM + logC);
+    }
+    return acc / n;
+  }
+
+  /** Buy and hold: the interval = horizon case of the same formula, so it is
+   *  never charged a rebalancing cost. */
+  function sdHoldGrowth(rounds, p, vol, w) {
+    return sdCycleGrowth(Math.max(1, Math.round(rounds)), p, vol, w, 0);
+  }
+
+  /** Rebalanced growth minus buy-and-hold growth over the same horizon. */
+  function sdHarvest(interval, rounds, p, vol, w, cost) {
+    return sdCycleGrowth(interval, p, vol, w, cost) - sdHoldGrowth(rounds, p, vol, w);
+  }
+
+  /** (intervals, growth per period) for every rebalancing interval. Exact --
+   *  a brute sweep because the objective is a binomial sum over a *discrete*
+   *  cycle length, so there is nothing to differentiate and set to zero. */
+  function sdIntervalCurve(rounds, p, vol, w, cost, maxInterval) {
+    const top = Math.max(1, Math.round(maxInterval || rounds));
+    const xs = new Array(top), gs = new Array(top);
+    for (let n = 1; n <= top; n++) {
+      xs[n - 1] = n;
+      gs[n - 1] = sdCycleGrowth(n, p, vol, w, cost);
+    }
+    return [xs, gs];
+  }
+
+  /** [interval, growth] maximising growth per period. */
+  function sdBestInterval(rounds, p, vol, w, cost) {
+    const [xs, gs] = sdIntervalCurve(rounds, p, vol, w, cost);
+    let best = 0;
+    for (let i = 1; i < gs.length; i++) if (gs[i] > gs[best]) best = i;
+    return [xs[best], gs[best]];
+  }
+
+  function sdSummary(pr) {
+    const { rounds, p, vol, w, interval, cost } = pr;
+    const [up, down] = sdMoves(vol);
+    const [bestN, bestG] = sdBestInterval(rounds, p, vol, w, cost);
+    const rebal = sdCycleGrowth(interval, p, vol, w, cost);
+    const hold = sdHoldGrowth(rounds, p, vol, w);
+    return {
+      up, down,
+      stockGrowth: sdStockGrowth(p, vol),
+      stockDrift: sdStockDrift(p, vol),
+      rebalGrowth: rebal,
+      holdGrowth: hold,
+      harvest: rebal - hold,
+      bestInterval: bestN,
+      bestGrowth: bestG,
+      // The weight that harvests most is the Kelly fraction for this coin --
+      // exactly 1/2 for a symmetric trendless stock, Shannon's rule on the page.
+      kellyW: kellyFraction(p, up, down),
+    };
+  }
+
+  /**
+   * Reference play-out: the stock, buy-and-hold, and the rebalanced portfolio.
+   *
+   * One draw per period per path, matching lab/analytics.py:simulate_rebalance
+   * so the seeded first path agrees bit for bit. All three series start at w0
+   * so they can share one axis: the stock is drawn as a portfolio held 100%
+   * long rather than as a bare price.
+   */
+  function simulateRebalance(pr) {
+    const { nPaths, rounds, w0, p, vol, w, interval, cost, seed } = pr;
+    const [up, down] = sdMoves(vol);
+    const n = Math.max(1, Math.round(interval));
+    const rand = mulberry32(seed);
+    const stride = rounds + 1;
+    const price = new Float64Array(stride);
+    const hold = new Float64Array(stride);
+    const rebal = new Float64Array(stride);
+    const termHold = new Float64Array(nPaths);
+    const termRebal = new Float64Array(nPaths);
+    price[0] = hold[0] = rebal[0] = w0;
+
+    for (let i = 0; i < nPaths; i++) {
+      let px = w0;
+      let hStock = w * w0, hCash = (1 - w) * w0;
+      let rStock = w * w0, rCash = (1 - w) * w0;
+      for (let t = 1; t <= rounds; t++) {
+        const m = rand() < p ? up : down;
+        px *= m; hStock *= m; rStock *= m;
+        if (t % n === 0) {
+          const total = rStock + rCash;
+          const turnover = total > 0 ? Math.abs(rStock / total - w) : 0;
+          const after = total * (1 - cost * turnover);
+          rStock = w * after; rCash = (1 - w) * after;
+        }
+        if (i === 0) {
+          price[t] = px; hold[t] = hStock + hCash; rebal[t] = rStock + rCash;
+        }
+      }
+      termHold[i] = hStock + hCash;
+      termRebal[i] = rStock + rCash;
+    }
+    return { price, hold, rebal, stride, nPaths, rounds, termHold, termRebal };
+  }
+
+  // ==========================================================================
+  // Insurance and risk pooling -- mirrors lab/analytics.py section 7
+  // ==========================================================================
+  /** pi * ln(1 - L/W): the exposed player's growth rate per period. Exact. */
+  function insUninsuredGrowth(wealth, loss, hazard) {
+    const x = loss / wealth;
+    if (x >= 1) return -Infinity;
+    return hazard * Math.log1p(-x);
+  }
+
+  /** ln(1 - P/W): the insured player's growth rate per period. Exact and
+   *  certain -- the premium is a number, not a distribution. */
+  function insInsuredGrowth(wealth, premium) {
+    if (premium >= wealth) return -Infinity;
+    return Math.log1p(-premium / wealth);
+  }
+
+  /** The most the buyer can pay and still improve: W(1 - (1-L/W)^pi). Exact,
+   *  and strictly above the expected payout pi*L for any 0 < pi < 1. */
+  function insBuyerMaxPremium(wealth, loss, hazard) {
+    const x = loss / wealth;
+    if (x >= 1) return wealth;
+    return wealth * (1 - Math.pow(1 - x, hazard));
+  }
+
+  /** The seller's growth rate per period from writing one contract. Exact. */
+  function insSellerGrowth(sellerWealth, premium, loss, hazard) {
+    if (sellerWealth + premium - loss <= 0) return -Infinity;
+    return hazard * Math.log1p((premium - loss) / sellerWealth)
+      + (1 - hazard) * Math.log1p(premium / sellerWealth);
+  }
+
+  /** The least the seller can accept: the root of insSellerGrowth = 0, found by
+   *  bisection -- NOT a closed form. See lab/analytics.py:ins_seller_min_premium
+   *  for why a bracket always exists. */
+  function insSellerMinPremium(sellerWealth, loss, hazard, tol) {
+    const t = tol === undefined ? 1e-12 : tol;
+    let lo = Math.max(hazard * loss, loss - sellerWealth) + 1e-12;
+    let hi = Math.max(lo * 2, loss);
+    for (let i = 0; i < 200; i++) {
+      if (insSellerGrowth(sellerWealth, hi, loss, hazard) > 0) break;
+      hi *= 2;
+    }
+    for (let i = 0; i < 200; i++) {
+      const mid = 0.5 * (lo + hi);
+      if (insSellerGrowth(sellerWealth, mid, loss, hazard) > 0) hi = mid;
+      else lo = mid;
+      if (hi - lo <= t * Math.max(1, hi)) break;
+    }
+    return 0.5 * (lo + hi);
+  }
+
+  /** The buyer's gain in growth-equivalent dollars per period: W * dg. See
+   *  lab/analytics.py:ins_buyer_value for why growth rates alone are not
+   *  comparable across two parties of very different wealth. */
+  function insBuyerValue(wealth, premium, loss, hazard) {
+    return wealth * (insInsuredGrowth(wealth, premium)
+      - insUninsuredGrowth(wealth, loss, hazard));
+  }
+
+  /** The seller's gain in the same growth-equivalent dollars per period. */
+  function insSellerValue(sellerWealth, premium, loss, hazard) {
+    return sellerWealth * insSellerGrowth(sellerWealth, premium, loss, hazard);
+  }
+
+  /** Growth rate of one member of a mutual pool of `members`. Exact -- the
+   *  same binomWeights recurrence sdCycleGrowth uses, summed over the pool's
+   *  loss count instead of over a rebalancing cycle's up/down count. */
+  function insPoolGrowth(members, wealth, loss, hazard) {
+    const n = Math.max(1, Math.round(members));
+    const weights = binomWeights(n, hazard);
+    const ratio = loss / wealth;
+    let acc = 0;
+    for (let k = 0; k <= n; k++) {
+      const wt = weights[k];
+      if (wt <= 0) continue;
+      acc += wt * Math.log1p(-ratio * (k / n));
+    }
+    return acc;
+  }
+
+  /** ln(1 - pi L/W): the n -> infinity growth rate of an infinite pool. Exact,
+   *  and an upper bound on every finite pool's growth rate. */
+  function insPoolLimit(wealth, loss, hazard) {
+    return Math.log1p((-hazard * loss) / wealth);
+  }
+
+  /** Smallest pool that beats buying insurance at `premium`: doubling to a
+   *  bracket, then bisecting the integer -- never scanning, since each
+   *  insPoolGrowth(n) call is itself an (n+1)-term sum. */
+  function insPoolBreakEven(premium, wealth, loss, hazard, maxMembers) {
+    const cap = maxMembers || 100000;
+    const target = insInsuredGrowth(wealth, premium);
+    if (insPoolGrowth(1, wealth, loss, hazard) >= target) return 1;
+    let hi = 2;
+    while (hi <= cap) {
+      if (insPoolGrowth(hi, wealth, loss, hazard) >= target) break;
+      hi *= 2;
+    }
+    if (hi > cap) return null;
+    let lo = Math.floor(hi / 2);
+    while (lo + 1 < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (insPoolGrowth(mid, wealth, loss, hazard) >= target) hi = mid;
+      else lo = mid;
+    }
+    return hi;
+  }
+
+  function insSummary(pr) {
+    const { wealth, sellerWealth, premium, loss, hazard, members } = pr;
+    const pMin = insSellerMinPremium(sellerWealth, loss, hazard);
+    const pMax = insBuyerMaxPremium(wealth, loss, hazard);
+    return {
+      expectedPayout: hazard * loss,
+      buyerMax: pMax, sellerMin: pMin,
+      bandOk: pMin < pMax, bandWidth: pMax - pMin,
+      uninsuredGrowth: insUninsuredGrowth(wealth, loss, hazard),
+      insuredGrowth: insInsuredGrowth(wealth, premium),
+      sellerGrowth: insSellerGrowth(sellerWealth, premium, loss, hazard),
+      buyerValue: insBuyerValue(wealth, premium, loss, hazard),
+      sellerValue: insSellerValue(sellerWealth, premium, loss, hazard),
+      poolGrowth: insPoolGrowth(members, wealth, loss, hazard),
+      poolLimit: insPoolLimit(wealth, loss, hazard),
+      poolBreakEven: insPoolBreakEven(premium, wealth, loss, hazard),
+    };
+  }
+
+  /** (premiums, buyer value, seller value), swept over a premium range. Exact
+   *  -- every point is one evaluation of insBuyerValue / insSellerValue, sized
+   *  around the band so its crossing sits inside the axis. */
+  function insPremiumCurve(pr, points) {
+    const { wealth, sellerWealth, loss, hazard } = pr;
+    const n = points || 160;
+    const pMax = insBuyerMaxPremium(wealth, loss, hazard);
+    const pMin = insSellerMinPremium(sellerWealth, loss, hazard);
+    const hi = Math.min(wealth * 0.95, Math.max(pMax, pMin) * 2.2);
+    const xs = new Array(n), buyer = new Array(n), seller = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = (hi * i) / (n - 1);
+      xs[i] = x;
+      buyer[i] = insBuyerValue(wealth, x, loss, hazard);
+      seller[i] = insSellerValue(sellerWealth, x, loss, hazard);
+    }
+    return { xs, buyer, seller };
+  }
+
+  /** (sizes, growth), one point per pool size from 1 to maxMembers. Exact, and
+   *  not log-spaced -- the curve is steepest at the smallest sizes. */
+  function insPoolCurve(pr, maxMembers) {
+    const { wealth, loss, hazard } = pr;
+    const top = maxMembers || 200;
+    const sizes = new Array(top), growth = new Array(top);
+    for (let n = 1; n <= top; n++) {
+      sizes[n - 1] = n;
+      growth[n - 1] = insPoolGrowth(n, wealth, loss, hazard);
+    }
+    return { sizes, growth };
+  }
+
   Object.assign(EP, {
     mulberry32,
-    binomPmf, binomCdf, binomPpf,
+    binomPmf, binomCdf, binomPpf, binomWeights,
     multipliers, ensembleGrowth, timeGrowth, expectedFinal,
     medianFinal, quantileFinal, probBelow, kellyFraction, sigmaLog, summary,
-    simulatePaths, pathStats, logHistogram, kellySweep, quantileSorted,
+    simulatePaths, pathStats, walkStats, logHistogram, kellySweep,
+    SAMPLE_PATHS,
     // gambler's ruin
     bets, ruinUnits, ruinProbUnits, ruinProb, reachTargetProb,
     ruinProbUnbounded, ruinDurationUnits, ruinDuration, ruinSummary,
@@ -733,5 +1319,15 @@ window.EP = window.EP || {};
     // prisoner's dilemma
     STRATEGIES, STRATEGY_LABELS, STRATEGY_NOTES, pdPayoffs, pdIsDilemma,
     pdPair, pdMatrix, pdTournament, pdReplicator, pdSummary,
+    // Monty Hall
+    mhBoard, mhGoatProb, mhSwitchJoint, mhSwitchProb, mhStayProb, mhSummary,
+    simulateMonty,
+    // Shannon's demon
+    sdMoves, sdStockGrowth, sdStockDrift, sdCycleGrowth, sdHoldGrowth,
+    sdHarvest, sdIntervalCurve, sdBestInterval, sdSummary, simulateRebalance,
+    // insurance and risk pooling
+    insUninsuredGrowth, insInsuredGrowth, insBuyerMaxPremium, insSellerGrowth,
+    insSellerMinPremium, insBuyerValue, insSellerValue, insPoolGrowth,
+    insPoolLimit, insPoolBreakEven, insSummary, insPremiumCurve, insPoolCurve,
   });
 })(window.EP);

@@ -207,7 +207,7 @@ window.EP = window.EP || {};
         return {
           stats: EP.ruinSummary(pr),
           sim,
-          walk: EP.pathStats(sim),
+          walk: EP.walkStats(sim),
           curve: EP.ruinCurve(pr, 160),
           betCurve: EP.ruinBetCurve(pr, 120),
         };

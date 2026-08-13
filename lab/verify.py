@@ -360,6 +360,261 @@ def verify_pd():
         print(f"  [{'ok  ' if ok else 'FAIL'}] T={t} is a valid dilemma")
 
 
+# -- 1e. Monty Hall -----------------------------------------------------------
+def mc_monty(doors, opened, know, n=400_000, seed=77):
+    """Vectorised Monte Carlo, independent of mulberry32 -- this checks the
+    formula, not the seeded-draw contract (that is simulate_monty's job)."""
+    rng = np.random.default_rng(seed)
+    n_doors, k = A.mh_board(doors, opened)
+    car = rng.integers(0, n_doors, n)
+    pick = rng.integers(0, n_doors, n)
+    knows = rng.random(n) < know
+    # A random host reveals a goat with probability (n_doors-k)/(n_doors-1) once
+    # the prize is not behind the player's own door; collapse the combinatorics
+    # into one draw exactly as simulate_monty does.
+    p_reveal = k / (n_doors - 1.0)
+    revealed = (~knows) & (car != pick) & (rng.random(n) < p_reveal)
+    valid = ~revealed
+    stay_win = valid & (car == pick)
+    p_switch = 1.0 / (n_doors - 1.0 - k)
+    switch_win = valid & (car != pick) & (rng.random(n) < p_switch)
+    return (float(valid.mean()), float(stay_win.sum()) / valid.sum(),
+            float(switch_win.sum()) / valid.sum())
+
+
+def verify_monty():
+    print("\nMonty Hall: closed forms vs Monte Carlo (400k games)")
+    cases = [
+        dict(doors=3, opened=1, know=1.0),   # the classic puzzle
+        dict(doors=3, opened=1, know=0.0),   # lucky host: no information
+        dict(doors=3, opened=1, know=0.5),   # a dial in between
+        dict(doors=5, opened=3, know=1.0),   # more doors, more opened
+        dict(doors=10, opened=1, know=1.0),  # opens only one of nine
+        dict(doors=10, opened=8, know=0.7),
+    ]
+    for c in cases:
+        print(f"\n  case {c}")
+        valid_frac, stay_mc, switch_mc = mc_monty(**c)
+        want_goat = A.mh_goat_prob(**c)
+        check("P(only goats revealed)", valid_frac, want_goat, tol=3e-3)
+        check("P(stay wins | valid)", stay_mc, A.mh_stay_prob(**c), tol=3e-3)
+        check("P(switch wins | valid)", switch_mc, A.mh_switch_prob(**c), tol=3e-3)
+        # Whatever the host's knowledge, staying and switching are the only two
+        # ways to win, and one of the N-2 other doors is never picked.
+        total = A.mh_stay_prob(**c) + A.mh_switch_prob(**c) * (
+            A.mh_board(c["doors"], c["opened"])[0] - 1 - A.mh_board(c["doors"], c["opened"])[1])
+        check("stay + (unopened others)*switch = 1", total, 1.0)
+
+    # The two endpoints of the `know` dial, exactly.
+    classic = A.mh_summary(doors=3, opened=1, know=1.0)
+    check("classic switch = 2/3", classic["switch_prob"], 2.0 / 3.0)
+    check("classic stay = 1/3", classic["stay_prob"], 1.0 / 3.0)
+    lucky = A.mh_summary(doors=3, opened=1, know=0.0)
+    check("lucky host: switch = stay", lucky["switch_prob"], lucky["stay_prob"])
+
+    # Opening more doors under a knowing host cannot move the stay probability:
+    # a knowing host never reveals anything about the player's own door.
+    for opened in (1, 2, 3, 7):
+        s = A.mh_summary(doors=10, opened=opened, know=1.0)
+        check(f"knowing host, opened={opened}: stay stays 1/10", s["stay_prob"], 0.1)
+
+
+# -- 1f. Shannon's demon -------------------------------------------------------
+def mc_rebalance_growth(interval, p, vol, w, cost, n=300_000, rounds_mult=1,
+                        seed=88):
+    """Vectorised Monte Carlo of the exact per-cycle growth formula.
+
+    Simulates exactly one rebalancing cycle of `interval` periods, n_paths times,
+    which checks sd_cycle_growth directly rather than composing many cycles --
+    composing would also work (growth per period is the same by construction)
+    but this isolates the one formula under test.
+    """
+    rng = np.random.default_rng(seed)
+    up, down = A.sd_moves(vol)
+    heads = rng.random((n, interval)) < p
+    log_r = np.where(heads, math.log(up), math.log(down)).sum(axis=1)
+    r = np.exp(log_r)
+    m = 1.0 - w + w * r
+    log_m = np.log(m)
+    if cost > 0.0 and 0.0 < w < 1.0:
+        w_after = w * r / m
+        log_c = np.log1p(-cost * np.abs(w_after - w))
+    else:
+        log_c = 0.0
+    return float((log_m + log_c).mean()) / interval
+
+
+def verify_shannon():
+    print("\nShannon's demon: closed forms vs Monte Carlo (300k cycles)")
+    cases = [
+        dict(interval=1, p=0.5, vol=0.3, w=0.5, cost=0.0),
+        dict(interval=5, p=0.5, vol=0.3, w=0.5, cost=0.0),
+        dict(interval=1, p=0.5, vol=0.3, w=0.5, cost=0.01),
+        dict(interval=3, p=0.5, vol=0.15, w=0.3, cost=0.0),
+        dict(interval=1, p=0.55, vol=0.3, w=0.5, cost=0.0),  # a trending stock
+    ]
+    for c in cases:
+        print(f"\n  case {c}")
+        got = mc_rebalance_growth(**c)
+        want = A.sd_cycle_growth(**c)
+        check("growth per period", got, want, tol=3e-4)
+
+    # A trendless stock (down = 1/up, p = 1/2) has exactly zero time-average
+    # growth by construction -- no Monte Carlo needed, this is algebra.
+    check("trendless stock growth = 0", A.sd_stock_growth(0.5, 0.3), 0.0)
+    # ...but positive ensemble growth, which is the seed of the whole paradox:
+    # E[m] > 1 while E[ln m] = 0.
+    drift = A.sd_stock_drift(0.5, 0.3)
+    ok = drift > 0.0
+    if not ok:
+        FAILURES.append(("stock ensemble drift > 0", drift, "> 0"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] trendless stock still has positive "
+          f"ensemble drift: {drift*100:.3f} %/period")
+
+    # No cost: rebalancing every period beats every longer interval, on a
+    # trendless stock. The curve need not be globally monotone once a trend or a
+    # cost is present, but the two endpoints bracketing the interior optimum
+    # must hold at zero cost.
+    xs, gs = A.sd_interval_curve(rounds=200, p=0.5, vol=0.3, w=0.5, cost=0.0)
+    ok = gs[0] == max(gs)
+    if not ok:
+        FAILURES.append(("best interval is 1 at zero cost", gs.index(max(gs)) + 1, 1))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] zero-cost optimum is interval=1")
+
+    # A large enough cost must eventually push the optimum away from 1: there is
+    # a trade-off, not a free lunch.
+    _, g_cheap = A.sd_best_interval(rounds=200, p=0.5, vol=0.3, w=0.5, cost=0.0)
+    best_n, g_costly = A.sd_best_interval(rounds=200, p=0.5, vol=0.3, w=0.5, cost=0.05)
+    ok = best_n > 1
+    if not ok:
+        FAILURES.append(("cost pushes optimal interval above 1", best_n, "> 1"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] a 5% turnover cost moves the optimum "
+          f"to every {best_n} periods")
+
+    # A trending stock (p far from 1/2) needn't be helped by rebalancing at all
+    # -- the honest caveat the story has to carry.
+    trend = A.sd_summary(rounds=200, p=0.7, vol=0.3, w=0.5, interval=1, cost=0.0)
+    ok = trend["harvest"] < 0.0
+    if not ok:
+        FAILURES.append(("trending stock: rebalancing hurts", trend["harvest"], "< 0"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] a trending stock (p=0.7) makes "
+          f"rebalancing every period cost {-trend['harvest']*100:.3f} %/period "
+          f"relative to holding")
+
+    # kelly_w should be 1/2 for the symmetric trendless coin, matching the claim
+    # that Shannon's 50/50 split is exactly the Kelly fraction.
+    check("Kelly fraction of the symmetric trendless coin = 1/2",
+          A.sd_summary(rounds=200, p=0.5, vol=0.3, w=0.5)["kelly_w"], 0.5, tol=1e-6)
+
+
+# -- 1g. insurance and risk pooling --------------------------------------------
+def mc_pool_growth(members, wealth, loss, hazard, n=200_000, seed=99):
+    rng = np.random.default_rng(seed)
+    k = rng.binomial(members, hazard, n)
+    m = 1.0 - (loss / wealth) * (k / members)
+    return float(np.log(m).mean())
+
+
+def verify_insurance():
+    print("\nInsurance and risk pooling: closed forms vs Monte Carlo")
+    print("\n  buyer's max premium is where insured growth = uninsured growth")
+    for wealth, loss, hazard in [(100000.0, 30000.0, 0.05), (50000.0, 40000.0, 0.1),
+                                 (200000.0, 10000.0, 0.02)]:
+        p_max = A.ins_buyer_max_premium(wealth, loss, hazard)
+        check(f"insured(p_max) = uninsured  (W={wealth}, L={loss}, pi={hazard})",
+              A.ins_insured_growth(wealth, p_max),
+              A.ins_uninsured_growth(wealth, loss, hazard))
+        # Strictly above the expected payout -- the concavity gap that makes the
+        # trade possible at all.
+        ok = p_max > hazard * loss
+        if not ok:
+            FAILURES.append((f"buyer_max > E[payout] W={wealth}", p_max, f"> {hazard*loss}"))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] p_max ${p_max:,.2f} > expected "
+              f"payout ${hazard*loss:,.2f}")
+
+    print("\n  seller's min premium is the root of seller growth = 0")
+    for sv, loss, hazard in [(1000000.0, 30000.0, 0.05), (500000.0, 40000.0, 0.1),
+                             (2000000.0, 10000.0, 0.02)]:
+        p_min = A.ins_seller_min_premium(sv, loss, hazard)
+        check(f"seller_growth(p_min) = 0  (V={sv}, L={loss}, pi={hazard})",
+              A.ins_seller_growth(sv, p_min, loss, hazard), 0.0, tol=1e-8)
+        ok = p_min > hazard * loss
+        if not ok:
+            FAILURES.append((f"seller_min > E[payout] V={sv}", p_min, f"> {hazard*loss}"))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] p_min ${p_min:,.2f} > expected "
+              f"payout ${hazard*loss:,.2f}")
+
+    # The band: at the textbook numbers, a real range exists where both sides
+    # improve. This is the thing expected value alone cannot produce.
+    p_max = A.ins_buyer_max_premium(100000.0, 30000.0, 0.05)
+    p_min = A.ins_seller_min_premium(1000000.0, 30000.0, 0.05)
+    ok = p_min < p_max
+    if not ok:
+        FAILURES.append(("premium band exists", p_min, f"< {p_max}"))
+    print(f"\n  [{'ok  ' if ok else 'FAIL'}] band exists: seller_min ${p_min:,.2f} "
+          f"< buyer_max ${p_max:,.2f}")
+    mid = 0.5 * (p_min + p_max)
+    ok = (A.ins_insured_growth(100000.0, mid) > A.ins_uninsured_growth(100000.0, 30000.0, 0.05)
+          and A.ins_seller_growth(1000000.0, mid, 30000.0, 0.05) > 0.0)
+    if not ok:
+        FAILURES.append(("midpoint premium improves both sides", ok, True))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] a premium in the middle of the band "
+          f"improves both sides' growth rate")
+
+    print("\n  risk pooling vs Monte Carlo (200k draws per pool size)")
+    for members in (2, 10, 50, 500):
+        got = mc_pool_growth(members, 100000.0, 30000.0, 0.05)
+        want = A.ins_pool_growth(members, 100000.0, 30000.0, 0.05)
+        check(f"pool growth, n={members}", got, want, tol=3e-4)
+
+    print("\n  pool growth rises monotonically toward the infinite-pool limit")
+    sizes = [1, 2, 5, 10, 50, 200, 2000]
+    growths = [A.ins_pool_growth(n, 100000.0, 30000.0, 0.05) for n in sizes]
+    limit = A.ins_pool_limit(100000.0, 30000.0, 0.05)
+    mono = all(b >= a - 1e-12 for a, b in zip(growths, growths[1:]))
+    bounded = all(g <= limit + 1e-9 for g in growths)
+    ok = mono and bounded
+    if not ok:
+        FAILURES.append(("pool growth monotone & bounded by limit", growths, limit))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] monotone: {mono}, bounded by the limit "
+          f"({limit*100:.4f} %/period): {bounded}")
+    check("n=1 pool equals the uninsured player",
+          A.ins_pool_growth(1, 100000.0, 30000.0, 0.05),
+          A.ins_uninsured_growth(100000.0, 30000.0, 0.05))
+
+    # Break-even pool size: one smaller must fail to beat the premium, this size
+    # must succeed (or n=1 already wins).
+    n_be = A.ins_pool_break_even(2000.0, 100000.0, 30000.0, 0.05)
+    target = A.ins_insured_growth(100000.0, 2000.0)
+    ok = A.ins_pool_growth(n_be, 100000.0, 30000.0, 0.05) >= target - 1e-12
+    if n_be > 1:
+        ok = ok and A.ins_pool_growth(n_be - 1, 100000.0, 30000.0, 0.05) < target
+    if not ok:
+        FAILURES.append(("break-even pool is the smallest that wins", n_be, target))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] break-even pool size {n_be} is the "
+          f"smallest that beats a $2,000 premium")
+
+    print("\n  chart sweeps agree with the scalar functions they sample")
+    xs, buyer, seller = A.ins_premium_curve(100000.0, 1000000.0, 30000.0, 0.05)
+    i = len(xs) // 3
+    check("premium curve buyer value", buyer[i],
+          A.ins_buyer_value(100000.0, xs[i], 30000.0, 0.05))
+    check("premium curve seller value", seller[i],
+          A.ins_seller_value(1000000.0, xs[i], 30000.0, 0.05))
+    # The band read off the curve (last positive-buyer, first positive-seller)
+    # must bracket the same interval ins_summary reports from the closed forms.
+    crosses = [x for x, b, s in zip(xs, buyer, seller) if b > 0 and s > 0]
+    ok = bool(crosses) and min(crosses) >= p_min - 1e-6 and max(crosses) <= p_max + 1e-6
+    if not ok:
+        FAILURES.append(("premium curve band matches closed-form band", crosses,
+                         (p_min, p_max)))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] every premium where the curve shows "
+          f"both sides positive lies inside [${p_min:,.2f}, ${p_max:,.2f}]")
+
+    sizes, growth = A.ins_pool_curve(100000.0, 30000.0, 0.05, max_members=200)
+    check("pool curve at n=50", growth[49], A.ins_pool_growth(50, 100000.0, 30000.0, 0.05))
+
+
 # -- 2. golden values for the JS engine --------------------------------------
 GOLDEN_CASES = [
     dict(w0=100.0, rounds=100, p=0.5, up=1.5, down=0.6, f=1.0),
@@ -389,6 +644,30 @@ PD_GOLDEN = [
     dict(rounds=50, t=5.0, noise=0.0, generations=60),
     dict(rounds=20, t=4.0, noise=0.05, generations=30),
     dict(rounds=100, t=5.9, noise=0.15, generations=40),
+]
+
+MH_GOLDEN = [
+    dict(doors=3, opened=1, know=1.0),   # the classic puzzle
+    dict(doors=3, opened=1, know=0.0),   # lucky host: no information at all
+    dict(doors=3, opened=1, know=0.6),   # a dial in between
+    dict(doors=5, opened=3, know=1.0),
+    dict(doors=10, opened=1, know=0.8),
+]
+
+SD_GOLDEN = [
+    dict(rounds=200, p=0.5, vol=0.3, w=0.5, interval=1, cost=0.0),
+    dict(rounds=200, p=0.5, vol=0.3, w=0.5, interval=5, cost=0.0),
+    dict(rounds=200, p=0.5, vol=0.15, w=0.3, interval=1, cost=0.01),
+    dict(rounds=400, p=0.55, vol=0.3, w=0.5, interval=1, cost=0.0),
+]
+
+INS_GOLDEN = [
+    dict(wealth=100000.0, seller_wealth=1000000.0, premium=2000.0, loss=30000.0,
+         hazard=0.05, members=50),
+    dict(wealth=50000.0, seller_wealth=500000.0, premium=5000.0, loss=40000.0,
+         hazard=0.1, members=20),
+    dict(wealth=200000.0, seller_wealth=5000000.0, premium=300.0, loss=10000.0,
+         hazard=0.02, members=200),
 ]
 
 
@@ -512,12 +791,89 @@ def emit_golden():
             },
         })
 
+    # -- Monty Hall -----------------------------------------------------------
+    monty = []
+    for c in MH_GOLDEN:
+        s = A.mh_summary(**c)
+        monty.append({
+            "params": c,
+            "expect": {
+                "doors": s["doors"], "opened": s["opened"],
+                "switchProb": s["switch_prob"], "stayProb": s["stay_prob"],
+                "goatProb": s["goat_prob"],
+                "switchKnowing": s["switch_knowing"], "switchRandom": s["switch_random"],
+            },
+        })
+
+    monty_cfg = dict(games=200, doors=3, opened=1, know=1.0, seed=7)
+    m_valid, m_stay, m_switch, m_first = A.simulate_monty(**monty_cfg)
+    monty_sim = {
+        "config": monty_cfg, "valid": m_valid, "stayWins": m_stay,
+        "switchWins": m_switch, "first": m_first,
+    }
+
+    # -- Shannon's demon --------------------------------------------------------
+    shannon = []
+    for c in SD_GOLDEN:
+        s = A.sd_summary(**c)
+        cxs, cgs = A.sd_interval_curve(c["rounds"], c["p"], c["vol"], c["w"],
+                                       c["cost"], max_interval=30)
+        shannon.append({
+            "params": c,
+            "expect": {
+                "up": s["up"], "down": s["down"],
+                "stockGrowth": s["stock_growth"], "stockDrift": s["stock_drift"],
+                "rebalGrowth": s["rebal_growth"], "holdGrowth": s["hold_growth"],
+                "harvest": s["harvest"],
+                "bestInterval": s["best_interval"], "bestGrowth": s["best_growth"],
+                "kellyW": s["kelly_w"],
+            },
+            "intervalCurve": {"xs": cxs, "gs": cgs},
+        })
+
+    sd_cfg = dict(n_paths=4, rounds=40, w0=100.0, p=0.5, vol=0.3, w=0.5,
+                  interval=5, cost=0.0, seed=7)
+    (sd_first, sd_hold_terms, sd_rebal_terms) = A.simulate_rebalance(**sd_cfg)
+    sd_sim = {
+        "config": sd_cfg,
+        "firstPrice": sd_first[0], "firstHold": sd_first[1], "firstRebal": sd_first[2],
+        "termHold": sd_hold_terms, "termRebal": sd_rebal_terms,
+    }
+
+    # -- insurance and risk pooling ---------------------------------------------
+    insurance = []
+    for c in INS_GOLDEN:
+        s = A.ins_summary(**c)
+        pxs, pbuy, psell = A.ins_premium_curve(
+            c["wealth"], c["seller_wealth"], c["loss"], c["hazard"], points=40)
+        psizes, pgrowth = A.ins_pool_curve(
+            c["wealth"], c["loss"], c["hazard"], max_members=60)
+        insurance.append({
+            "params": c,
+            "expect": {
+                "expectedPayout": s["expected_payout"],
+                "buyerMax": s["buyer_max"], "sellerMin": s["seller_min"],
+                "bandOk": s["band_ok"], "bandWidth": s["band_width"],
+                "uninsuredGrowth": s["uninsured_growth"],
+                "insuredGrowth": s["insured_growth"],
+                "sellerGrowth": s["seller_growth"],
+                "buyerValue": s["buyer_value"], "sellerValue": s["seller_value"],
+                "poolGrowth": s["pool_growth"], "poolLimit": s["pool_limit"],
+                "poolBreakEven": s["pool_break_even"],
+            },
+            "premiumCurve": {"xs": pxs, "buyer": pbuy, "seller": psell},
+            "poolCurve": {"sizes": psizes, "growth": pgrowth},
+        })
+
     payload = {
         "prng": prng, "cases": cases, "sim": sim, "binom": binom,
         "strategies": list(A.STRATEGIES),
         "ruin": ruin, "ruinSim": ruin_sim,
         "stpete": stpete, "stpeteSim": sp_sim,
         "pd": pd,
+        "monty": monty, "montySim": monty_sim,
+        "shannon": shannon, "shannonSim": sd_sim,
+        "insurance": insurance,
     }
     out = os.path.join(ROOT, "js", "golden.js")
     with open(out, "w") as fh:
@@ -529,6 +885,8 @@ def emit_golden():
         fh.write(";\n")
     print(f"  wrote {out} ({len(cases)} coin cases, {len(ruin)} ruin cases, "
           f"{len(stpete)} St Petersburg cases, {len(pd)} dilemma cases, "
+          f"{len(monty)} Monty Hall cases, {len(shannon)} Shannon cases, "
+          f"{len(insurance)} insurance cases, "
           f"{len(prng)} PRNG streams, {len(binom)} binomial points)")
 
 
@@ -538,6 +896,9 @@ if __name__ == "__main__":
     verify_ruin()
     verify_st_petersburg()
     verify_pd()
+    verify_monty()
+    verify_shannon()
+    verify_insurance()
     emit_golden()
 
     print()
