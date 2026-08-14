@@ -636,15 +636,14 @@ window.EP = window.EP || {};
       story:
         "Sell a put below a recent dip and you are paid twice: keep the " +
         "premium if the stock recovers, or buy it at a discount if it " +
-        "doesn't. Get the shares, then sell a call above the next high — " +
-        "paid again, either way. Traders call this cycle “the wheel,” and " +
-        "it looks like manufacturing income from nothing. Selling puts and " +
-        "calls this way is decades old; running them as one repeating " +
-        "cycle is newer, popularised on trading forums in the 2010s. None " +
-        "of it beats holding the stock unless the premium pays more than " +
-        "the stock's risk is worth. Pick a real index or stock below to " +
-        "run all four strategies on what it actually did since 2009, " +
-        "instead of a simulated coin flip.",
+        "doesn't. Take the shares, keep them, and sell a call at every new " +
+        "high — paid again, either way. Traders call this cycle “the " +
+        "wheel,” and it looks like manufacturing income from nothing. " +
+        "Selling puts and calls this way is decades old; running them as " +
+        "one repeating cycle is newer, popularised on trading forums in " +
+        "the 2010s. None of it beats holding the stock unless the premium " +
+        "pays more than the stock's risk is worth. Pick a real index or " +
+        "stock below to run it on what actually happened since 2009.",
       controls: [
         { key: "underlying", type: "select", label: "What are you trading?",
           value: "simulated", options: marketOptions(),
@@ -663,15 +662,15 @@ window.EP = window.EP || {};
           min: 1, max: 18, step: 1, value: 5, int: true,
           fmt: (v) => `${Math.round(v)} yr` },
       ],
-      // The rules of the wheel itself -- tenors, the sale haircut, the stop
-      // and take-profit thresholds -- are the definition of this strategy,
-      // not a dial for exploring it, the same way the ergodic coin fixes f=1
-      // and leaves f as Kelly's own dial instead. s0 is fixed because only
-      // its ratio to w0 (how many contracts one lot buys) matters, and w0
-      // alone already exposes that.
+      // The rules of the wheel itself -- tenors, the sale haircut, the
+      // take-profit threshold -- are the definition of this strategy, not a
+      // dial for exploring it, the same way the ergodic coin fixes f=1 and
+      // leaves f as Kelly's own dial instead. s0 is fixed because only its
+      // ratio to w0 (how many contracts one lot buys) matters, and w0 alone
+      // already exposes that. There is deliberately no stop-loss on the put:
+      // see the note, and lab/analytics.py:simulate_wheel.
       fixed: { s0: 100, r: 0.03, q: 0, xMonths: 6, yMonths: 3, sellHaircut: 0.10,
-               putSl: 0.30, callTp: 0.70, callSl: 0.30, stockFeePct: 0.005,
-               optFee: 0.65 },
+               callTp: 0.70, stockFeePct: 0.005, optFee: 0.65 },
       // A real ticker replaces the simulated GBM path outright: its daily
       // closes (already split/dividend-adjusted by fetch_market_data.py) are
       // rebased to start at s0 so the wheel's 100-shares-per-contract sizing
@@ -726,41 +725,51 @@ window.EP = window.EP || {};
                              : "exact, over every possible path" },
         { label: "A single put's real-world odds of assignment",
           value: pct(s.putNaiveAssignProb),
-          note: "from the drift/vol sliders — exact, no stop-loss or entry timing" },
+          note: "exact — one put held to expiry, from the drift/vol sliders" },
         { label: "This simulation's actual assignment rate",
-          value: pct(s.simAssignRate), note: `of ${count(s.putsSold)} puts sold` },
+          value: pct(s.simAssignRate),
+          note: `of ${count(s.putsSold)} puts sold — the gap is entry timing` },
       ],
       note:
-        "The last two tiles are the whole tension. A put sold today and " +
-        "held to expiry with no stop at all gets assigned about as often as " +
-        "the exact formula says it should. The simulation's own rate " +
-        "differs from that for two reasons at once: the -30% stop can end a " +
-        "losing put early, before it would have reached expiry in the " +
-        "money, and the entry itself is not an unconditional day — it only " +
-        "fires once price crosses the dip line, which the exact formula " +
-        "does not know about. Both effects push the same way, which is why " +
-        "acquisition here is common but not universal, and why the " +
-        "covered-call leg can sit idle for a long stretch waiting on a " +
-        "fresh all-time high that a declining stock may never deliver — " +
-        "watch for the marked events on the first chart to thin out after " +
-        "an assignment. " +
+        "Two rules here follow from the word acquisition, and both are " +
+        "worth stating because the obvious alternative is a trap. First, " +
+        "the puts carry no stop-loss. A put going into the money is the " +
+        "strategy working, not a loss to cut — and a stop defined on the " +
+        "put's own marked value is self-defeating in the most literal way, " +
+        "because any path that ends in assignment must first push the put " +
+        "deep enough in to trip the stop. An earlier version of this page " +
+        "carried a -30% stop and, run over the S&P's 2009-2026 history, " +
+        "sold 161 puts and took delivery exactly zero times: an " +
+        "acquisition strategy that structurally could not acquire, sitting " +
+        "in cash for seventeen years while the thing it meant to buy went " +
+        "up eightfold. A risk control defined on the wrong variable can " +
+        "quietly delete the strategy it is meant to protect. Second, the " +
+        "shares are never sold — a call finishing in the money is bought " +
+        "back at intrinsic rather than delivered, so exposure only " +
+        "ratchets up and the comparison against buy-and-hold stays a " +
+        "comparison of the same holding. " +
+        "That is what the first two tiles are for. With no stop in the " +
+        "way, the simulation's assignment rate lands close to the exact " +
+        "formula's, and the remaining gap is pure entry timing: the wheel " +
+        "only writes after price crosses the dip line, which the formula " +
+        "does not know about. " +
         "The bars are one path's race, not a law: rerun it and any of the " +
-        "four can win. The sweep is the number that generalises. It answers " +
-        "the only question that actually decides whether selling options " +
-        "for a living works — not the win rate on any one trade, but " +
-        "whether the implied volatility you are paid exceeds the realized " +
-        "volatility the stock actually delivers by more than the haircut " +
-        "and the fees cost. Below that line, the wheel is not a source of " +
-        "yield. It is a worse way to hold the stock. " +
-        "Picking a real index or stock swaps the simulated coin flip for " +
-        "what that security's daily closes actually did since 2009 " +
-        "(split- and dividend-adjusted); the drift and volatility sliders " +
-        "then stop drawing the path and only feed the two formula-based " +
-        "tiles, and the horizon locks to that security's own full history. " +
-        "Every real series is rebased to start at the same price so the " +
-        "contract math behaves the same regardless of the ticker's real " +
-        "level or currency — the wheel does not know or care that it is " +
-        "trading a rescaled Nikkei instead of a $100 stock.",
+        "four can win. The sweep is the number that generalises. It " +
+        "answers the only question that actually decides whether selling " +
+        "options for a living works — not the win rate on any one trade, " +
+        "but whether the implied volatility you are paid exceeds the " +
+        "realized volatility the stock actually delivers by more than the " +
+        "haircut and the fees cost. Below that line the wheel is not a " +
+        "source of yield; it is a more expensive way to hold the stock. " +
+        "Picking a real index or stock swaps the simulated path for what " +
+        "that security's daily closes actually did since 2009 (split- and " +
+        "dividend-adjusted); the drift and volatility sliders then stop " +
+        "drawing the path and only feed the formula-based tiles, and the " +
+        "horizon locks to that security's own history. Every real series " +
+        "is rebased to start at the same price so the contract math " +
+        "behaves the same regardless of the ticker's real level or " +
+        "currency — the wheel neither knows nor cares that it is trading a " +
+        "rescaled Nikkei instead of a $100 stock.",
     },
     {
       id: "base-rates",

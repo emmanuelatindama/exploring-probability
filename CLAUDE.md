@@ -186,6 +186,34 @@ it and finding `NaN`/`null` in the output. Map field names explicitly at the
 call site (`holdSummary({ sigma: pr.sigmaRv, ... })`) whenever a shared helper
 predates a scenario that needs a more specific name for the same quantity.
 
+**A risk control defined on the wrong variable can silently delete the
+strategy it protects, and every test will still pass.** The wheel's puts
+originally carried a -30% stop on the option's own marked value. That stop is
+incompatible with the strategy's *purpose*: the wheel sells puts in order to be
+assigned, and any path ending in assignment must first push the short put deep
+enough into the money to trip a 30% stop — so the stop fires first, essentially
+always. Run over the S&P's 2009-2026 history the arm sold 161 puts and took
+delivery zero times; on AAPL, 74 puts and zero. It sat in cash for seventeen
+years while the thing it was trying to buy went up eightfold, and it looked
+like a strategy that merely *underperformed* rather than one that could not
+execute at all. Nothing caught this: the bookkeeping identities balanced (zero
+is a valid count), the Python/JS parity tests passed (both sides were equally
+wrong), and the equity curve was smooth and plausible. What caught it was
+printing the event counts and reading them. When a scenario has a stated
+*goal*, assert the goal happens — `verify_wheel` now checks that assignments
+across a batch of seeds is greater than zero, and that no share-disposal event
+is ever emitted.
+
+**Two arms that are supposed to differ can collapse onto each other, and a
+chart will not tell you.** With the old rules the wheel and the puts-only arm
+drew the identical line on the default seed, because the covered-call leg was
+gated on a fresh *all-time* high: after a drawdown that gate never opens, so no
+call is ever written and the two arms are the same simulation. The fix was to
+trigger on a fresh *rolling* high (the same `x_months` window the dip trigger
+uses), which stays live in a downtrend. A comparison scenario should assert its
+arms actually diverge; identical lines read as a rendering bug, and worse, read
+as a *finding*.
+
 **A cohort still open when the horizon ends is a fourth outcome, not a
 missing one.** `simulateWheel`'s bookkeeping identity is `sold = closed early
 + expired + assigned/called-away + still-open` -- the last term exists because

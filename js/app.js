@@ -501,8 +501,8 @@
     },
 
     "wheel-paths": {
-      title: "One account, four strategies, the same seeded stock",
-      cap: "Log scale. Markers show the wheel's own major transitions — top-ups and individual stop-outs are left to the table view.",
+      title: "One account, four strategies, the same stock",
+      cap: "Log scale. Markers show the wheel's own major transitions — worthless expiries and take-profit closes are far too frequent to mark, and are left to the table view.",
       render: (node, d, pr) => ({
         plot: EP.wheelPaths(node, d, pr),
         legend: [
@@ -510,9 +510,9 @@
           { color: getVar("--series-4"), label: "Buy the dip, sell the high" },
           { color: getVar("--series-2"), label: "Puts only (no covered calls)" },
           { color: getVar("--series-1"), label: "The wheel" },
-          { color: getVar("--series-1"), shape: "dot", label: "Put sold / called away" },
-          { color: getVar("--series-3"), shape: "dot", label: "Assigned" },
-          { color: getVar("--series-2"), shape: "dot", label: "Call sold" },
+          { color: getVar("--series-1"), shape: "dot", label: "Put sold" },
+          { color: getVar("--series-3"), shape: "dot", label: "Assigned — shares kept for good" },
+          { color: getVar("--series-2"), shape: "dot", label: "Call sold / bought back in the money" },
         ],
         table: tableWheelPaths(d, pr),
       }),
@@ -943,9 +943,13 @@
   function tableWheelPaths(d, pr) {
     const { wheel } = d.fam;
     const EVENT_LABELS = {
-      sell_put: "Sold put", top_up_put: "Topped up put", stop_put: "Put stopped out",
-      assigned: "Assigned", sell_call: "Sold call", close_call: "Call closed",
-      called_away: "Called away", call_expired: "Call expired worthless",
+      sell_put: "Sold put",
+      put_expired: "Put expired worthless",
+      assigned: "Assigned — shares held for good",
+      sell_call: "Sold covered call",
+      close_call: "Call bought back at a profit",
+      buy_to_close_call: "Call bought back in the money",
+      call_expired: "Call expired worthless",
     };
     const rows = wheel.events.map((e) => [
       String(e.t), EVENT_LABELS[e.kind] || e.kind, String(e.contracts),

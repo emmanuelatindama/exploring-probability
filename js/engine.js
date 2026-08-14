@@ -1533,16 +1533,14 @@ window.EP = window.EP || {};
     return equity;
   }
 
-  /** The wheel (or, with includeCalls=false, the puts-only arm) on an already-
-   *  generated price path. Not a closed form -- see the section note above
-   *  and the bookkeeping comments in lab/analytics.py:simulate_wheel, which
-   *  this mirrors line for line: `cash` is free money, `collateral` is cash
-   *  already reserved against open put lots, and the equity curve marks
-   *  options to zero between transactions rather than continuously
-   *  mark-to-market (the stop decisions, unlike the curve, do mark
-   *  continuously to the live Black-Scholes price). */
+  /** The wheel, or with includeCalls=false the puts-only arm. Mirrors
+   *  analytics.py:simulate_wheel -- see that docstring for why the puts carry
+   *  no stop-loss (a stop on the put's marked value fires before every
+   *  assignment, so an acquisition strategy carrying one can never acquire)
+   *  and why assigned shares are never sold (an in-the-money call is bought
+   *  back at intrinsic rather than delivered). */
   function simulateWheel(path, pr, includeCalls) {
-    const { xMonths, yMonths, dipPct, sellHaircut, putSl, callTp, callSl,
+    const { xMonths, yMonths, dipPct, sellHaircut, callTp,
             sigmaIv, r, q, stockFeePct, optFee, w0 } = pr;
     const n = path.length - 1;
     const dt = 1 / TRADING_DAYS;
@@ -1551,151 +1549,113 @@ window.EP = window.EP || {};
     const callTenor = Math.max(1, Math.round(yMonths * TRADING_DAYS_PER_MONTH));
 
     let cash = w0, collateral = 0, shares = 0;
-    let ath = path[0], dipArmed = true;
-    let state = "wait"; // "wait" | "puts" | "shares"
-    let putStrike = 0, putExpiry = 0, callStrike = 0, callExpiry = 0;
+    let dipArmed = true;
     let putLots = [], callLots = [];
 
     const equity = new Float64Array(n + 1);
     equity[0] = w0;
     const events = [];
-    const stats = { putsSold: 0, putsStopped: 0, putsExpired: 0, assignments: 0,
-      callsSold: 0, callsStopped: 0, callsTp: 0, calledAway: 0, callsExpired: 0,
+    const stats = { putsSold: 0, putsExpired: 0, assignments: 0,
+      callsSold: 0, callsTp: 0, callsBoughtBack: 0, callsExpired: 0,
       putsStillOpen: 0, callsStillOpen: 0 };
 
     for (let t = 1; t <= n; t++) {
       const s = path[t];
-      cash *= Math.exp(r * dt);
-      collateral *= Math.exp(r * dt);
+      const growth = Math.exp(r * dt);
+      cash *= growth;
+      cash += collateral * (growth - 1); // collateral earns too, credited here
 
       let hi = -Infinity;
       for (let i = Math.max(0, t - window); i <= t; i++) if (path[i] > hi) hi = path[i];
       const dipLevel = hi * (1 - dipPct);
       if (s > dipLevel) dipArmed = true;
-      if (s > ath) ath = s;
 
-      if (state === "wait") {
-        if (dipArmed && s <= dipLevel) {
-          putStrike = s; putExpiry = t + putTenor;
-          const nNew = Math.floor(cash / (100 * putStrike));
-          if (nNew > 0) {
-            const theo = bsPutPrice(s, putStrike, putTenor / TRADING_DAYS, sigmaIv, r, q);
-            const premium = theo * (1 - sellHaircut);
-            cash -= nNew * 100 * putStrike;
-            collateral += nNew * 100 * putStrike;
-            cash += nNew * (100 * premium - optFee);
-            putLots.push({ contracts: nNew, premium });
-            stats.putsSold += nNew;
-            events.push({ t, kind: "sell_put", contracts: nNew, strike: putStrike });
-            state = "puts";
-          }
-          dipArmed = false;
+      // -- puts reaching expiry: take delivery (ITM) or keep the premium ---
+      let keptPuts = [];
+      for (const lot of putLots) {
+        if (t < lot.expiry) { keptPuts.push(lot); continue; }
+        const face = lot.contracts * 100 * lot.strike;
+        collateral -= face;
+        if (s < lot.strike) {
+          // The reserved collateral IS the purchase price; only the
+          // transaction cost leaves the account.
+          cash -= face * stockFeePct;
+          shares += lot.contracts * 100;
+          stats.assignments += lot.contracts;
+          events.push({ t, kind: "assigned", contracts: lot.contracts,
+            strike: lot.strike });
+        } else {
+          cash += face;
+          stats.putsExpired += lot.contracts;
+          events.push({ t, kind: "put_expired", contracts: lot.contracts,
+            strike: lot.strike });
         }
-      } else if (state === "puts") {
-        const daysLeft = putExpiry - t;
-        const texp = Math.max(daysLeft, 0) / TRADING_DAYS;
-        const theo = texp > 0
-          ? bsPutPrice(s, putStrike, texp, sigmaIv, r, q)
-          : Math.max(putStrike - s, 0);
+      }
+      putLots = keptPuts;
 
-        const nAdd = Math.floor(cash / (100 * putStrike));
-        if (nAdd > 0 && texp > 0) {
+      // -- write new puts with whatever cash is free -----------------------
+      if (t === 1 || (dipArmed && s <= dipLevel)) {
+        const strike = s;
+        const nNew = Math.floor(cash / (100 * strike));
+        if (nNew > 0) {
+          const theo = bsPutPrice(s, strike, putTenor / TRADING_DAYS, sigmaIv, r, q);
           const premium = theo * (1 - sellHaircut);
-          cash -= nAdd * 100 * putStrike;
-          collateral += nAdd * 100 * putStrike;
-          cash += nAdd * (100 * premium - optFee);
-          putLots.push({ contracts: nAdd, premium });
-          stats.putsSold += nAdd;
-          events.push({ t, kind: "top_up_put", contracts: nAdd, strike: putStrike });
+          cash -= nNew * 100 * strike;
+          collateral += nNew * 100 * strike;
+          cash += nNew * (100 * premium - optFee);
+          putLots.push({ contracts: nNew, premium, strike, expiry: t + putTenor });
+          stats.putsSold += nNew;
+          events.push({ t, kind: "sell_put", contracts: nNew, strike });
+        }
+        if (t !== 1) dipArmed = false;
+      }
+
+      // -- covered calls on uncovered shares, at a fresh rolling high ------
+      if (includeCalls) {
+        let covered = 0;
+        for (const lot of callLots) covered += lot.contracts;
+        covered *= 100;
+        const uncovered = shares - covered;
+        if (s >= hi && uncovered >= 100) {
+          const nNew = Math.floor(uncovered / 100);
+          const strike = s;
+          const theo = bsCallPrice(s, strike, callTenor / TRADING_DAYS, sigmaIv, r, q);
+          const premium = theo * (1 - sellHaircut);
+          cash += nNew * (100 * premium - optFee);
+          callLots.push({ contracts: nNew, premium, strike, expiry: t + callTenor });
+          stats.callsSold += nNew;
+          events.push({ t, kind: "sell_call", contracts: nNew, strike });
         }
 
-        const kept = [];
-        for (const lot of putLots) {
-          const pl = (lot.premium - theo) / lot.premium;
-          if (pl < -putSl) {
-            const c = lot.contracts;
-            collateral -= c * 100 * putStrike;
-            cash += c * 100 * putStrike;
-            cash -= c * (100 * theo + optFee);
-            stats.putsStopped += c;
-            events.push({ t, kind: "stop_put", contracts: c });
-          } else {
-            kept.push(lot);
-          }
-        }
-        putLots = kept;
-
-        if (putLots.length === 0) {
-          state = "wait";
-          dipArmed = s > dipLevel;
-        } else if (daysLeft <= 0) {
-          let total = 0;
-          for (const lot of putLots) total += lot.contracts;
-          collateral -= total * 100 * putStrike;
-          if (s < putStrike) {
-            cash -= total * 100 * putStrike * stockFeePct;
-            shares += total * 100;
-            stats.assignments += total;
-            events.push({ t, kind: "assigned", contracts: total, strike: putStrike });
-            state = "shares";
-          } else {
-            cash += total * 100 * putStrike;
-            stats.putsExpired += total;
-            state = "wait";
-            dipArmed = s > dipLevel;
-          }
-          putLots = [];
-        }
-      } else { // "shares"
-        if (includeCalls && callLots.length === 0 && s >= ath) {
-          const nNew = Math.floor(shares / 100);
-          if (nNew > 0) {
-            callStrike = s; callExpiry = t + callTenor;
-            const theo = bsCallPrice(s, callStrike, callTenor / TRADING_DAYS, sigmaIv, r, q);
-            const premium = theo * (1 - sellHaircut);
-            cash += nNew * (100 * premium - optFee);
-            callLots.push({ contracts: nNew, premium });
-            stats.callsSold += nNew;
-            events.push({ t, kind: "sell_call", contracts: nNew, strike: callStrike });
-          }
-        }
-
-        if (callLots.length > 0) {
-          const daysLeft = callExpiry - t;
-          const texp = Math.max(daysLeft, 0) / TRADING_DAYS;
+        const keptCalls = [];
+        for (const lot of callLots) {
+          const texp = Math.max(lot.expiry - t, 0) / TRADING_DAYS;
           const theo = texp > 0
-            ? bsCallPrice(s, callStrike, texp, sigmaIv, r, q)
-            : Math.max(s - callStrike, 0);
-          const kept = [];
-          for (const lot of callLots) {
-            const pl = (lot.premium - theo) / lot.premium;
-            if (pl > callTp || pl < -callSl) {
-              const c = lot.contracts;
-              cash -= c * (100 * theo + optFee);
-              if (pl > callTp) stats.callsTp += c; else stats.callsStopped += c;
-              events.push({ t, kind: "close_call", contracts: c });
+            ? bsCallPrice(s, lot.strike, texp, sigmaIv, r, q)
+            : Math.max(s - lot.strike, 0);
+          if (t >= lot.expiry) {
+            if (theo > 0) {
+              // In the money at expiry: buy it back rather than deliver,
+              // because the shares are never sold.
+              cash -= lot.contracts * (100 * theo + optFee);
+              stats.callsBoughtBack += lot.contracts;
+              events.push({ t, kind: "buy_to_close_call", contracts: lot.contracts,
+                strike: lot.strike });
             } else {
-              kept.push(lot);
+              stats.callsExpired += lot.contracts;
+              events.push({ t, kind: "call_expired", contracts: lot.contracts,
+                strike: lot.strike });
             }
-          }
-          callLots = kept;
-          if (daysLeft <= 0 && callLots.length > 0) {
-            let total = 0;
-            for (const lot of callLots) total += lot.contracts;
-            if (s > callStrike) {
-              cash += total * 100 * callStrike * (1 - stockFeePct);
-              shares -= total * 100;
-              stats.calledAway += total;
-              events.push({ t, kind: "called_away", contracts: total, strike: callStrike });
-              state = "wait";
-              dipArmed = s > dipLevel;
-            } else {
-              stats.callsExpired += total;
-              events.push({ t, kind: "call_expired", contracts: total, strike: callStrike });
-            }
-            callLots = [];
+          } else if ((lot.premium - theo) / lot.premium >= callTp) {
+            cash -= lot.contracts * (100 * theo + optFee);
+            stats.callsTp += lot.contracts;
+            events.push({ t, kind: "close_call", contracts: lot.contracts,
+              strike: lot.strike });
+          } else {
+            keptCalls.push(lot);
           }
         }
+        callLots = keptCalls;
       }
 
       equity[t] = cash + collateral + shares * s;
@@ -1706,7 +1666,6 @@ window.EP = window.EP || {};
 
     return { equity, events, stats };
   }
-
   /** All four arms on one shared seeded price path -- a paired comparison, so
    *  nearly all of the path's own randomness cancels out of the differences
    *  between arms even though three of the four have no distribution of
@@ -1767,12 +1726,17 @@ window.EP = window.EP || {};
       holdCagrSample: cagr(last(fam.hold), pr.w0, pr.years),
       holdCagrExact: hold.growthRate,
       putNaiveAssignProb: putProbNaive,
-      callNaiveCalledawayProb: callProbNaive,
+      // Renamed from callNaiveCalledawayProb: nothing is ever called away
+      // now, so this is just the chance the call finishes in the money and
+      // has to be bought back.
+      callNaiveItmProb: callProbNaive,
       simAssignRate: assignedRate,
       putsSold: ws.putsSold,
+      putsExpired: ws.putsExpired,
       assignments: ws.assignments,
       callsSold: ws.callsSold,
-      calledAway: ws.calledAway,
+      callsTp: ws.callsTp,
+      callsBoughtBack: ws.callsBoughtBack,
       callsExpired: ws.callsExpired,
     };
   }

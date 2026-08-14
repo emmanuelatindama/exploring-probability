@@ -608,30 +608,57 @@ def verify_wheel():
     check("E[Z]", float(draws.mean()), 0.0, tol=0.02)
     check("Var[Z]", float(draws.var()), 1.0, tol=0.02, rel=True)
 
-    print("\n  with every stop and take-profit disabled, options resolve only at expiry")
-    fam = A.simulate_wheel_family(seed=7, put_sl=50.0, call_tp=50.0, call_sl=50.0)
+    print("\n  with the call take-profit disabled, calls resolve only at expiry")
+    fam = A.simulate_wheel_family(seed=7, call_tp=50.0)
     s_ = fam["wheel"]["stats"]
-    ok = (s_["puts_stopped"] == 0 and s_["calls_stopped"] == 0
-          and s_["calls_tp"] == 0
+    ok = (s_["calls_tp"] == 0
           and s_["puts_sold"] == s_["assignments"] + s_["puts_expired"]
              + s_["puts_still_open"]
-          and s_["calls_sold"] == s_["called_away"] + s_["calls_expired"]
+          and s_["calls_sold"] == s_["calls_bought_back"] + s_["calls_expired"]
              + s_["calls_still_open"])
     if not ok:
-        FAILURES.append(("stops disabled -> only expiry outcomes", s_, "no early closes"))
+        FAILURES.append(("take-profit disabled -> only expiry outcomes", s_,
+                        "no early closes"))
     print(f"  [{'ok  ' if ok else 'FAIL'}] puts {s_['puts_sold']} = "
           f"{s_['assignments']} assigned + {s_['puts_expired']} expired; "
-          f"calls {s_['calls_sold']} = {s_['called_away']} called away + "
+          f"calls {s_['calls_sold']} = {s_['calls_bought_back']} bought back + "
           f"{s_['calls_expired']} expired -- no early close on either side")
+
+    print("\n  shares only ever ratchet up: nothing is sold, ever")
+    for seed in (1, 4, 7):
+        path = A.simulate_gbm_path(seed=seed)
+        w = A.simulate_wheel(path)
+        sold = [e for e in w["events"]
+                if e["kind"] in ("called_away", "sell_stock")]
+        ok = not sold
+        if not ok:
+            FAILURES.append((f"no share sales (seed={seed})", len(sold), 0))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] seed {seed}: "
+              f"{len(sold)} share-disposal events")
+
+    print("\n  a put stop-loss would pre-empt assignment (why there isn't one)")
+    # Regression guard for the defect this rewrite fixed: the acquisition leg
+    # must actually acquire. A -30% stop on the put's own marked value fired
+    # before every assignment, so the arm sold 161 puts over the S&P's history
+    # and took delivery zero times.
+    assigned_any = 0
+    for seed in range(1, 9):
+        assigned_any += A.simulate_wheel_family(seed=seed)["wheel"]["stats"]["assignments"]
+    ok = assigned_any > 0
+    if not ok:
+        FAILURES.append(("wheel acquires shares over 8 seeds", assigned_any, "> 0"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] {assigned_any} contracts assigned "
+          f"across 8 seeds")
 
     print("\n  lot bookkeeping balances across a batch of seeds")
     for seed in range(1, 9):
         fam = A.simulate_wheel_family(seed=seed)
         s_ = fam["wheel"]["stats"]
         puts_ok = (s_["puts_sold"] == s_["assignments"] + s_["puts_expired"]
-                  + s_["puts_stopped"] + s_["puts_still_open"])
-        calls_ok = (s_["calls_sold"] == s_["called_away"] + s_["calls_expired"]
-                   + s_["calls_tp"] + s_["calls_stopped"] + s_["calls_still_open"])
+                  + s_["puts_still_open"])
+        calls_ok = (s_["calls_sold"] == s_["calls_bought_back"]
+                   + s_["calls_expired"] + s_["calls_tp"]
+                   + s_["calls_still_open"])
         equity_ok = min(fam["wheel"]["equity"]) > -1e-6
         ok = puts_ok and calls_ok and equity_ok
         if not ok:
@@ -815,15 +842,15 @@ HOLD_GOLDEN = [
 # t=215), while staying light enough for tests.html to check bit for bit.
 WHEEL_SIM_CFG = dict(w0=20000.0, s0=100.0, mu=0.08, sigma_rv=0.20, sigma_iv=0.24,
                      r=0.03, q=0.0, years=1.0, x_months=6.0, y_months=3.0,
-                     dip_pct=0.05, sell_haircut=0.10, put_sl=0.30, call_tp=0.70,
-                     call_sl=0.30, stock_fee_pct=0.005, opt_fee=0.65, seed=7)
+                     dip_pct=0.05, sell_haircut=0.10, call_tp=0.70,
+                     stock_fee_pct=0.005, opt_fee=0.65, seed=7)
 
 # Deliberately tiny -- this is only checking that engine.js's sweep loop
 # agrees with analytics.py's, not producing a chart-quality curve.
 WHEEL_SWEEP_CFG = dict(w0=20000.0, s0=100.0, mu=0.08, sigma_rv=0.20, r=0.03,
                        q=0.0, years=1.0, x_months=6.0, y_months=3.0,
-                       dip_pct=0.05, sell_haircut=0.10, put_sl=0.30,
-                       call_tp=0.70, call_sl=0.30, stock_fee_pct=0.005,
+                       dip_pct=0.05, sell_haircut=0.10,
+                       call_tp=0.70, stock_fee_pct=0.005,
                        opt_fee=0.65, points=4, n_seeds=3, spread_lo=-0.05,
                        spread_hi=0.10, base_seed=500)
 
@@ -1085,8 +1112,8 @@ def emit_golden():
             "q": WHEEL_SIM_CFG["q"], "years": WHEEL_SIM_CFG["years"],
             "xMonths": WHEEL_SIM_CFG["x_months"], "yMonths": WHEEL_SIM_CFG["y_months"],
             "dipPct": WHEEL_SIM_CFG["dip_pct"], "sellHaircut": WHEEL_SIM_CFG["sell_haircut"],
-            "putSl": WHEEL_SIM_CFG["put_sl"], "callTp": WHEEL_SIM_CFG["call_tp"],
-            "callSl": WHEEL_SIM_CFG["call_sl"], "stockFeePct": WHEEL_SIM_CFG["stock_fee_pct"],
+            "callTp": WHEEL_SIM_CFG["call_tp"],
+            "stockFeePct": WHEEL_SIM_CFG["stock_fee_pct"],
             "optFee": WHEEL_SIM_CFG["opt_fee"], "seed": WHEEL_SIM_CFG["seed"],
         },
         "path": fam["path"],
@@ -1106,8 +1133,8 @@ def emit_golden():
             "r": WHEEL_SWEEP_CFG["r"], "q": WHEEL_SWEEP_CFG["q"],
             "years": WHEEL_SWEEP_CFG["years"], "xMonths": WHEEL_SWEEP_CFG["x_months"],
             "yMonths": WHEEL_SWEEP_CFG["y_months"], "dipPct": WHEEL_SWEEP_CFG["dip_pct"],
-            "sellHaircut": WHEEL_SWEEP_CFG["sell_haircut"], "putSl": WHEEL_SWEEP_CFG["put_sl"],
-            "callTp": WHEEL_SWEEP_CFG["call_tp"], "callSl": WHEEL_SWEEP_CFG["call_sl"],
+            "sellHaircut": WHEEL_SWEEP_CFG["sell_haircut"],
+            "callTp": WHEEL_SWEEP_CFG["call_tp"],
             "stockFeePct": WHEEL_SWEEP_CFG["stock_fee_pct"], "optFee": WHEEL_SWEEP_CFG["opt_fee"],
             "points": WHEEL_SWEEP_CFG["points"], "nSeeds": WHEEL_SWEEP_CFG["n_seeds"],
             "spreadLo": WHEEL_SWEEP_CFG["spread_lo"], "spreadHi": WHEEL_SWEEP_CFG["spread_hi"],
