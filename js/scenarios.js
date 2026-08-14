@@ -125,6 +125,17 @@ window.EP = window.EP || {};
           note: `vs ${pctSigned(s.ensembleGrowth)} expected` },
       ],
       mathBox: coinDispersionBox,
+      notation: {
+        "W_T": "Final wealth after T rounds",
+        "w_0": "Initial wealth",
+        "T (or n)": "Number of rounds",
+        "p": "Probability of heads (winning)",
+        "1−p": "Probability of tails (losing)",
+        "up": "Multiplier if heads (e.g. 1.5 = +50%)",
+        "down": "Multiplier if tails (e.g. 0.6 = −40%)",
+        "E[W_T]": "Expected value (long-run average across all players)",
+        "SD[W_T]": "Standard deviation (typical spread around the mean)",
+      },
       note:
         "The gap between those first two tiles is the whole point. The mean is " +
         "dragged upward by a vanishingly small number of enormous winners, so it " +
@@ -175,6 +186,18 @@ window.EP = window.EP || {};
           note: `of ${count(pr.nPaths)}` },
       ],
       mathBox: coinDispersionBox,
+      notation: {
+        "W_T": "Final wealth after T rounds",
+        "w_0": "Initial wealth",
+        "n": "Number of rounds",
+        "f": "Fraction of wealth staked each round (Kelly optimizes this)",
+        "p": "Probability of heads (winning)",
+        "1−p": "Probability of tails (losing)",
+        "up": "Multiplier if heads (e.g. 1.5 = +50%)",
+        "down": "Multiplier if tails (e.g. 0.6 = −40%)",
+        "E[W_T]": "Expected value (average across all players)",
+        "SD[W_T]": "Standard deviation (typical spread)",
+      },
       note:
         "Growth per round peaks at f* = (p·a − q·b) / (a·b), where a is " +
         "the fractional gain and b the fractional loss. Below f* you leave growth " +
@@ -250,6 +273,15 @@ window.EP = window.EP || {};
         "than the single probability already on the tiles above — they are",
         "the same fact, twice.",
       ],
+      notation: {
+        "W": "Terminal wealth (either $0 or the target)",
+        "target": "Goal amount (multiple of your starting bankroll)",
+        "P(reach)": "Probability of reaching the target before going broke",
+        "E[W]": "Expected value of terminal wealth",
+        "SD[W]": "Standard deviation of terminal wealth",
+        "bet": "Fixed dollar amount wagered each round",
+        "p": "Probability of winning a single bet",
+      },
       note:
         "This game is additive: every round moves you one bet up or one bet " +
         "down, so wealth is a random walk rather than a product, and the axis " +
@@ -342,6 +374,17 @@ window.EP = window.EP || {};
           ? "A finite mean and an infinite spread, at once: this is that case."
           : "Whenever mp is close to 1, small changes move both by a lot.",
       ],
+      notation: {
+        "X": "Payout amount",
+        "m": "Pot multiplier per heads flip (e.g., 2 = doubles)",
+        "N": "The toss number where the first tail lands",
+        "p": "Probability that the coin shows heads (game continues)",
+        "1−p": "Probability that the coin shows tails (game ends)",
+        "E[X]": "Expected payout (mean across many games)",
+        "SD[X]": "Standard deviation of payouts",
+        "m·p": "Determines if mean is finite (must be < 1)",
+        "m²·p": "Determines if standard deviation is finite (must be < 1)",
+      },
       note:
         "The second chart is the paradox drawn directly. Each bar is one " +
         "outcome's contribution to the expected value: what it pays, times how " +
@@ -414,6 +457,13 @@ window.EP = window.EP || {};
         "with a mean and a spread of its own. The number on the tile above",
         "is not an estimate of anything; there is nothing left to average.",
       ],
+      notation: {
+        "T": "Payoff for betraying (temptation to defect)",
+        "R": "Payoff for mutual cooperation (reward)",
+        "P": "Payoff for mutual defection (punishment)",
+        "S": "Payoff for unilateral cooperation (sucker's payoff)",
+        "Score": "Points earned per round for each strategy",
+      },
       note:
         "Every number here is exact, not simulated. Each strategy needs at " +
         "most two bits of history — what you did last round, and whether you " +
@@ -485,6 +535,14 @@ window.EP = window.EP || {};
         "Same number that is already on the first tile, just named as a",
         "distribution's own mean and spread rather than a probability.",
       ],
+      notation: {
+        "switchProb": "Probability of winning if you switch doors",
+        "1−switchProb": "Probability of losing if you switch",
+        "E[win]": "Expected value of the switching strategy",
+        "SD[win]": "Standard deviation of the outcome",
+        "N": "Total number of doors",
+        "k": "Number of doors the host opens to reveal goats",
+      },
       note:
         "The two lines on the first chart are the whole mechanism. A knowing " +
         "host can never open the door hiding the prize, so every bit of " +
@@ -584,6 +642,15 @@ window.EP = window.EP || {};
         "dollars have no equally simple closed form — only the tiles' exact",
         "growth rates do. Terminal wealth here is simulated, not derived.",
       ],
+      notation: {
+        "w": "Stock weight (fraction of wealth invested in the stock)",
+        "1−w": "Cash weight (fraction kept in cash)",
+        "p": "Probability the stock goes up each period",
+        "vol": "Size of each move (volatility)",
+        "up": "Multiplier for an up move = 1 + vol",
+        "down": "Multiplier for a down move = 1/(1 + vol)",
+        "G": "Growth rate per period (exact, from tiles)",
+      },
       note:
         "The stock alone has zero time-average growth here by construction — " +
         "up and down are reciprocals, so a coin that is heads half the time " +
@@ -670,6 +737,16 @@ window.EP = window.EP || {};
         "own terms — and still not enough, on its own, to explain why both",
         "sides are correct to sign at a premium above hazard·loss.",
       ],
+      notation: {
+        "loss": "Dollar amount of the loss if it happens",
+        "hazard": "Probability the loss event occurs",
+        "1−hazard": "Probability the loss does not occur",
+        "premium": "Price of the insurance contract",
+        "E[loss]": "Expected value of the loss",
+        "SD[loss]": "Standard deviation of the loss",
+        "wealth": "Buyer's starting capital",
+        "sellerWealth": "Seller's/insurer's starting capital",
+      },
       note:
         "Expected value says a fair premium is pi × L, and that a rational " +
         "insurer must charge more than that to survive — so on that measure " +
@@ -814,6 +891,17 @@ window.EP = window.EP || {};
         "quantity is a single put or call's own real-world ITM probability",
         "(the tiles above) — everything past one option is simulated.",
       ],
+      notation: {
+        "strike": "Option strike price (exercise price)",
+        "premium": "Price you receive for selling the option",
+        "basis": "Cost basis of shares (what you paid per share)",
+        "s": "Current stock price",
+        "tenor": "Time to expiration of the option",
+        "sigmaIV": "Implied volatility (what you sell options at)",
+        "sigmaRV": "Realized volatility (what the stock actually does)",
+        "dipPct": "Percentage below the rolling high to trigger a new put",
+        "shareSl": "Share stop-loss trigger (max loss cap on shares)",
+      },
       note:
         "The wheel here holds exactly one position at a time. Sell a put; " +
         "hold it to expiry with no stop at all, because the premium is " +

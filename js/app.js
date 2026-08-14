@@ -125,6 +125,21 @@
       const pre = el("pre");
       pre.id = "math-box-lines";
       details.appendChild(pre);
+
+      if (sc.notation && Object.keys(sc.notation).length > 0) {
+        const notationDiv = el("div", "notation-legend");
+        notationDiv.appendChild(el("h4", null, "Notation"));
+        const list = el("dl");
+        for (const [term, definition] of Object.entries(sc.notation)) {
+          const dt = el("dt", null, term);
+          const dd = el("dd", null, definition);
+          list.appendChild(dt);
+          list.appendChild(dd);
+        }
+        notationDiv.appendChild(list);
+        details.appendChild(notationDiv);
+      }
+
       body.appendChild(details);
     }
   }
