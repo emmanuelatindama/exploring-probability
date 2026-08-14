@@ -121,10 +121,11 @@
 
     if (sc.mathBox) {
       const details = el("details", "math-box");
+      details.open = true; // typeset math, opt out of rather than into
       details.appendChild(el("summary", null, "For math enthusiasts"));
-      const pre = el("pre");
-      pre.id = "math-box-lines";
-      details.appendChild(pre);
+      const holder = el("div");
+      holder.id = "math-box-lines";
+      details.appendChild(holder);
 
       if (sc.notation && Object.keys(sc.notation).length > 0) {
         const notationDiv = el("div", "notation-legend");
@@ -138,6 +139,12 @@
         }
         notationDiv.appendChild(list);
         details.appendChild(notationDiv);
+        // The dt terms carry \(...\) delimiters too, same convention as the
+        // math-box lines rendered below -- typeset them once here since,
+        // unlike the formulas, the notation never changes on a re-render.
+        if (window.MathJax && window.MathJax.typesetPromise) {
+          window.MathJax.typesetPromise([notationDiv]);
+        }
       }
 
       body.appendChild(details);
@@ -679,12 +686,20 @@
   }
 
   /** A scenario's closed forms, for readers who want the formula behind the
-   *  tiles rather than just the number -- at most 7 lines, textContent only
-   *  (never innerHTML), same as every other computed label on this page. */
+   *  tiles rather than just the number -- at most 7 lines. Each line is set
+   *  via textContent (never innerHTML, same as every other computed label on
+   *  this page); MathJax then scans those text nodes for \(...\) and \[...\]
+   *  and typesets the math in place without needing the source to be HTML. */
   function renderMathBox(sc, pr, stats) {
-    const pre = $("#math-box-lines");
-    if (!pre || !sc.mathBox) return;
-    pre.textContent = sc.mathBox(pr, stats).join("\n");
+    const holder = $("#math-box-lines");
+    if (!holder || !sc.mathBox) return;
+    holder.textContent = "";
+    for (const line of sc.mathBox(pr, stats)) {
+      holder.appendChild(el("div", "math-line", line));
+    }
+    if (window.MathJax && window.MathJax.typesetPromise) {
+      window.MathJax.typesetPromise([holder]);
+    }
   }
 
   /** Legend keys mirror the mark they stand for: a 2px stroke for lines, a

@@ -9,6 +9,18 @@
 <!-- Pinned so a CDN release can never change the page under us. -->
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
 
+<!-- MathJax: renders the math-box formulas as typeset math instead of plain
+     text. \( \) / \[ \] only -- $ is left alone so dollar amounts in the
+     surrounding prose are never mistaken for math delimiters. -->
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] },
+    options: { skipHtmlTags: ["script", "noscript", "style", "textarea"] },
+  };
+</script>
+<script id="MathJax-script" async
+  src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-mml-chtml.js"></script>
+
 <style>
   /* Palette: the dataviz reference instance, validated by lab/validate_palette.py.
      Dark values are declared under BOTH scopes -- the media query covers the OS
@@ -215,26 +227,35 @@
     padding: 6px 0; min-height: 24px;
   }
   details.math-box summary:hover { color: var(--text-primary); }
-  details.math-box pre {
-    margin: 10px 0 0; padding: 12px 16px;
+  /* Typeset math, not code -- no monospace, no pre-wrap; MathJax owns the
+     line spacing for the formula spans it inserts. */
+  #math-box-lines {
+    margin: 10px 0 0; padding: 14px 18px;
     background: var(--surface-1); border: 1px solid var(--border);
-    border-radius: 8px; font-size: 13px; line-height: 1.6;
-    color: var(--text-secondary); white-space: pre-wrap; max-width: 74ch;
+    border-radius: 8px; font-size: 14px; line-height: 1.9;
+    color: var(--text-secondary); max-width: 74ch;
   }
+  #math-box-lines .math-line { margin: 0 0 6px; }
+  #math-box-lines .math-line:last-child { margin-bottom: 0; }
 
-  /* -- notation legend (definitions of symbols used in math box) */
-  .notation-legend { margin-top: 14px; padding: 12px 16px;
-    background: var(--ghost); border: 1px solid var(--border);
-    border-radius: 8px; font-size: 13px;
+  /* -- notation legend (definitions of symbols used in math box) -------- */
+  .notation-legend {
+    margin-top: 12px; padding: 14px 18px;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-left: 2px solid var(--series-1);
+    border-radius: 8px; font-size: 13px; max-width: 74ch;
   }
-  .notation-legend h4 { margin: 0 0 10px; font-size: 12px; font-weight: 600;
-    color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em;
+  .notation-legend h4 {
+    margin: 0 0 10px; font-size: 12px; font-weight: 600;
+    color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
   }
-  .notation-legend dl { margin: 0; display: grid;
-    grid-template-columns: auto 1fr; gap: 8px 12px;
+  .notation-legend dl {
+    margin: 0; display: grid; grid-template-columns: auto 1fr;
+    gap: 9px 14px; align-items: baseline;
   }
-  .notation-legend dt { font-weight: 600; color: var(--text-primary);
-    font-variant-numeric: tabular-nums; font-family: monospace;
+  .notation-legend dt {
+    margin: 0; font-weight: 600; color: var(--text-primary);
+    white-space: nowrap;
   }
   .notation-legend dd { margin: 0; color: var(--text-secondary); }
 
