@@ -31,7 +31,7 @@ That is a deliberate constraint, not an oversight:
 
 | Path | Role |
 |---|---|
-| `lab/analytics.py` | **Source of truth.** Four numbered sections: the multiplicative coin, gambler's ruin, St Petersburg, the prisoner's dilemma. |
+| `lab/analytics.py` | **Source of truth.** Seven numbered sections: the multiplicative coin, gambler's ruin, St Petersburg, the prisoner's dilemma, Monty Hall, Shannon's demon, insurance and risk pooling. |
 | `lab/verify.py` | Checks the closed forms against Monte Carlo, then writes `js/golden.js`. |
 | `js/engine.js` | Simulation + the same closed forms, mirroring `analytics.py` section for section. |
 | `js/scenarios.js` | The scenario registry. Adding a scenario touches only this file plus a chart if it needs a new form. |
@@ -116,6 +116,38 @@ drawn without the moire that limits the multiplicative tabs to eight.
 `nan <= tol` is false, so `verify.py:check` reported the St Petersburg
 expectation as a failure while printing `got inf, want inf`. Both `check`
 implementations now special-case non-finite values to equality.
+
+**No numpy in JS: use a binomial-weight recurrence, not a pmf call per term.**
+`sd_cycle_growth` and `ins_pool_growth` are each a sum over a binomial
+distribution, and `lab/analytics.py` gets the whole array of weights from one
+vectorised `binom.pmf` call. `js/engine.js` has no numpy, so `binomWeights(n,
+p)` builds the same array with the elementary recurrence `pmf(k+1) = pmf(k) *
+(n-k)/(k+1) * p/q` — one multiply per term instead of a `logGamma`-based
+`binomPmf` call per term. This is the JS answer to "vectorise it": not a
+library, a cheaper loop body. It stays numerically stable for any n this
+project sweeps (up to a few thousand); `pmf(0)` only underflows to a hard zero
+past n ≈ 1074 at p = 0.5, far outside any control range on the page.
+
+**A `derive` that clamps a control's own displayed value must write the clamp
+back into `state`.** Monty Hall's `opened` (doors the host opens) is clamped to
+`doors - 2` inside `mhBoard`, and `opened` is also a slider the reader can see
+and drag directly — unlike the gambler's ruin `target`, which is derived but
+never itself displayed. Without syncing, the slider could show "8" while every
+tile and chart quietly used the clamped value the formulas actually saw.
+`app.js:syncDerivedControls` pulls the post-`derive` value back into
+`state.values` and the DOM after every render, so the number on screen is
+always the number in the maths. Any future scenario where `derive` clamps a
+*visible* control needs this, not just Monty Hall.
+
+**Hovering a slider and scrolling the page changes its value.** This is
+standard `<input type="range">` browser behaviour (Chrome and Firefox both
+apply wheel deltas to a focused/hovered range input), not a bug in this
+project's controls, but it bit screenshot automation: scrolling the page with
+the cursor left over a control changed `doors`/`opened` mid-test and produced
+tiles that looked like a wrong formula until the actual slider values were
+checked. Worth remembering when driving the page programmatically — move the
+pointer (or scroll) away from the controls row before dispatching wheel/scroll
+events.
 
 ## Dataviz
 

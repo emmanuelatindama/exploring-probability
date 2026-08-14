@@ -32,7 +32,13 @@ criterion, and the second scenario shows where it comes from.
 
 - **Ergodic coin flip** — the paradox above
 - **Kelly bet sizing** — the resolution, with a growth-rate sweep over bet size
-- *Gambler's ruin*, *St. Petersburg paradox*, *Iterated prisoner's dilemma* — declared, not yet built
+- **Gambler's ruin** — additive bets against two absorbing barriers
+- **St Petersburg paradox** — a wager with infinite expected value nobody will pay $20 for
+- **Iterated prisoner's dilemma** — a round-robin tournament, then let the winners breed
+- **Monty Hall** — the host's knowledge as a dial, not an assumption
+- **Shannon's demon** — harvesting a growth rate out of a stock that goes nowhere
+- **Insurance and risk pooling** — a contract with negative expected value that both sides are right to sign
+- *Parrondo's paradox*, *base rates*, *the birthday problem*, *the secretary problem*, *the two-envelope paradox*, *optional stopping* — declared, not yet built
 
 ## Running it locally
 

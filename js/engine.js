@@ -947,6 +947,37 @@ window.EP = window.EP || {};
     };
   }
 
+  /** (know values, switch prob, stay prob) over the host's-knowledge dial.
+   *  Every point is one evaluation of mhSwitchProb / mhStayProb. */
+  function mhKnowCurve(doors, opened, points) {
+    const n = points || 101;
+    const ks = new Array(n), switchP = new Array(n), stayP = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const k = i / (n - 1);
+      ks[i] = k;
+      switchP[i] = mhSwitchProb(doors, opened, k);
+      stayP[i] = mhStayProb(doors, opened, k);
+    }
+    return { ks, switchP, stayP };
+  }
+
+  /**
+   * (doors, switch prob under a knowing host, switch prob under a random one)
+   * for door counts from 3 to maxDoors, `opened` held fixed. The comparison the
+   * scenario is actually about: the host's knowledge, not the door count.
+   */
+  function mhDoorsCurve(opened, maxDoors) {
+    const top = Math.max(4, Math.round(maxDoors));
+    const xs = [], knowing = [], random = [];
+    for (let n = 3; n <= top; n++) {
+      if (n - 2 < opened) continue;
+      xs.push(n);
+      knowing.push(mhSwitchProb(n, opened, 1));
+      random.push(mhSwitchProb(n, opened, 0));
+    }
+    return { xs, knowing, random };
+  }
+
   /**
    * Reference play-out, mirroring lab/analytics.py:simulate_monty exactly.
    *
@@ -1321,7 +1352,7 @@ window.EP = window.EP || {};
     pdPair, pdMatrix, pdTournament, pdReplicator, pdSummary,
     // Monty Hall
     mhBoard, mhGoatProb, mhSwitchJoint, mhSwitchProb, mhStayProb, mhSummary,
-    simulateMonty,
+    mhKnowCurve, mhDoorsCurve, simulateMonty,
     // Shannon's demon
     sdMoves, sdStockGrowth, sdStockDrift, sdCycleGrowth, sdHoldGrowth,
     sdHarvest, sdIntervalCurve, sdBestInterval, sdSummary, simulateRebalance,

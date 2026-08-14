@@ -1079,6 +1079,351 @@ window.EP = window.EP || {};
     return Plotly.react(el, data, layout, CONFIG);
   }
 
+  // ==========================================================================
+  // Monty Hall
+  // ==========================================================================
+  /**
+   * Switching vs staying against the host's-knowledge dial.
+   *
+   * The two lines are the whole scenario: at know=1 (the classic puzzle)
+   * switching wins two doors in three; at know=0 (a lucky host) the lines meet,
+   * because a reveal that carries no information cannot change either odds.
+   */
+  function mhKnow(el, d, pr) {
+    const t = theme();
+    const { ks, switchP, stayP } = d.knowCurve;
+
+    const data = [
+      { x: ks, y: stayP, type: "scatter", mode: "lines",
+        line: { color: t.deemph, width: 2 }, name: "Staying",
+        hovertemplate: "<b>%{y:.1%}</b> staying wins<extra></extra>" },
+      { x: ks, y: switchP, type: "scatter", mode: "lines",
+        line: { color: t.s1, width: 2 }, name: "Switching",
+        hovertemplate: "<b>%{y:.1%}</b> switching wins<extra></extra>" },
+      { x: [pr.know], y: [d.stats.switchProb], type: "scatter", mode: "markers",
+        marker: { color: t.s1, size: 9, line: { color: t.surface, width: 2 } },
+        name: "Your dial",
+        hovertemplate: "<b>you: %{y:.1%}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "P(the host knows where the prize is)",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".0%",
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "Chance of winning", font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".0%", range: [0, 1.02],
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", x0: pr.know, x1: pr.know, yref: "paper", y0: 0, y1: 1,
+        line: { color: t.muted, width: 1 }, layer: "below",
+      }],
+      annotations: [
+        { x: pr.know, y: 0, yref: "paper", text: "your dial",
+          showarrow: false, xanchor: "center", yanchor: "bottom", yshift: 2,
+          font: { family: FONT, size: 11, color: t.muted },
+          bgcolor: t.surface, borderpad: 2 },
+      ],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /**
+   * Switching's win rate against the number of doors, for a knowing host and a
+   * random one -- the comparison the scenario is actually about. Door count
+   * changes the *size* of the advantage; the host's knowledge decides whether
+   * there is one at all.
+   */
+  function mhDoors(el, d, pr) {
+    const t = theme();
+    const { xs, knowing, random } = d.doorsCurve;
+
+    const data = [
+      { x: xs, y: random, type: "scatter", mode: "lines+markers",
+        line: { color: t.deemph, width: 2 }, marker: { size: 5 },
+        name: "Random host",
+        hovertemplate: "<b>%{y:.1%}</b> switching wins, random host<extra></extra>" },
+      { x: xs, y: knowing, type: "scatter", mode: "lines+markers",
+        line: { color: t.s1, width: 2 }, marker: { size: 5 },
+        name: "Knowing host",
+        hovertemplate: "<b>%{y:.1%}</b> switching wins, knowing host<extra></extra>" },
+      { x: [pr.doors], y: [d.stats.switchKnowing], type: "scatter", mode: "markers",
+        marker: { color: t.s1, size: 9, line: { color: t.surface, width: 2 } },
+        name: "Your board",
+        hovertemplate: "<b>%{y:.1%}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: `Number of doors (${pr.opened} opened)`,
+                 font: { color: t.textSecondary, size: 12 } },
+        tickmode: "linear", dtick: xs.length > 12 ? 2 : 1,
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "Chance switching wins",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".0%", rangemode: "tozero",
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", x0: pr.doors, x1: pr.doors, yref: "paper", y0: 0, y1: 1,
+        line: { color: t.muted, width: 1 }, layer: "below",
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  // ==========================================================================
+  // Shannon's demon
+  // ==========================================================================
+  /**
+   * The stock, buy-and-hold and rebalanced portfolios, all on the one seeded
+   * price path -- the direct demonstration that the stock can finish flat while
+   * the rebalanced line pulls away from it. Log scale for the same reason every
+   * other wealth axis on the site is: a single lucky path must not flatten the
+   * others onto the floor, though here all three paths share one draw so the
+   * risk is milder than on the multiplicative tabs.
+   */
+  function sdPaths(el, d, pr) {
+    const t = theme();
+    const { price, hold, rebal, stride } = d.sim;
+    const xs = indices(stride);
+    const band = (arr) => Array.from(arr, clampFloor);
+    const py = band(price), hy = band(hold), ry = band(rebal);
+
+    let yLo = Infinity, yHi = -Infinity;
+    for (const arr of [py, hy, ry]) {
+      for (const v of arr) { if (v < yLo) yLo = v; if (v > yHi) yHi = v; }
+    }
+
+    const data = [
+      lineTrace(xs, py, {
+        line: { color: t.deemph, width: 2 }, name: "Stock (buy 100%, never touch)",
+        hovertemplate: "<b>%{y:$,.2f}</b>  stock alone<extra></extra>",
+      }),
+      lineTrace(xs, hy, {
+        line: { color: t.s2, width: 2 }, name: "Buy and hold the mix",
+        hovertemplate: "<b>%{y:$,.2f}</b>  buy-and-hold<extra></extra>",
+      }),
+      lineTrace(xs, ry, {
+        line: { color: t.s1, width: 2 }, name: "Rebalanced every " +
+          `${pr.interval} period${pr.interval === 1 ? "" : "s"}`,
+        hovertemplate: "<b>%{y:$,.2f}</b>  rebalanced<extra></extra>",
+      }),
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Period", font: { color: t.textSecondary, size: 12 } },
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, Object.assign({
+        type: "log",
+        title: { text: "Value (log scale)", font: { color: t.textSecondary, size: 12 } },
+      }, decadeTicks(Math.min(yLo, pr.w0), Math.max(yHi, pr.w0), true))),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", xref: "paper", x0: 0, x1: 1,
+        yref: "y", y0: Math.log10(pr.w0), y1: Math.log10(pr.w0),
+        line: { color: t.axis, width: 1 }, layer: "below",
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /**
+   * Harvest (rebalanced growth minus buy-and-hold growth) against the
+   * rebalancing interval -- the diverging pair, because zero is meaningful
+   * here: above it rebalancing helps, below it costs are eating the harvest.
+   */
+  function sdSweep(el, d, pr) {
+    const t = theme();
+    const { xs, harvest } = d.harvestCurve;
+
+    const posY = harvest.map((v) => (v < 0 ? null : v));
+    const negY = harvest.map((v) => (v > 0 ? null : v));
+
+    const data = [
+      { x: xs, y: negY, type: "scatter", mode: "lines",
+        line: { color: t.neg, width: 2 }, fill: "tozeroy",
+        fillcolor: hexA(t.neg, 0.1), name: "Rebalancing costs more than it harvests",
+        hovertemplate: "<b>%{y:+.4%}</b> per period<extra></extra>" },
+      { x: xs, y: posY, type: "scatter", mode: "lines",
+        line: { color: t.s1, width: 2 }, fill: "tozeroy",
+        fillcolor: hexA(t.s1, 0.1), name: "Rebalancing harvests volatility",
+        hovertemplate: "<b>%{y:+.4%}</b> per period<extra></extra>" },
+      { x: [pr.interval], y: [d.stats.harvest], type: "scatter", mode: "markers",
+        marker: { color: d.stats.harvest >= 0 ? t.s1 : t.neg, size: 9,
+                  line: { color: t.surface, width: 2 } },
+        name: "Your interval",
+        hovertemplate: "<b>%{y:+.4%}</b> at your interval<extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Rebalance every N periods",
+                 font: { color: t.textSecondary, size: 12 } },
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "Harvest vs buy-and-hold",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: "+.3%",
+        zeroline: true, zerolinecolor: t.axis, zerolinewidth: 1,
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", x0: pr.interval, x1: pr.interval, yref: "paper",
+        y0: 0, y1: 1, line: { color: t.muted, width: 1 }, layer: "below",
+      }],
+      annotations: [{
+        x: d.stats.bestInterval, y: d.stats.bestGrowth - d.stats.holdGrowth,
+        text: `best: every ${d.stats.bestInterval}`,
+        showarrow: false, xanchor: "left", yanchor: "bottom",
+        xshift: 8, yshift: 4,
+        font: { family: FONT, size: 11, color: t.textPrimary },
+        bgcolor: t.surface, borderpad: 3,
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  // ==========================================================================
+  // Insurance and risk pooling
+  // ==========================================================================
+  /**
+   * Buyer's and seller's growth-equivalent value against the premium, with the
+   * band where both are positive shaded -- the range expected value alone
+   * cannot produce, because it can only ever show a transfer.
+   */
+  function insBand(el, d, pr) {
+    const t = theme();
+    const { xs, buyer, seller } = d.premiumCurve;
+    const { buyerMax, sellerMin, bandOk } = d.stats;
+
+    const data = [
+      { x: xs, y: buyer, type: "scatter", mode: "lines",
+        line: { color: t.s1, width: 2 }, name: "Buyer's value",
+        hovertemplate: "<b>%{y:$,.2f}</b>/period, buyer<extra></extra>" },
+      { x: xs, y: seller, type: "scatter", mode: "lines",
+        line: { color: t.s3, width: 2 }, name: "Seller's value",
+        hovertemplate: "<b>%{y:$,.2f}</b>/period, seller<extra></extra>" },
+      { x: [pr.premium], y: [d.stats.buyerValue], type: "scatter", mode: "markers",
+        marker: { color: t.s1, size: 9, line: { color: t.surface, width: 2 } },
+        name: "Your premium (buyer)",
+        hovertemplate: "<b>%{y:$,.2f}</b><extra></extra>" },
+      { x: [pr.premium], y: [d.stats.sellerValue], type: "scatter", mode: "markers",
+        marker: { color: t.s3, size: 9, line: { color: t.surface, width: 2 } },
+        name: "Your premium (seller)",
+        hovertemplate: "<b>%{y:$,.2f}</b><extra></extra>" },
+    ];
+
+    const shapes = [{
+      type: "line", x0: xs[0], x1: xs[xs.length - 1], yref: "y", y0: 0, y1: 0,
+      line: { color: t.axis, width: 1 }, layer: "below",
+    }, {
+      type: "line", x0: pr.premium, x1: pr.premium, yref: "paper", y0: 0, y1: 1,
+      line: { color: t.muted, width: 1 }, layer: "below",
+    }];
+    if (bandOk) {
+      shapes.unshift({
+        type: "rect", x0: sellerMin, x1: buyerMax, yref: "paper", y0: 0, y1: 1,
+        fillcolor: hexA(t.s1, 0.08), line: { width: 0 }, layer: "below",
+      });
+    }
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Premium", font: { color: t.textSecondary, size: 12 } },
+        tickprefix: "$", tickformat: ",d",
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "Value (growth-equivalent $/period)",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickprefix: "$", tickformat: ",.0f",
+      }),
+      hovermode: "x unified",
+      shapes,
+      annotations: bandOk ? [{
+        x: (sellerMin + buyerMax) / 2, y: 1, yref: "paper",
+        text: "both sides improve here",
+        showarrow: false, xanchor: "center", yanchor: "top", yshift: -6,
+        font: { family: FONT, size: 11, color: t.textSecondary },
+        bgcolor: t.surface, borderpad: 3,
+      }] : [],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /**
+   * Growth rate of one pool member against pool size, approaching the
+   * infinite-pool limit -- nobody in this picture has taken the other side of
+   * anything, unlike the buyer/seller band above.
+   */
+  function insPool(el, d, pr) {
+    const t = theme();
+    const { sizes, growth } = d.poolCurve;
+    const { poolLimit } = d.stats;
+
+    const data = [
+      { x: sizes, y: growth, type: "scatter", mode: "lines",
+        line: { color: t.s1, width: 2 }, name: "Pool of this size",
+        hovertemplate: "<b>%{y:+.4%}</b>/period, n=%{x}<extra></extra>" },
+      { x: [pr.members], y: [d.stats.poolGrowth], type: "scatter", mode: "markers",
+        marker: { color: t.s1, size: 9, line: { color: t.surface, width: 2 } },
+        name: "Your pool",
+        hovertemplate: "<b>%{y:+.4%}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Pool size (members)",
+                 font: { color: t.textSecondary, size: 12 } },
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "Growth per period, one member",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: "+.3%",
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", xref: "paper", x0: 0, x1: 1, yref: "y",
+        y0: poolLimit, y1: poolLimit,
+        line: { color: t.deemph, width: 1, dash: "dot" }, layer: "below",
+      }, {
+        type: "line", x0: pr.members, x1: pr.members, yref: "paper", y0: 0, y1: 1,
+        line: { color: t.muted, width: 1 }, layer: "below",
+      }],
+      annotations: [{
+        x: sizes[sizes.length - 1], y: poolLimit,
+        text: `infinite pool: ${EP.fmt.pctSigned(poolLimit)}`,
+        showarrow: false, xanchor: "right", yanchor: "bottom",
+        font: { family: FONT, size: 11, color: t.textPrimary },
+        bgcolor: t.surface, borderpad: 3,
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
   // -- colour helpers --------------------------------------------------------
   /** rgba() from a hex the browser resolved for us, for 10% area washes. */
   function hexA(hex, alpha) {
@@ -1116,5 +1461,6 @@ window.EP = window.EP || {};
     trajectory, histogram, sweep, theme, FLOOR, RUIN_PATHS,
     ruinWalks, ruinOdds, ruinBoldness, spRunningMean, spContributions,
     pdScores, pdHeatmap, pdShares, strategyColors,
+    mhKnow, mhDoors, sdPaths, sdSweep, insBand, insPool,
   });
 })(window.EP);

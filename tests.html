@@ -248,6 +248,111 @@
           { exact: true });
   }
 
+  // -- 8. Monty Hall ----------------------------------------------------------
+  for (const c of G.monty) {
+    const p = c.params;
+    group(`Monty Hall — ${p.doors} doors, ${p.opened} opened, know=${p.know}`);
+    const got = EP.mhSummary(p);
+    for (const key of Object.keys(c.expect)) {
+      const isCount = key === "doors" || key === "opened";
+      check(key, got[key], c.expect[key], isCount ? { exact: true } : { relTol: 1e-9 });
+    }
+    // Staying and switching-to-one-of-the-others must exhaust the win space.
+    const others = p.doors - 1 - EP.mhBoard(p.doors, p.opened)[1];
+    check("stay + others*switch = 1",
+          got.stayProb + got.switchProb * others, 1, { absTol: 1e-9 });
+
+    const kc = EP.mhKnowCurve(p.doors, p.opened, c.knowCurve.ks.length);
+    c.knowCurve.switch.forEach((want, i) => {
+      check(`know curve switch[${i}]`, kc.switchP[i], want, { relTol: 1e-9 });
+    });
+    c.knowCurve.stay.forEach((want, i) => {
+      check(`know curve stay[${i}]`, kc.stayP[i], want, { relTol: 1e-9 });
+    });
+    const dc = EP.mhDoorsCurve(p.opened, Math.max(...c.doorsCurve.xs));
+    c.doorsCurve.knowing.forEach((want, i) => {
+      check(`doors curve knowing[${i}]`, dc.knowing[i], want, { relTol: 1e-9 });
+    });
+    c.doorsCurve.random.forEach((want, i) => {
+      check(`doors curve random[${i}]`, dc.random[i], want, { relTol: 1e-9 });
+    });
+  }
+
+  group("Seeded Monty Hall play-out — draw order must reproduce exactly");
+  const mcfg = G.montySim.config;
+  const msim = EP.simulateMonty(mcfg);
+  check("valid games", msim.valid, G.montySim.valid, { exact: true });
+  check("stay wins", msim.stayWins, G.montySim.stayWins, { exact: true });
+  check("switch wins", msim.switchWins, G.montySim.switchWins, { exact: true });
+  G.montySim.first.forEach((want, i) => {
+    check(`game ${i + 1}: [car,pick,stay,switch]`, JSON.stringify(msim.first[i]),
+          JSON.stringify(want), { exact: true });
+  });
+
+  // -- 9. Shannon's demon -------------------------------------------------------
+  for (const c of G.shannon) {
+    const p = c.params;
+    group(`Shannon's demon — ${p.rounds} rounds, vol=${p.vol}, w=${p.w}, ` +
+          `interval=${p.interval}, cost=${p.cost}`);
+    const got = EP.sdSummary(p);
+    const TIER_KEYS = { bestInterval: 1 };
+    for (const key of Object.keys(c.expect)) {
+      check(key, got[key], c.expect[key],
+            TIER_KEYS[key] ? { exact: true } : { relTol: 1e-8 });
+    }
+    const [xs, gs] = EP.sdIntervalCurve(p.rounds, p.p, p.vol, p.w, p.cost, 30);
+    c.intervalCurve.xs.forEach((want, i) => {
+      check(`interval curve x[${i}]`, xs[i], want, { exact: true });
+    });
+    c.intervalCurve.gs.forEach((want, i) => {
+      check(`interval curve g[${i}]`, gs[i], want, { relTol: 1e-8 });
+    });
+  }
+
+  group("Seeded rebalancing walk — must reproduce exactly");
+  const scfg = G.shannonSim.config;
+  const ssim = EP.simulateRebalance(scfg);
+  ["firstPrice", "firstHold", "firstRebal"].forEach((key) => {
+    const arr = ssim[key.replace("first", "").toLowerCase()];
+    G.shannonSim[key].forEach((want, t) => {
+      check(`${key}[${t}]`, arr[t], want, { relTol: 1e-9 });
+    });
+  });
+  G.shannonSim.termHold.forEach((want, i) => {
+    check(`terminal hold ${i + 1}`, ssim.termHold[i], want, { relTol: 1e-9 });
+  });
+  G.shannonSim.termRebal.forEach((want, i) => {
+    check(`terminal rebal ${i + 1}`, ssim.termRebal[i], want, { relTol: 1e-9 });
+  });
+
+  // -- 10. Insurance and risk pooling --------------------------------------
+  for (const c of G.insurance) {
+    const p = c.params;
+    group(`Insurance — wealth=$${p.wealth}, seller=$${p.sellerWealth}, ` +
+          `premium=$${p.premium}, loss=$${p.loss}, hazard=${p.hazard}`);
+    const got = EP.insSummary(p);
+    for (const key of Object.keys(c.expect)) {
+      const isCount = key === "poolBreakEven";
+      const isBool = key === "bandOk";
+      check(key, got[key], c.expect[key],
+            isCount || isBool ? { exact: true } : { relTol: 1e-8 });
+    }
+    const curve = EP.insPremiumCurve(p, c.premiumCurve.xs.length);
+    c.premiumCurve.xs.forEach((want, i) => {
+      check(`premium curve x[${i}]`, curve.xs[i], want, { relTol: 1e-9 });
+    });
+    c.premiumCurve.buyer.forEach((want, i) => {
+      check(`premium curve buyer[${i}]`, curve.buyer[i], want, { relTol: 1e-8 });
+    });
+    c.premiumCurve.seller.forEach((want, i) => {
+      check(`premium curve seller[${i}]`, curve.seller[i], want, { relTol: 1e-8 });
+    });
+    const pool = EP.insPoolCurve(p, c.poolCurve.sizes.length);
+    c.poolCurve.growth.forEach((want, i) => {
+      check(`pool curve growth[${i}]`, pool.growth[i], want, { relTol: 1e-8 });
+    });
+  }
+
   // -- summary --------------------------------------------------------------
   const s = document.getElementById("summary");
   s.textContent = failed === 0

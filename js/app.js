@@ -381,6 +381,96 @@
         table: tablePdShares(d, pr),
       }),
     },
+
+    "mh-know": {
+      title: "Switching vs staying, as the host's knowledge changes",
+      cap: "Closed form. The two lines meet at know=0 — a host who reveals a goat by luck has told you nothing.",
+      short: true,
+      render: (node, d, pr) => ({
+        plot: EP.mhKnow(node, d, pr),
+        legend: [
+          { color: getVar("--series-1"), label: "Switching" },
+          { color: getVar("--deemphasis"), label: "Staying" },
+          { color: getVar("--series-1"), shape: "dot",
+            label: `Your dial (${F().pct(pr.know)})` },
+        ],
+        table: tableMhKnow(d, pr),
+      }),
+    },
+
+    "mh-doors": {
+      title: "Switching's edge vs the number of doors",
+      cap: "Closed form. More doors grow a knowing host's advantage; they cannot create one for a host who reveals goats by chance.",
+      short: true,
+      render: (node, d, pr) => ({
+        plot: EP.mhDoors(node, d, pr),
+        legend: [
+          { color: getVar("--series-1"), label: "Knowing host" },
+          { color: getVar("--deemphasis"), label: "Random host" },
+          { color: getVar("--series-1"), shape: "dot",
+            label: `Your board (${F().count(pr.doors)} doors)` },
+        ],
+        table: tableMhDoors(d, pr),
+      }),
+    },
+
+    "sd-paths": {
+      title: "The stock, held plain vs held and rebalanced",
+      cap: "Log scale, one seeded price path shared by all three lines.",
+      render: (node, d, pr) => ({
+        plot: EP.sdPaths(node, d, pr),
+        legend: [
+          { color: getVar("--deemphasis"), label: "Stock alone" },
+          { color: getVar("--series-2"), label: "Buy and hold the mix" },
+          { color: getVar("--series-1"),
+            label: `Rebalanced every ${pr.interval} period(s)` },
+        ],
+        table: tableSdPaths(d, pr),
+      }),
+    },
+
+    "sd-sweep": {
+      title: "Volatility harvested vs the rebalancing interval",
+      cap: "Closed form, not simulated — the exact growth rate for every possible interval, relative to buy-and-hold.",
+      short: true,
+      render: (node, d, pr) => ({
+        plot: EP.sdSweep(node, d, pr),
+        legend: [
+          { color: getVar("--series-1"), label: "Harvests volatility" },
+          { color: getVar("--diverging-neg"), label: "Costs more than it harvests" },
+        ],
+        table: tableSdSweep(d, pr),
+      }),
+    },
+
+    "ins-band": {
+      title: "What the premium is worth to each side",
+      cap: "Closed form. Value is growth-equivalent dollars per period — where both curves clear zero, both sides have improved.",
+      render: (node, d, pr) => ({
+        plot: EP.insBand(node, d, pr),
+        legend: [
+          { color: getVar("--series-1"), label: "Buyer's value" },
+          { color: getVar("--series-3"), label: "Seller's value" },
+          { shape: "band", fill: withAlpha(getVar("--series-1"), 0.12),
+            label: "Both sides improve here" },
+        ],
+        table: tableInsBand(d, pr),
+      }),
+    },
+
+    "ins-pool": {
+      title: "One member's growth rate vs the pool's size",
+      cap: "Closed form. No counterparty here — every member carries an equal share of however many losses land.",
+      short: true,
+      render: (node, d, pr) => ({
+        plot: EP.insPool(node, d, pr),
+        legend: [
+          { color: getVar("--series-1"), label: "Pool of this size" },
+          { color: getVar("--deemphasis"), label: "Infinite-pool limit" },
+        ],
+        table: tableInsPool(d, pr),
+      }),
+    },
   };
 
   /** Shared legend for the two charts that colour by strategy. */
@@ -419,12 +509,34 @@
     });
   }
 
+  /**
+   * If a scenario's `derive` clamps a value that is itself a directly-displayed
+   * slider (Monty Hall's `opened`, clamped to doors-2), the slider and its label
+   * would otherwise keep showing the pre-clamp number forever, disagreeing with
+   * every tile and chart on the page. Pulling the clamped value back into
+   * state keeps the control honest, and it self-corrects instead of fighting
+   * the next render: once opened has been pulled down to fit the door count,
+   * raising the door count again does not un-clamp it on its own, which is the
+   * right behaviour -- the reader did not touch that slider.
+   */
+  function syncDerivedControls(sc, pr) {
+    for (const c of sc.controls || []) {
+      if (pr[c.key] === undefined || pr[c.key] === state.values[c.key]) continue;
+      state.values[c.key] = pr[c.key];
+      const input = document.getElementById(`ctl-${c.key}`);
+      const val = document.getElementById(`ctl-${c.key}-val`);
+      if (input) input.value = pr[c.key];
+      if (val) val.textContent = c.fmt(pr[c.key]);
+    }
+  }
+
   function render() {
     const sc = EP.byId(state.id);
     if (!sc || sc.status !== "ready") return;
 
     const pr = EP.resolveParams(sc, state.values);
     if (state.seed !== undefined) pr.seed = state.seed;
+    syncDerivedControls(sc, pr);
 
     const d = sc.compute(pr);
     renderTiles(sc, pr, d.stats);
@@ -691,6 +803,61 @@
       head: ["Generation"].concat(EP.STRATEGIES.map((s) => EP.STRATEGY_LABELS[s])),
       rows,
     };
+  }
+
+  function tableMhKnow(d, pr) {
+    const { ks, switchP, stayP } = d.knowCurve;
+    const step = Math.max(1, Math.round(ks.length / 12));
+    const rows = [];
+    for (let i = 0; i < ks.length; i += step) {
+      rows.push([F().pct(ks[i]), F().pct(switchP[i]), F().pct(stayP[i])]);
+    }
+    return { head: ["Host knows (P)", "Switching wins", "Staying wins"], rows };
+  }
+
+  function tableMhDoors(d, pr) {
+    const { xs, knowing, random } = d.doorsCurve;
+    const rows = xs.map((x, i) =>
+      [String(x), F().pct(knowing[i]), F().pct(random[i])]);
+    return { head: ["Doors", "Knowing host", "Random host"], rows };
+  }
+
+  function tableSdPaths(d, pr) {
+    const { price, hold, rebal } = d.sim;
+    const rows = sampledRounds(pr.rounds).map((t) => [
+      String(t), F().money(price[t]), F().money(hold[t]), F().money(rebal[t]),
+    ]);
+    return { head: ["Period", "Stock alone", "Buy and hold", "Rebalanced"], rows };
+  }
+
+  function tableSdSweep(d, pr) {
+    const { xs, harvest } = d.harvestCurve;
+    const step = Math.max(1, Math.round(xs.length / 14));
+    const rows = [];
+    for (let i = 0; i < xs.length; i += step) {
+      rows.push([String(xs[i]), F().pctSigned(harvest[i])]);
+    }
+    return { head: ["Rebalance every N periods", "Harvest vs buy-and-hold"], rows };
+  }
+
+  function tableInsBand(d, pr) {
+    const { xs, buyer, seller } = d.premiumCurve;
+    const step = Math.max(1, Math.round(xs.length / 14));
+    const rows = [];
+    for (let i = 0; i < xs.length; i += step) {
+      rows.push([F().money(xs[i]), F().money(buyer[i]), F().money(seller[i])]);
+    }
+    return { head: ["Premium", "Buyer's value", "Seller's value"], rows };
+  }
+
+  function tableInsPool(d, pr) {
+    const { sizes, growth } = d.poolCurve;
+    const step = Math.max(1, Math.round(sizes.length / 14));
+    const rows = [];
+    for (let i = 0; i < sizes.length; i += step) {
+      rows.push([String(sizes[i]), F().pctSigned(growth[i])]);
+    }
+    return { head: ["Pool size", "Growth per period"], rows };
   }
 
   // -- boot -----------------------------------------------------------------

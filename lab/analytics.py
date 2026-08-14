@@ -768,6 +768,33 @@ def mh_summary(doors=3, opened=1, know=1.0, **_):
     }
 
 
+def mh_know_curve(doors=3, opened=1, points=101, **_):
+    """(know values, switch prob, stay prob) over the host's-knowledge dial.
+
+    Every point is one evaluation of mh_switch_prob / mh_stay_prob -- the curve
+    connects the two limits mh_summary already reports, and adds no new maths.
+    """
+    ks = [i / (points - 1) for i in range(points)]
+    switch = [mh_switch_prob(doors, opened, k) for k in ks]
+    stay = [mh_stay_prob(doors, opened, k) for k in ks]
+    return ks, switch, stay
+
+
+def mh_doors_curve(opened=1, max_doors=20, **_):
+    """(doors, switch prob under a knowing host, switch prob under a random one),
+    for door counts from 3 to max_doors, with `opened` held fixed.
+
+    This is the comparison the scenario is actually about: the host's knowledge,
+    not the door count, is what makes switching worth anything. Door counts that
+    would leave nothing to switch to are skipped, same clamp as mh_board.
+    """
+    doors_list = [n for n in range(3, max(4, int(max_doors)) + 1)
+                  if n - 2 >= opened]
+    knowing = [mh_switch_prob(n, opened, 1.0) for n in doors_list]
+    random_ = [mh_switch_prob(n, opened, 0.0) for n in doors_list]
+    return doors_list, knowing, random_
+
+
 def simulate_monty(games=20000, doors=3, opened=1, know=1.0, seed=7):
     """Reference play-out. Returns (valid, stay wins, switch wins, first games).
 

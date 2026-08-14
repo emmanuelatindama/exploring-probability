@@ -418,6 +418,26 @@ def verify_monty():
         s = A.mh_summary(doors=10, opened=opened, know=1.0)
         check(f"knowing host, opened={opened}: stay stays 1/10", s["stay_prob"], 0.1)
 
+    # The two sweep curves are literal evaluations of formulas already checked
+    # above, so this is a spot check that the sweep wiring agrees with them.
+    ks, sw, st = A.mh_know_curve(doors=5, opened=2, points=11)
+    check("know curve endpoint (know=0) matches mh_switch_prob",
+          sw[0], A.mh_switch_prob(5, 2, 0.0))
+    check("know curve endpoint (know=1) matches mh_switch_prob",
+          sw[-1], A.mh_switch_prob(5, 2, 1.0))
+    xs, know_line, rand_line = A.mh_doors_curve(opened=1, max_doors=12)
+    check("doors curve matches mh_switch_prob at doors=6",
+          know_line[xs.index(6)], A.mh_switch_prob(6, 1, 1.0))
+    # With one door opened regardless of how many are on offer, a random host's
+    # reveal carries less and less information as the board grows -- there are
+    # more doors it could have opened that would have meant nothing -- so
+    # switching's edge shrinks toward zero rather than staying at a constant.
+    ok = all(a >= b - 1e-12 for a, b in zip(rand_line, rand_line[1:]))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] random-host switch prob is "
+          f"non-increasing in door count: {ok}")
+    if not ok:
+        FAILURES.append(("random host switch prob monotone in doors", rand_line, "non-increasing"))
+
 
 # -- 1f. Shannon's demon -------------------------------------------------------
 def mc_rebalance_growth(interval, p, vol, w, cost, n=300_000, rounds_mult=1,
@@ -795,6 +815,8 @@ def emit_golden():
     monty = []
     for c in MH_GOLDEN:
         s = A.mh_summary(**c)
+        kks, kswitch, kstay = A.mh_know_curve(c["doors"], c["opened"], points=21)
+        dxs, dknow, drand = A.mh_doors_curve(c["opened"], max_doors=15)
         monty.append({
             "params": c,
             "expect": {
@@ -803,6 +825,8 @@ def emit_golden():
                 "goatProb": s["goat_prob"],
                 "switchKnowing": s["switch_knowing"], "switchRandom": s["switch_random"],
             },
+            "knowCurve": {"ks": kks, "switch": kswitch, "stay": kstay},
+            "doorsCurve": {"xs": dxs, "knowing": dknow, "random": drand},
         })
 
     monty_cfg = dict(games=200, doors=3, opened=1, know=1.0, seed=7)
@@ -835,7 +859,12 @@ def emit_golden():
                   interval=5, cost=0.0, seed=7)
     (sd_first, sd_hold_terms, sd_rebal_terms) = A.simulate_rebalance(**sd_cfg)
     sd_sim = {
-        "config": sd_cfg,
+        "config": {
+            "nPaths": sd_cfg["n_paths"], "rounds": sd_cfg["rounds"],
+            "w0": sd_cfg["w0"], "p": sd_cfg["p"], "vol": sd_cfg["vol"],
+            "w": sd_cfg["w"], "interval": sd_cfg["interval"],
+            "cost": sd_cfg["cost"], "seed": sd_cfg["seed"],
+        },
         "firstPrice": sd_first[0], "firstHold": sd_first[1], "firstRebal": sd_first[2],
         "termHold": sd_hold_terms, "termRebal": sd_rebal_terms,
     }
@@ -849,7 +878,14 @@ def emit_golden():
         psizes, pgrowth = A.ins_pool_curve(
             c["wealth"], c["loss"], c["hazard"], max_members=60)
         insurance.append({
-            "params": c,
+            # Re-keyed to camelCase: ins_summary's kwarg is seller_wealth (Python
+            # convention), but tests.html hands "params" straight to EP.insSummary,
+            # which destructures pr.sellerWealth.
+            "params": {
+                "wealth": c["wealth"], "sellerWealth": c["seller_wealth"],
+                "premium": c["premium"], "loss": c["loss"],
+                "hazard": c["hazard"], "members": c["members"],
+            },
             "expect": {
                 "expectedPayout": s["expected_payout"],
                 "buyerMax": s["buyer_max"], "sellerMin": s["seller_min"],

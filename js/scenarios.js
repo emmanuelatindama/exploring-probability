@@ -393,7 +393,7 @@ window.EP = window.EP || {};
     },
     {
       id: "monty-hall",
-      status: "planned",
+      status: "ready",
       name: "Monty Hall",
       blurb:
         "Three doors, one prize, a host who knows where it is — and an offer " +
@@ -407,14 +407,47 @@ window.EP = window.EP || {};
         "ten thousand readers wrote in to correct her, hundreds of them with " +
         "doctorates. She was right. Paul Erdős, one of the century's great " +
         "mathematicians, refused to believe it until he was shown a simulation.",
+      controls: [
+        { key: "doors", label: "Number of doors", min: 3, max: 20, step: 1,
+          value: 3, int: true, fmt: (v) => `${Math.round(v)}` },
+        { key: "opened", label: "Doors the host opens", min: 1, max: 8, step: 1,
+          value: 1, int: true, fmt: (v) => `${Math.round(v)}` },
+        { key: "know", label: "P(the host knows where the prize is)",
+          min: 0, max: 1, step: 0.01, value: 1.0, fmt: pct },
+      ],
+      fixed: {},
+      // At least one door must remain to switch to -- see mhBoard's clamp on
+      // the Python and JS sides. Clamped here too so the tiles and the reader's
+      // slider position always agree on what "opened" actually is.
+      derive: (pr) => { pr.opened = Math.min(pr.opened, pr.doors - 2); },
+      compute: (pr) => ({
+        stats: EP.mhSummary(pr),
+        knowCurve: EP.mhKnowCurve(pr.doors, pr.opened, 101),
+        doorsCurve: EP.mhDoorsCurve(pr.opened, Math.max(15, pr.doors + 5)),
+      }),
+      charts: ["mh-know", "mh-doors"],
+      tiles: (pr, s) => [
+        { label: "Switching wins", value: pct(s.switchProb),
+          note: "exact, conditional on only goats having been revealed" },
+        { label: "Staying wins", value: pct(s.stayProb), note: "exact" },
+        { label: "Switching is better by", value: pctSigned(s.advantage),
+          note: `${num(s.ratio, 2)}× as likely to win` },
+        { label: "If the host opened at random", value: pct(s.switchRandom),
+          note: "no advantage to switching at all" },
+      ],
       note:
-        "Will show the win rate for switching against staying as the number " +
-        "of doors and the host's knowledge change — because the host's " +
-        "knowledge is the entire mechanism. A host who opens a door at random " +
-        "and happens to reveal a goat gives you nothing, while a host who is " +
-        "guaranteed to reveal a goat has transferred the whole of the losing " +
-        "door's probability onto the one you didn't pick. Same visible " +
-        "outcome, different information, different answer.",
+        "The two lines on the first chart are the whole mechanism. A knowing " +
+        "host can never open the door hiding the prize, so every bit of " +
+        "probability that used to sit on the doors he opened has nowhere to " +
+        "go but the one door you did not pick and he did not open — which is " +
+        "why switching wins with probability (N-1)/(N(N-1-k)) rather than the " +
+        "1/(N-k) a coin flip would give you. A host who opens doors at random " +
+        "and simply happens not to reveal the prize has told you nothing: the " +
+        "lines meet at know=0, and switching is worth exactly what staying is. " +
+        "The second chart holds the host's knowledge fixed at each extreme and " +
+        "sweeps the number of doors instead — more doors make a knowing host's " +
+        "advantage larger, but they cannot manufacture one for a host who " +
+        "reveals goats by luck.",
     },
     {
       id: "parrondo",
@@ -442,7 +475,7 @@ window.EP = window.EP || {};
     },
     {
       id: "shannon-demon",
-      status: "planned",
+      status: "ready",
       name: "Shannon's demon",
       blurb:
         "A stock that ends exactly where it started, and a rebalancing rule " +
@@ -456,17 +489,67 @@ window.EP = window.EP || {};
         "you finish ahead. What you have harvested is volatility itself, not " +
         "direction. It is Kelly sizing seen from the other side, and it is " +
         "why the ruinous coin becomes a winning one when you stake a quarter.",
+      controls: [
+        { key: "vol", label: "Size of each move", min: 0.05, max: 0.6, step: 0.01,
+          value: 0.3, fmt: (v) => `up ×${(1 + v).toFixed(2)}, down ×${(1 / (1 + v)).toFixed(2)}` },
+        { key: "p", label: "P(the stock goes up)", min: 0.3, max: 0.7, step: 0.01,
+          value: 0.5, fmt: pct },
+        { key: "w", label: "Stock weight (rest in cash)", min: 0, max: 1,
+          step: 0.01, value: 0.5, fmt: pct },
+        { key: "interval", label: "Rebalance every N periods", min: 1, max: 60,
+          step: 1, value: 5, int: true, fmt: (v) => `${Math.round(v)}` },
+        { key: "cost", label: "Trading cost (of turnover)", min: 0, max: 0.05,
+          step: 0.001, value: 0, fmt: pct },
+        { key: "rounds", label: "Periods", min: 50, max: 500, step: 10,
+          value: 200, int: true, fmt: count },
+      ],
+      // One path, deliberately: the scenario is about one seeded price path
+      // seen two ways, not a fan of many players -- "New random draw" reseeds
+      // the walk (and the interval sweep with it) via the same state.seed the
+      // other scenarios already use.
+      fixed: { w0: 100, nPaths: 1 },
+      compute: (pr) => {
+        const stats = EP.sdSummary(pr);
+        const sim = EP.simulateRebalance(pr);
+        const [xs, gs] = EP.sdIntervalCurve(pr.rounds, pr.p, pr.vol, pr.w,
+                                            pr.cost, pr.rounds);
+        const harvest = gs.map((g) => g - stats.holdGrowth);
+        return { stats, sim, harvestCurve: { xs, harvest } };
+      },
+      charts: ["sd-paths", "sd-sweep"],
+      tiles: (pr, s) => [
+        { label: "Stock's own growth rate", value: pctSigned(s.stockGrowth),
+          note: "time-average; zero for the default trendless coin" },
+        { label: "Rebalanced growth rate", value: pctSigned(s.rebalGrowth),
+          note: `rebalancing every ${pr.interval} period(s)` },
+        { label: "Buy-and-hold growth rate", value: pctSigned(s.holdGrowth),
+          note: `same mix, never rebalanced, over ${pr.rounds} periods` },
+        { label: "Volatility harvested", value: pctSigned(s.harvest),
+          note: `best: every ${s.bestInterval} period(s)` },
+      ],
       note:
-        "Will compare buy-and-hold against periodic rebalancing on the same " +
-        "seeded price path, sweeping the rebalancing interval to show that the " +
-        "harvest has an optimum rather than increasing forever. The honest " +
-        "part of the story belongs here too: the effect needs mean-reverting " +
-        "or trendless prices and zero costs, and it reverses on a trending " +
-        "asset, which is where most retellings of this result stop early.",
+        "The stock alone has zero time-average growth here by construction — " +
+        "up and down are reciprocals, so a coin that is heads half the time " +
+        "multiplies wealth by up and by 1/up equally often, and those cancel " +
+        "exactly in log space. A 50/50 mix rebalanced every period does not " +
+        "cancel: every round it locks in some of a rise as cash before the " +
+        "next round can give it back, and buys back in cheap after a fall. " +
+        "That asymmetry is the harvest, and the second chart shows it has a " +
+        "shape rather than a direction — free at zero cost, where rebalancing " +
+        "as often as possible is always best, but pushed to an interior " +
+        "optimum the moment trading costs money, because every rebalance past " +
+        "that point spends more in turnover than it recovers in variance. " +
+        "Two honest caveats belong here. First, this needs a trendless or " +
+        "mean-reverting stock — set P(up) away from 50% and rebalancing can " +
+        "cost you money instead, because you would be selling the winner just " +
+        "as it starts to run. Second, the weight that harvests the most here " +
+        "is exactly the Kelly fraction for this coin, which is 1/2 only " +
+        "because the coin is symmetric: Shannon's 50/50 split is not a magic " +
+        "number, it is Kelly sizing wearing a different name.",
     },
     {
       id: "insurance",
-      status: "planned",
+      status: "ready",
       name: "Insurance and risk pooling",
       blurb:
         "A contract with negative expected value for both sides, which both " +
@@ -481,13 +564,66 @@ window.EP = window.EP || {};
         "of that contract gain, which expected value says is impossible. " +
         "Work out how, and you have understood why the average is the wrong " +
         "thing to maximise.",
+      controls: [
+        { key: "wealth", label: "Buyer's wealth", min: 20000, max: 500000,
+          step: 5000, value: 100000, int: true, fmt: money },
+        { key: "loss", label: "Loss if it happens", min: 5000, max: 150000,
+          step: 1000, value: 30000, int: true, fmt: money },
+        { key: "hazard", label: "P(the loss happens)", min: 0.01, max: 0.3,
+          step: 0.005, value: 0.05, fmt: pct },
+        { key: "sellerWealth", label: "Seller's wealth", min: 200000,
+          max: 5000000, step: 50000, value: 1000000, int: true, fmt: money },
+        // Defaults to a premium *inside* the mutual-gain band, which for the
+        // other default settings is $1,522-$1,768. At $2,000 the opening view
+        // contradicted the scenario's own claim: the buyer's curve sat below
+        // zero, and "smallest pool that beats buying" collapsed to 1 -- a pool
+        // of one being just the uninsured player, i.e. "don't insure at all".
+        { key: "premium", label: "Premium you pay", min: 0, max: 20000,
+          step: 100, value: 1600, int: true, fmt: money },
+        { key: "members", label: "Pool size", min: 1, max: 500, step: 1,
+          value: 50, int: true, fmt: count },
+      ],
+      fixed: {},
+      // A loss the buyer's wealth cannot survive breaks ins_uninsured_growth's
+      // domain (ln of a negative number), so it is clamped here rather than at
+      // every call site -- the same pattern gambler's ruin uses for its target.
+      derive: (pr) => { pr.loss = Math.min(pr.loss, pr.wealth * 0.95); },
+      compute: (pr) => ({
+        stats: EP.insSummary(pr),
+        premiumCurve: EP.insPremiumCurve(pr, 160),
+        poolCurve: EP.insPoolCurve(pr, Math.max(200, pr.members * 2)),
+      }),
+      charts: ["ins-band", "ins-pool"],
+      tiles: (pr, s) => [
+        { label: "Expected payout", value: money(s.expectedPayout),
+          note: "what expected value says the premium should be" },
+        { label: "Buyer's max premium", value: money(s.buyerMax),
+          note: "most the buyer can pay and still improve" },
+        { label: "Seller's min premium", value: money(s.sellerMin),
+          note: "least the seller can accept and still improve" },
+        { label: "A band exists", value: s.bandOk ? "Yes" : "No",
+          note: s.bandOk ? `width ${money(s.bandWidth)}`
+                          : "no premium helps both sides" },
+      ],
       note:
-        "Will show the growth rate of an insured and an uninsured player " +
-        "against the premium, with the range of premiums where both the buyer " +
-        "and the seller improve their long-run growth — a band that expected " +
-        "value alone cannot produce. Then the pooling version: identical " +
-        "players sharing identical independent risks, where every one of them " +
-        "ends up better off and nobody has taken the other side.",
+        "Expected value says a fair premium is pi × L, and that a rational " +
+        "insurer must charge more than that to survive — so on that measure " +
+        "insurance can only ever be a transfer, never a mutual gain. The band " +
+        "on the first chart is the rebuttal: because ln is concave, the same " +
+        "dollar of variance costs the small buyer more than it costs the " +
+        "large seller, so a premium well above pi × L can still leave the " +
+        "buyer better off, and a seller who could never accept exactly pi × L " +
+        "(that premium leaves their own growth rate negative, the mirror of " +
+        "the buyer's problem) can profitably accept anything above their own " +
+        "minimum. Whatever premium you dial in, if it lands inside the shaded " +
+        "band, both curves are positive — both parties have improved their " +
+        "long-run growth rate, and nobody had to be wrong about anything. " +
+        "The second chart drops the seller entirely: a mutual pool of equals, " +
+        "each carrying an equal share of however many losses land among them. " +
+        "Even a pool of two beats going it alone, and the curve climbs toward " +
+        "the dashed line — the same growth rate an infinitely large insurer " +
+        "could offer at cost — without any counterparty ever taking the other " +
+        "side of the bet.",
     },
     {
       id: "base-rates",
