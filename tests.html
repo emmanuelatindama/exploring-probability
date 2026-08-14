@@ -297,8 +297,13 @@
     const got = EP.sdSummary(p);
     const TIER_KEYS = { bestInterval: 1 };
     for (const key of Object.keys(c.expect)) {
-      check(key, got[key], c.expect[key],
-            TIER_KEYS[key] ? { exact: true } : { relTol: 1e-8 });
+      // A symmetric coin makes stockGrowth analytically zero, and a relative
+      // bar blows up comparing two numbers that are each "zero plus floating-
+      // point noise" -- the same reason probabilities elsewhere use absTol.
+      const opts = TIER_KEYS[key] ? { exact: true }
+        : Math.abs(c.expect[key]) < 1e-9 ? { absTol: 1e-9 }
+        : { relTol: 1e-8 };
+      check(key, got[key], c.expect[key], opts);
     }
     const [xs, gs] = EP.sdIntervalCurve(p.rounds, p.p, p.vol, p.w, p.cost, 30);
     c.intervalCurve.xs.forEach((want, i) => {
@@ -350,6 +355,129 @@
     const pool = EP.insPoolCurve(p, c.poolCurve.sizes.length);
     c.poolCurve.growth.forEach((want, i) => {
       check(`pool curve growth[${i}]`, pool.growth[i], want, { relTol: 1e-8 });
+    });
+  }
+
+  // -- 11. The wheel strategy ------------------------------------------------
+  // Phi and its inverse are rational approximations here, not scipy's exact
+  // routines -- so this section uses a 1e-6 bar rather than the 1e-8/1e-9 the
+  // other closed forms hold to, a deliberately looser, explicitly-chosen
+  // tolerance rather than one inferred from magnitude. The PRNG-derived
+  // pieces (the normal generator, the simulated paths) still demand exact
+  // bit-for-bit equality, same as mulberry32 itself.
+  group("The wheel — Black-Scholes prices and real-world ITM probabilities");
+  for (const c of G.wheelBs) {
+    const p = c.params;
+    // d1/d2 are plain log/sqrt arithmetic -- no Phi anywhere in them -- so
+    // they hold to the tight bar. Everything downstream of them calls normCdf
+    // (Abramowitz-Stegun, ~1.5e-7 absolute error in Phi itself), which a
+    // price of order 100 turns into a relative price error around 1e-6; 1e-5
+    // leaves headroom without hiding a real regression.
+    const [d1, d2] = EP.bsD1D2(p.s, p.k, p.t, p.sigma, p.r, p.q);
+    check(`d1 s=${p.s} k=${p.k} t=${p.t}`, d1, c.expect.d1, { relTol: 1e-9 });
+    check(`d2 s=${p.s} k=${p.k} t=${p.t}`, d2, c.expect.d2, { relTol: 1e-9 });
+    check(`call price s=${p.s} k=${p.k} t=${p.t}`,
+          EP.bsCallPrice(p.s, p.k, p.t, p.sigma, p.r, p.q), c.expect.callPrice,
+          { relTol: 1e-5 });
+    check(`put price s=${p.s} k=${p.k} t=${p.t}`,
+          EP.bsPutPrice(p.s, p.k, p.t, p.sigma, p.r, p.q), c.expect.putPrice,
+          { relTol: 1e-5 });
+    check(`real-world call ITM prob s=${p.s} k=${p.k} t=${p.t}`,
+          EP.realWorldItmProb(p.s, p.k, p.t, p.sigma, p.mu, p.q, true),
+          c.expect.realWorldCallProb, { relTol: 1e-5 });
+    check(`real-world put ITM prob s=${p.s} k=${p.k} t=${p.t}`,
+          EP.realWorldItmProb(p.s, p.k, p.t, p.sigma, p.mu, p.q, false),
+          c.expect.realWorldPutProb, { relTol: 1e-5 });
+  }
+
+  group("The wheel — buy-and-hold's exact terminal distribution");
+  for (const c of G.hold) {
+    const got = EP.holdSummary(c.params);
+    // growthRate/expectedFinal/medianFinal are plain exp/log, no Phi; the two
+    // quantile fields additionally go through normPpf (Acklam, ~2.6e-9
+    // relative) and pBelowStart through normCdf -- all comfortably inside
+    // the same 1e-5 bar the price checks above use, so one tolerance covers
+    // the whole group without hiding which fields are actually exact.
+    for (const key of Object.keys(c.expect)) {
+      check(key, got[key], c.expect[key], { relTol: 1e-5 });
+    }
+  }
+
+  group("The wheel — normal draws must reproduce exactly (Box-Muller on mulberry32)");
+  for (const seed of Object.keys(G.normals)) {
+    const randn = EP.makeNormalGenerator(Number(seed));
+    G.normals[seed].forEach((want, i) => {
+      check(`seed ${seed}, normal draw ${i + 1}`, randn(), want, { exact: true });
+    });
+  }
+
+  group("The wheel — seeded family simulation must reproduce exactly");
+  {
+    const wc = G.wheelSim.config;
+    const pr = {
+      w0: wc.w0, s0: wc.s0, mu: wc.mu, sigmaRv: wc.sigmaRv, sigmaIv: wc.sigmaIv,
+      r: wc.r, q: wc.q, years: wc.years, xMonths: wc.xMonths, yMonths: wc.yMonths,
+      dipPct: wc.dipPct, sellHaircut: wc.sellHaircut, putSl: wc.putSl,
+      callTp: wc.callTp, callSl: wc.callSl, stockFeePct: wc.stockFeePct,
+      optFee: wc.optFee, seed: wc.seed,
+    };
+    const fam = EP.simulateWheelFamily(pr);
+    // path/dip/hold never call normCdf -- pure GBM and pure arithmetic on it
+    // -- so they hold to the PRNG's own bit-parity-adjacent bar. wheel and
+    // puts-only price and mark options every day the cohort is open, so each
+    // one's Phi-approximation error compounds through the day-by-day cash
+    // flow rather than cancelling; 1e-5 is the same bar the BS prices
+    // themselves are held to above, not a separately-chosen number.
+    G.wheelSim.path.forEach((want, i) => {
+      check(`path[${i}]`, fam.path[i], want, { relTol: 1e-9 });
+    });
+    G.wheelSim.wheelEquity.forEach((want, i) => {
+      check(`wheel equity[${i}]`, fam.wheel.equity[i], want, { relTol: 1e-5 });
+    });
+    G.wheelSim.putsOnlyEquity.forEach((want, i) => {
+      check(`puts-only equity[${i}]`, fam.putsOnly.equity[i], want, { relTol: 1e-5 });
+    });
+    G.wheelSim.dipEquity.forEach((want, i) => {
+      check(`dip equity[${i}]`, fam.dip[i], want, { relTol: 1e-9 });
+    });
+    G.wheelSim.holdEquity.forEach((want, i) => {
+      check(`hold equity[${i}]`, fam.hold[i], want, { relTol: 1e-9 });
+    });
+    for (const key of Object.keys(G.wheelSim.wheelStats)) {
+      const jsKey = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+      check(`stats.${jsKey}`, fam.wheel.stats[jsKey], G.wheelSim.wheelStats[key],
+            { exact: true });
+    }
+    check("event count", fam.wheel.events.length, G.wheelSim.wheelEvents.length,
+          { exact: true });
+    G.wheelSim.wheelEvents.forEach((want, i) => {
+      const got = fam.wheel.events[i];
+      check(`event[${i}] day`, got.t, want.t, { exact: true });
+      check(`event[${i}] kind`, got.kind, want.kind, { exact: true });
+      check(`event[${i}] contracts`, got.contracts, want.contracts, { exact: true });
+    });
+  }
+
+  group("The wheel — the IV-RV sweep loop must reproduce exactly");
+  {
+    const sc = G.wheelSweep.config;
+    const pr = {
+      w0: sc.w0, s0: sc.s0, mu: sc.mu, sigmaRv: sc.sigmaRv, r: sc.r, q: sc.q,
+      years: sc.years, xMonths: sc.xMonths, yMonths: sc.yMonths,
+      dipPct: sc.dipPct, sellHaircut: sc.sellHaircut, putSl: sc.putSl,
+      callTp: sc.callTp, callSl: sc.callSl, stockFeePct: sc.stockFeePct,
+      optFee: sc.optFee, points: sc.points, nSeeds: sc.nSeeds,
+      spreadLo: sc.spreadLo, spreadHi: sc.spreadHi, baseSeed: sc.baseSeed,
+    };
+    const sweep = EP.wheelIvSweep(pr);
+    G.wheelSweep.xs.forEach((want, i) => {
+      check(`sweep xs[${i}]`, sweep.xs[i], want, { relTol: 1e-9 });
+    });
+    G.wheelSweep.gs.forEach((want, i) => {
+      // Each point averages several full wheel-family runs, so the per-step
+      // Phi-approximation error compounds further than a single equity
+      // curve's -- observed up to ~2e-5, so 5e-5 leaves real margin.
+      check(`sweep gs[${i}]`, sweep.gs[i], want, { relTol: 5e-5 });
     });
   }
 

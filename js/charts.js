@@ -1456,11 +1456,206 @@ window.EP = window.EP || {};
     return lum > 0.18 ? t.inkOnLight : t.inkOnDark;
   }
 
+  // ==========================================================================
+  // The wheel strategy
+  // ==========================================================================
+  /** Marker style per event kind the reader should actually notice on the
+   *  path -- the others (top-ups, individual stop-outs) are frequent enough
+   *  to turn into visual noise and are left to the table view instead. */
+  const WHEEL_EVENT_MARKS = {
+    sell_put: { key: "s1", symbol: "triangle-down", label: "Put sold" },
+    assigned: { key: "s3", symbol: "circle", label: "Assigned" },
+    sell_call: { key: "s2", symbol: "triangle-up", label: "Call sold" },
+    called_away: { key: "s1", symbol: "circle", label: "Called away" },
+  };
+
+  /**
+   * All four arms on the one shared seeded path, log scale, with the wheel's
+   * own major transitions marked directly on its line -- the emphasis form:
+   * one path is the whole story here, not a cloud of them, because the point
+   * is what one account actually goes through, event by event.
+   */
+  function wheelPaths(el, d, pr) {
+    const t = theme();
+    const { wheel, putsOnly, dip, hold } = d.fam;
+    const xs = indices(wheel.equity.length);
+    const band = (arr) => Array.from(arr, clampFloor);
+    const wy = band(wheel.equity), py = band(putsOnly.equity);
+    const dy = band(dip), hy = band(hold);
+
+    let yLo = Infinity, yHi = -Infinity;
+    for (const arr of [wy, py, dy, hy]) {
+      for (const v of arr) { if (v < yLo) yLo = v; if (v > yHi) yHi = v; }
+    }
+
+    const data = [
+      lineTrace(xs, hy, {
+        line: { color: t.deemph, width: 2 }, name: "Buy and hold",
+        hovertemplate: "<b>%{y:$,.2f}</b>  buy-and-hold<extra></extra>",
+      }),
+      lineTrace(xs, dy, {
+        line: { color: t.s4, width: 2 }, name: "Buy the dip, sell the high",
+        hovertemplate: "<b>%{y:$,.2f}</b>  dip strategy<extra></extra>",
+      }),
+      lineTrace(xs, py, {
+        line: { color: t.s2, width: 2, dash: "dot" }, name: "Puts only (no covered calls)",
+        hovertemplate: "<b>%{y:$,.2f}</b>  puts only<extra></extra>",
+      }),
+      lineTrace(xs, wy, {
+        line: { color: t.s1, width: 2 }, name: "The wheel",
+        hovertemplate: "<b>%{y:$,.2f}</b>  the wheel<extra></extra>",
+      }),
+    ];
+
+    for (const kind of Object.keys(WHEEL_EVENT_MARKS)) {
+      const mark = WHEEL_EVENT_MARKS[kind];
+      const evs = wheel.events.filter((e) => e.kind === kind);
+      if (!evs.length) continue;
+      data.push({
+        x: evs.map((e) => e.t),
+        y: evs.map((e) => clampFloor(wheel.equity[e.t])),
+        type: "scatter", mode: "markers",
+        marker: { color: t[mark.key], symbol: mark.symbol, size: 9,
+                 line: { color: t.surface, width: 1.5 } },
+        name: mark.label, showlegend: false,
+        hovertemplate: `<b>${mark.label}</b>  day %{x}<extra></extra>`,
+      });
+    }
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Trading day", font: { color: t.textSecondary, size: 12 } },
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, Object.assign({
+        type: "log",
+        title: { text: "Account value (log scale)", font: { color: t.textSecondary, size: 12 } },
+      }, decadeTicks(Math.min(yLo, pr.w0), Math.max(yHi, pr.w0), true))),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", xref: "paper", x0: 0, x1: 1,
+        yref: "y", y0: Math.log10(pr.w0), y1: Math.log10(pr.w0),
+        line: { color: t.axis, width: 1 }, layer: "below",
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /**
+   * Annualized growth rate per arm, ranked horizontal bars -- same form as
+   * pdScores, because the question is the same one: which of several
+   * competitors comes out ahead, on this one shared draw.
+   */
+  const WHEEL_ARMS = [
+    { key: "wheel", label: "The wheel", colorKey: "s1" },
+    { key: "putsOnly", label: "Puts only", colorKey: "s2" },
+    { key: "dip", label: "Buy the dip, sell the high", colorKey: "s4" },
+    { key: "hold", label: "Buy and hold", colorKey: "deemph" },
+  ];
+
+  function wheelBars(el, d) {
+    const t = theme();
+    const rows = WHEEL_ARMS
+      .map((a) => ({ ...a, cagr: d.stats.cagrs[a.key] }))
+      .sort((a, b) => a.cagr - b.cagr);
+
+    // Text sits INSIDE each bar, anchored at its far end, rather than
+    // "outside": pdScores can put its labels outside because every value
+    // there is positive, so the label only ever spills into the open margin
+    // on the right. A bar here can go negative, and "outside" then pushes
+    // the label left, off the plot area and into the margin the category
+    // names already occupy -- the two texts collided until this changed.
+    const data = [{
+      x: rows.map((r) => r.cagr),
+      y: rows.map((r) => r.label),
+      type: "bar", orientation: "h",
+      marker: { color: rows.map((r) => t[r.colorKey]) },
+      text: rows.map((r) => EP.fmt.pctSigned(r.cagr)),
+      textposition: "inside", insidetextanchor: "end",
+      textfont: {
+        family: FONT, size: 11,
+        color: rows.map((r) => readableInk(t[r.colorKey], t)),
+      },
+      hovertemplate: "<b>%{x:+.2%}</b> annualized<extra></extra>",
+    }];
+
+    const layout = baseLayout(t, {
+      margin: { l: 168, r: 48, t: 8, b: 48 },
+      bargap: 0.32,
+      xaxis: axis(t, {
+        title: { text: "Annualized growth rate (this one seeded path)",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: "+.1%",
+        zeroline: true, zerolinecolor: t.axis, zerolinewidth: 1,
+      }),
+      yaxis: axis(t, { showgrid: false, ticks: "" }),
+      hovermode: "closest",
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /**
+   * The wheel's growth rate against sigma_iv - sigma_rv -- the diverging pair
+   * around the zero this scenario's whole argument turns on: sell premium
+   * for less edge than that and the frictions win regardless of how the
+   * mechanics play out.
+   */
+  function wheelSweep(el, d, pr) {
+    const t = theme();
+    const { xs, gs } = d.sweep;
+    const posY = gs.map((v) => (v < 0 ? null : v));
+    const negY = gs.map((v) => (v > 0 ? null : v));
+    const spreadNow = pr.sigmaIv - pr.sigmaRv;
+
+    const data = [
+      { x: xs, y: negY, type: "scatter", mode: "lines",
+        line: { color: t.neg, width: 2 }, fill: "tozeroy",
+        fillcolor: hexA(t.neg, 0.1), name: "Frictions win",
+        hovertemplate: "<b>%{y:+.3%}</b> annualized<extra></extra>" },
+      { x: xs, y: posY, type: "scatter", mode: "lines",
+        line: { color: t.s1, width: 2 }, fill: "tozeroy",
+        fillcolor: hexA(t.s1, 0.1), name: "The edge wins",
+        hovertemplate: "<b>%{y:+.3%}</b> annualized<extra></extra>" },
+      { x: [spreadNow], y: [d.stats.cagrs.wheel], type: "scatter", mode: "markers",
+        marker: { color: d.stats.cagrs.wheel >= 0 ? t.s1 : t.neg, size: 9,
+                 line: { color: t.surface, width: 2 } },
+        name: "Your spread",
+        hovertemplate: "<b>your spread: %{y:+.3%}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Implied vol − realized vol",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: "+.0%",
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "The wheel's growth rate (annualized)",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: "+.1%",
+        zeroline: true, zerolinecolor: t.axis, zerolinewidth: 1,
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", x0: spreadNow, x1: spreadNow, yref: "paper",
+        y0: 0, y1: 1, line: { color: t.muted, width: 1 }, layer: "below",
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
   Object.assign(EP, {
     // SAMPLE_PATHS is engine.js's -- charts.js only reads it.
     trajectory, histogram, sweep, theme, FLOOR, RUIN_PATHS,
     ruinWalks, ruinOdds, ruinBoldness, spRunningMean, spContributions,
     pdScores, pdHeatmap, pdShares, strategyColors,
+    wheelPaths, wheelBars, wheelSweep,
     mhKnow, mhDoors, sdPaths, sdSweep, insBand, insPool,
   });
 })(window.EP);

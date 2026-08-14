@@ -626,6 +626,143 @@ window.EP = window.EP || {};
         "side of the bet.",
     },
     {
+      id: "the-wheel",
+      status: "ready",
+      name: "The wheel strategy",
+      blurb:
+        "Sell puts below the dips, sell calls above the highs, and let " +
+        "assignment do the buying — compared against the stock alone and " +
+        "against doing nothing at all.",
+      story:
+        "Sell a put below a recent dip and you are paid twice: keep the " +
+        "premium if the stock recovers, or buy it at a discount if it " +
+        "doesn't. Get the shares, then sell a call above the next high — " +
+        "paid again, either way. Traders call this cycle “the wheel,” and " +
+        "it looks like manufacturing income from nothing. Selling puts and " +
+        "calls this way is decades old; running them as one repeating " +
+        "cycle is newer, popularised on trading forums in the 2010s. None " +
+        "of it beats holding the stock unless the premium pays more than " +
+        "the stock's risk is worth. Pick a real index or stock below to " +
+        "run all four strategies on what it actually did since 2009, " +
+        "instead of a simulated coin flip.",
+      controls: [
+        { key: "underlying", type: "select", label: "What are you trading?",
+          value: "simulated", options: marketOptions(),
+          fmt: (v) => v === "simulated" ? "Simulated stock" : (marketEntry(v) || {}).name || v },
+        { key: "w0", label: "Starting capital", min: 20000, max: 300000,
+          step: 5000, value: 100000, int: true, fmt: money },
+        { key: "mu", label: "Stock's real-world drift (simulated only)", min: 0,
+          max: 0.15, step: 0.01, value: 0.08, fmt: pct },
+        { key: "sigmaRv", label: "Realized volatility (simulated only)",
+          min: 0.10, max: 0.45, step: 0.01, value: 0.20, fmt: pct },
+        { key: "sigmaIv", label: "Implied volatility (what you sell options at)",
+          min: 0.10, max: 0.45, step: 0.01, value: 0.24, fmt: pct },
+        { key: "dipPct", label: "Dip trigger, below the rolling high", min: 0.01,
+          max: 0.15, step: 0.01, value: 0.05, fmt: pct },
+        { key: "years", label: "Horizon (simulated only — real data runs its full history)",
+          min: 1, max: 18, step: 1, value: 5, int: true,
+          fmt: (v) => `${Math.round(v)} yr` },
+      ],
+      // The rules of the wheel itself -- tenors, the sale haircut, the stop
+      // and take-profit thresholds -- are the definition of this strategy,
+      // not a dial for exploring it, the same way the ergodic coin fixes f=1
+      // and leaves f as Kelly's own dial instead. s0 is fixed because only
+      // its ratio to w0 (how many contracts one lot buys) matters, and w0
+      // alone already exposes that.
+      fixed: { s0: 100, r: 0.03, q: 0, xMonths: 6, yMonths: 3, sellHaircut: 0.10,
+               putSl: 0.30, callTp: 0.70, callSl: 0.30, stockFeePct: 0.005,
+               optFee: 0.65 },
+      // A real ticker replaces the simulated GBM path outright: its daily
+      // closes (already split/dividend-adjusted by fetch_market_data.py) are
+      // rebased to start at s0 so the wheel's 100-shares-per-contract sizing
+      // behaves the same regardless of the security's real price level or
+      // currency, and the horizon is pinned to however much history that
+      // series actually has -- mu and years stop doing anything, since there
+      // is now exactly one path and it is not simulated from either of them.
+      derive: (pr) => {
+        if (pr.underlying === "simulated") { delete pr.realPath; return; }
+        const entry = marketEntry(pr.underlying);
+        if (!entry) { pr.underlying = "simulated"; delete pr.realPath; return; }
+        const scale = pr.s0 / entry.prices[0];
+        const path = new Float64Array(entry.prices.length);
+        for (let i = 0; i < entry.prices.length; i++) path[i] = entry.prices[i] * scale;
+        pr.realPath = path;
+        pr.years = (path.length - 1) / 252;
+        pr.underlyingMeta = entry;
+      },
+      compute: (pr) => {
+        const fam = EP.simulateWheelFamily(pr);
+        const w = EP.wheelSummary(pr);
+        // A real path is the same on every seed -- it is not simulated --
+        // so sweeping seeds there would just repeat one number nSeeds times.
+        const nSeeds = pr.realPath ? 1 : 8;
+        const sweep = EP.wheelIvSweep(Object.assign({}, pr, {
+          points: 10, nSeeds, spreadLo: -0.10, spreadHi: 0.20, baseSeed: 1000,
+        }));
+        if (pr.realPath) {
+          // holdSummary's closed form assumes GBM with the mu/sigmaRv
+          // sliders, which real data does not obey -- with one actual path
+          // and no ensemble, "exact" and "this one path" are the same number.
+          w.holdCagrExact = w.holdCagrSample;
+          w.holdFinalExact = w.holdFinalSample;
+          w.holdMedianExact = w.holdFinalSample;
+        }
+        return {
+          stats: Object.assign({
+            cagrs: { wheel: w.wheelCagr, putsOnly: w.putsOnlyCagr,
+                     dip: w.dipCagr, hold: w.holdCagrSample },
+          }, w),
+          fam, sweep,
+        };
+      },
+      charts: ["wheel-paths", "wheel-bars", "wheel-sweep"],
+      tiles: (pr, s) => [
+        { label: "The wheel's growth rate", value: pctSigned(s.wheelCagr),
+          note: pr.realPath
+            ? `${pr.underlyingMeta.name}, ${pr.underlyingMeta.startDate.slice(0, 4)}–${pr.underlyingMeta.endDate.slice(0, 4)}`
+            : "this one seeded path" },
+        { label: "Buy-and-hold's growth rate", value: pctSigned(s.holdCagrExact),
+          note: pr.realPath ? "what actually happened, this one history"
+                             : "exact, over every possible path" },
+        { label: "A single put's real-world odds of assignment",
+          value: pct(s.putNaiveAssignProb),
+          note: "from the drift/vol sliders — exact, no stop-loss or entry timing" },
+        { label: "This simulation's actual assignment rate",
+          value: pct(s.simAssignRate), note: `of ${count(s.putsSold)} puts sold` },
+      ],
+      note:
+        "The last two tiles are the whole tension. A put sold today and " +
+        "held to expiry with no stop at all gets assigned about as often as " +
+        "the exact formula says it should. The simulation's own rate " +
+        "differs from that for two reasons at once: the -30% stop can end a " +
+        "losing put early, before it would have reached expiry in the " +
+        "money, and the entry itself is not an unconditional day — it only " +
+        "fires once price crosses the dip line, which the exact formula " +
+        "does not know about. Both effects push the same way, which is why " +
+        "acquisition here is common but not universal, and why the " +
+        "covered-call leg can sit idle for a long stretch waiting on a " +
+        "fresh all-time high that a declining stock may never deliver — " +
+        "watch for the marked events on the first chart to thin out after " +
+        "an assignment. " +
+        "The bars are one path's race, not a law: rerun it and any of the " +
+        "four can win. The sweep is the number that generalises. It answers " +
+        "the only question that actually decides whether selling options " +
+        "for a living works — not the win rate on any one trade, but " +
+        "whether the implied volatility you are paid exceeds the realized " +
+        "volatility the stock actually delivers by more than the haircut " +
+        "and the fees cost. Below that line, the wheel is not a source of " +
+        "yield. It is a worse way to hold the stock. " +
+        "Picking a real index or stock swaps the simulated coin flip for " +
+        "what that security's daily closes actually did since 2009 " +
+        "(split- and dividend-adjusted); the drift and volatility sliders " +
+        "then stop drawing the path and only feed the two formula-based " +
+        "tiles, and the horizon locks to that security's own full history. " +
+        "Every real series is rebased to start at the same price so the " +
+        "contract math behaves the same regardless of the ticker's real " +
+        "level or currency — the wheel does not know or care that it is " +
+        "trading a rescaled Nikkei instead of a $100 stock.",
+    },
+    {
       id: "base-rates",
       status: "planned",
       name: "Base rates and the 95% test",
@@ -768,6 +905,20 @@ window.EP = window.EP || {};
   }
 
   const byId = (id) => SCENARIOS.find((s) => s.id === id);
+
+  const marketEntry = (symbol) =>
+    (window.EP_MARKET || []).find((e) => e.symbol === symbol);
+
+  /** "Simulated stock" plus every real series lab/fetch_market_data.py baked
+   *  into js/market_data.js -- load order in index.html puts that file before
+   *  this one, so window.EP_MARKET already exists by the time this runs. */
+  function marketOptions() {
+    const opts = [{ value: "simulated", label: "Simulated stock (Monte Carlo)" }];
+    for (const e of (window.EP_MARKET || [])) {
+      opts.push({ value: e.symbol, label: `${e.name} (${e.kind === "index" ? "Index" : e.category})` });
+    }
+    return opts;
+  }
 
   Object.assign(EP, {
     SCENARIOS, byId, resolveParams, defaultValues,

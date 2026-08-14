@@ -39,6 +39,17 @@ Seven games live here, in this order:
 7. **Insurance and risk pooling.** Two parties with different wealths, and the
    band of premiums inside which both of their growth rates improve.
 
+8. **The wheel strategy.** Sell cash-secured puts below a rolling high; if
+   assigned, sell covered calls above the running all-time high; repeat. Unlike
+   sections 1-7, this one has no closed form for the strategy itself -- the
+   acquisition rule, the per-lot loss stop, and the dynamic cohort sizing are
+   all path-dependent decisions with no tractable hitting-time distribution
+   under GBM. What *is* exact here: the Black-Scholes price of any single
+   option, the real-world (not risk-neutral) probability that a single sold
+   option finishes in the money, and buy-and-hold's terminal distribution.
+   Section 8 states each of those exactly and simulates everything else,
+   flagged as such in every docstring that isn't.
+
 Sections 6 and 7 are sums over a binomial distribution, so they are written
 against numpy arrays rather than Python loops: one `binom.pmf` call over a
 vector of outcomes instead of a term-at-a-time accumulation. The JS mirror
@@ -48,7 +59,7 @@ cannot do that, and gets a weight recurrence instead -- see js/engine.js.
 import math
 
 import numpy as np
-from scipy.stats import binom
+from scipy.stats import binom, norm
 
 
 def multipliers(up=1.5, down=0.6, f=1.0):
@@ -1266,6 +1277,525 @@ def ins_summary(wealth=100000.0, seller_wealth=1000000.0, premium=2000.0,
         "pool_limit": ins_pool_limit(wealth, loss, hazard),
         "pool_break_even": ins_pool_break_even(premium, wealth, loss, hazard),
     }
+
+
+# =============================================================================
+# 8. The wheel strategy -- selling premium against a rolling high and an ATH
+# =============================================================================
+# A cash-secured put sold below a rolling x-month high, held to expiry
+# ("acquire": no take-profit, only a -30% loss stop); if assigned, a covered
+# call sold at the next all-time high, closed at +70%/-30% or expiry; repeat.
+# Compared against the same entry/exit signal traded in stock alone, and
+# against buy-and-hold.
+#
+# Two contracts run on this project so far: a BIT-EXACT one for the shared
+# PRNG (mulberry32 itself, and now the normal draws built on it) and a
+# TOLERANCE-matched one for transcendental approximations (js/engine.js's
+# rational Phi against this module's call into scipy). lab/verify.py checks
+# the first at 1e-12 and the second at 1e-6 -- six correct decimal digits on a
+# probability or a price is exact for every purpose this scenario has, and
+# demanding bit-parity from two different Phi implementations would be
+# demanding an accident.
+#
+# Every option here is priced European-style (no early exercise) and marked
+# to its own Black-Scholes theoretical value between trades. The 90% sale /
+# 100% buyback haircut is a REALIZED cost, paid once on the way in; it is not
+# re-applied when marking a position for the stop-loss check, so a position
+# that has not moved at all already shows an built-in paper loss of
+# (0.9-1.0)/0.9 = -11.1% the instant it is marked. That is not a bug -- it is
+# the honest cost of selling into a market maker's spread -- but it does mean
+# the -30% stop has only about nineteen points of real room once a trade
+# opens flat.
+
+TRADING_DAYS = 252
+TRADING_DAYS_PER_MONTH = 21
+
+
+def norm_ppf(q):
+    """Standard normal quantile. Used only for buy-and-hold's closed-form
+    quantiles -- nothing path-dependent here needs an inverse CDF."""
+    return float(norm.ppf(q))
+
+
+def norm_cdf(x):
+    """Standard normal CDF -- the Python side of a tolerance-matched (not
+    bit-exact) contract with js/engine.js's rational approximation of Phi.
+    See the section note above for why 1e-6 is the right bar, not 1e-12."""
+    return float(norm.cdf(x))
+
+
+def bs_d1_d2(s, k, t, sigma, r=0.0, q=0.0):
+    """Black-Scholes d1 and d2 for a European option on a dividend-paying
+    underlying. Exact, given the model's own assumptions (constant sigma,
+    continuous trading, lognormal terminal price).
+
+    d2's usual second form, (ln(S/K) + (r-q-sigma^2/2)T) / (sigma*sqrt(T)), is
+    recovered algebraically by expanding d1 - sigma*sqrt(T) -- which is also
+    what lets real_world_itm_prob below reuse this same function with mu in
+    place of r rather than carrying a second formula that could drift from
+    this one.
+    """
+    if t <= 0.0 or sigma <= 0.0:
+        d = math.inf if s > k else (-math.inf if s < k else 0.0)
+        return d, d
+    vt = sigma * math.sqrt(t)
+    d1 = (math.log(s / k) + (r - q + 0.5 * sigma * sigma) * t) / vt
+    return d1, d1 - vt
+
+
+def bs_call_price(s, k, t, sigma, r=0.0, q=0.0):
+    """Black-Scholes European call. Exact under the model's own assumptions."""
+    if t <= 0.0:
+        return max(s - k, 0.0)
+    d1, d2 = bs_d1_d2(s, k, t, sigma, r, q)
+    return s * math.exp(-q * t) * norm_cdf(d1) - k * math.exp(-r * t) * norm_cdf(d2)
+
+
+def bs_put_price(s, k, t, sigma, r=0.0, q=0.0):
+    """Black-Scholes European put, from the same d1/d2 the call uses (put-call
+    parity applied directly) rather than a second independent formula."""
+    if t <= 0.0:
+        return max(k - s, 0.0)
+    d1, d2 = bs_d1_d2(s, k, t, sigma, r, q)
+    return k * math.exp(-r * t) * norm_cdf(-d2) - s * math.exp(-q * t) * norm_cdf(-d1)
+
+
+def real_world_itm_prob(s, k, t, sigma, mu=0.0, q=0.0, call=True):
+    """P(a single option finishes in the money), under the *physical* measure
+    (drift mu) rather than the risk-neutral one (rate r) Black-Scholes prices
+    with. Exact -- S_T is lognormal under GBM, so this is one evaluation of
+    Phi -- and it is the number this scenario actually cares about, since the
+    question is what happens on a path drawn at mu, not what a risk-neutral
+    hedger would assume.
+
+    This is the exact anchor the wheel's own assignment rate is checked
+    against: a single contract, held to expiry with no stop-loss at all. The
+    simulated rate differs from it in two ways at once -- the stop can end a
+    losing put early, before it would have reached expiry ITM, and the entry
+    trigger is not "any day," it is "the day the price first crosses the dip
+    line," which is not the unconditional distribution this formula assumes.
+    """
+    if t <= 0.0:
+        return 1.0 if (s > k) == call else 0.0
+    _, d2 = bs_d1_d2(s, k, t, sigma, r=mu, q=q)
+    return norm_cdf(d2) if call else norm_cdf(-d2)
+
+
+def hold_growth_rate(mu=0.08, sigma=0.20, q=0.0, **_):
+    """E[ln(S_T/S_0)] / T = mu - q - sigma^2/2: the time-average growth rate of
+    a continuously held position. Exact -- the continuous-time twin of
+    time_growth in section 1, and the same lesson: positive drift can still
+    carry a zero or negative typical outcome once volatility is large enough.
+    """
+    return mu - q - 0.5 * sigma * sigma
+
+
+def hold_summary(w0=100000.0, mu=0.08, sigma=0.20, q=0.0, years=5.0, **_):
+    """Exact terminal-wealth statistics for buy-and-hold under GBM.
+
+    ln(S_T/S0) ~ Normal((mu-q-sigma^2/2)T, sigma^2 T), so every field below is
+    a property of one lognormal distribution. Nothing here is simulated --
+    contrast with the wheel, where nothing is exact.
+    """
+    g = hold_growth_rate(mu, sigma, q)
+    vt = sigma * math.sqrt(max(years, 0.0))
+    return {
+        "growth_rate": g,
+        "expected_final": w0 * math.exp((mu - q) * years),
+        "median_final": w0 * math.exp(g * years),
+        "p_below_start": norm_cdf(-(g * years) / vt) if vt > 0
+                        else (1.0 if g < 0 else 0.0),
+        "q05": w0 * math.exp(g * years + vt * norm_ppf(0.05)),
+        "q95": w0 * math.exp(g * years + vt * norm_ppf(0.95)),
+    }
+
+
+def make_normal_generator(seed):
+    """Standard-normal draws from the shared mulberry32 uniform stream, via
+    Box-Muller.
+
+    Two independent normals come out of every two uniforms; the second is
+    cached and handed back on the *next* call rather than discarded, so
+    js/engine.js must cache in the same slot for a seeded path to agree beyond
+    its first draw -- the normal-draw extension of the PRNG contract that
+    already covers mulberry32 itself.
+    """
+    rand = mulberry32(seed)
+    spare = []
+
+    def randn():
+        if spare:
+            return spare.pop()
+        u1, u2 = rand(), rand()
+        r = math.sqrt(-2.0 * math.log(max(u1, 1e-300)))
+        theta = 2.0 * math.pi * u2
+        z0, z1 = r * math.cos(theta), r * math.sin(theta)
+        spare.append(z1)
+        return z0
+
+    return randn
+
+
+def simulate_gbm_path(s0=100.0, mu=0.08, sigma=0.20, q=0.0, years=5.0, seed=7):
+    """One daily-close price path under GBM. Not exact -- this is the shared
+    randomness every arm of the scenario is compared on, so it is drawn once
+    and read by all four rather than once per arm, which is what makes the
+    *differences* between arms nearly noise-free even though none of the four
+    (except buy-and-hold; see hold_summary) has a closed-form distribution.
+    """
+    randn = make_normal_generator(seed)
+    dt = 1.0 / TRADING_DAYS
+    n = max(1, round(years * TRADING_DAYS))
+    drift = (mu - q - 0.5 * sigma * sigma) * dt
+    vol = sigma * math.sqrt(dt)
+    s, path = s0, [s0]
+    for _ in range(n):
+        s *= math.exp(drift + vol * randn())
+        path.append(s)
+    return path
+
+
+def simulate_dip_strategy(path, x_months=6.0, dip_pct=0.05, stock_fee_pct=0.005,
+                          r=0.03, w0=100000.0, **_):
+    """Buy 100% into the stock the first time it reaches dip_pct below the
+    rolling x-month high; sell everything the first time it reaches a new
+    all-time high; repeat. No options anywhere -- the options-free twin of the
+    wheel's own entry/exit signal, continuous rather than lot-quantized (see
+    the scenario's `story` for why that asymmetry is left in on purpose).
+    Not exact -- the entry/exit rule is path-dependent, same as the wheel's.
+    """
+    n = len(path) - 1
+    window = max(1, round(x_months * TRADING_DAYS_PER_MONTH))
+    dt = 1.0 / TRADING_DAYS
+    cash, shares = w0, 0.0
+    ath = path[0]
+    dip_armed = True
+    equity = [w0]
+    for t in range(1, n + 1):
+        s = path[t]
+        cash *= math.exp(r * dt)
+        hi = max(path[max(0, t - window):t + 1])
+        dip_level = hi * (1.0 - dip_pct)
+        if s > dip_level:
+            dip_armed = True
+        if s > ath:
+            ath = s
+        if shares == 0.0:
+            if dip_armed and s <= dip_level:
+                shares = (cash / (1.0 + stock_fee_pct)) / s
+                cash = 0.0
+                dip_armed = False
+        elif s >= ath:
+            cash = shares * s * (1.0 - stock_fee_pct)
+            shares = 0.0
+        equity.append(cash + shares * s)
+    return equity
+
+
+def simulate_wheel(path, x_months=6.0, y_months=3.0, dip_pct=0.05,
+                   sell_haircut=0.10, put_sl=0.30, call_tp=0.70, call_sl=0.30,
+                   sigma_iv=0.24, r=0.03, q=0.0, stock_fee_pct=0.005,
+                   opt_fee=0.65, w0=100000.0, include_calls=True, **_):
+    """The wheel (or, with include_calls=False, the puts-only arm that isolates
+    what the covered calls are worth) on an already-generated price path.
+
+    Not a closed form. The acquisition rule, the per-lot -30% stop, and the
+    cash-secured cohort growing as free cash crosses a new 100-share threshold
+    are all path-dependent decisions -- specifically, the loss stop is a
+    barrier on the option's OWN marked value rather than on the underlying
+    price, which has no tractable hitting-time distribution under GBM even
+    though the underlying itself does. real_world_itm_prob above is the exact
+    quantity this simulation's assignment rate is checked against, with the
+    stop and the entry selection effect both switched off.
+
+    Bookkeeping notes, both deliberate:
+    - `cash` is free money; `collateral` is cash already reserved against open
+      put lots. A lot's collateral is carved out of `cash` the moment it is
+      sold and returned to `cash` the moment it closes (by any of stop-loss,
+      worthless expiry, or assignment), so `cash` can never be double-spent by
+      sizing a new lot against money already backing an old one.
+    - The equity curve marks options to zero between transactions -- it is the
+      realized cash-plus-collateral-plus-shares value, not a continuous
+      mark-to-market of open short options. The STOP decisions, unlike the
+      curve, do continuously mark to the live Black-Scholes price; only the
+      chart's headline number is realized-cash-flow based. This smooths the
+      wheel's interim volatility slightly relative to a real broker's net
+      liquidation value, without affecting any trade or stop decision.
+    """
+    n = len(path) - 1
+    dt = 1.0 / TRADING_DAYS
+    window = max(1, round(x_months * TRADING_DAYS_PER_MONTH))
+    put_tenor = max(1, round(x_months * TRADING_DAYS_PER_MONTH))
+    call_tenor = max(1, round(y_months * TRADING_DAYS_PER_MONTH))
+
+    cash, collateral, shares = w0, 0.0, 0
+    ath = path[0]
+    dip_armed = True
+    state = "wait"  # "wait" | "puts" | "shares"
+    put_strike = put_expiry = None
+    call_strike = call_expiry = None
+    put_lots, call_lots = [], []
+
+    equity = [w0]
+    events = []
+    stats = {"puts_sold": 0, "puts_stopped": 0, "puts_expired": 0,
+             "assignments": 0, "calls_sold": 0, "calls_stopped": 0,
+             "calls_tp": 0, "called_away": 0, "calls_expired": 0}
+
+    for t in range(1, n + 1):
+        s = path[t]
+        cash *= math.exp(r * dt)
+        collateral *= math.exp(r * dt)
+
+        hi = max(path[max(0, t - window):t + 1])
+        dip_level = hi * (1.0 - dip_pct)
+        if s > dip_level:
+            dip_armed = True
+        if s > ath:
+            ath = s
+
+        if state == "wait":
+            if dip_armed and s <= dip_level:
+                put_strike, put_expiry = s, t + put_tenor
+                n_new = int(cash // (100.0 * put_strike))
+                if n_new > 0:
+                    theo = bs_put_price(s, put_strike, put_tenor / TRADING_DAYS,
+                                        sigma_iv, r, q)
+                    premium = theo * (1.0 - sell_haircut)
+                    cash -= n_new * 100.0 * put_strike
+                    collateral += n_new * 100.0 * put_strike
+                    cash += n_new * (100.0 * premium - opt_fee)
+                    put_lots.append({"contracts": n_new, "premium": premium})
+                    stats["puts_sold"] += n_new
+                    events.append({"t": t, "kind": "sell_put",
+                                  "contracts": n_new, "strike": put_strike})
+                    state = "puts"
+                dip_armed = False
+
+        elif state == "puts":
+            days_left = put_expiry - t
+            texp = max(days_left, 0) / TRADING_DAYS
+            theo = (bs_put_price(s, put_strike, texp, sigma_iv, r, q)
+                    if texp > 0 else max(put_strike - s, 0.0))
+
+            n_add = int(cash // (100.0 * put_strike))
+            if n_add > 0 and texp > 0:
+                premium = theo * (1.0 - sell_haircut)
+                cash -= n_add * 100.0 * put_strike
+                collateral += n_add * 100.0 * put_strike
+                cash += n_add * (100.0 * premium - opt_fee)
+                put_lots.append({"contracts": n_add, "premium": premium})
+                stats["puts_sold"] += n_add
+                events.append({"t": t, "kind": "top_up_put",
+                              "contracts": n_add, "strike": put_strike})
+
+            kept = []
+            for lot in put_lots:
+                pl = (lot["premium"] - theo) / lot["premium"]
+                if pl < -put_sl:
+                    c = lot["contracts"]
+                    collateral -= c * 100.0 * put_strike
+                    cash += c * 100.0 * put_strike
+                    cash -= c * (100.0 * theo + opt_fee)
+                    stats["puts_stopped"] += c
+                    events.append({"t": t, "kind": "stop_put", "contracts": c})
+                else:
+                    kept.append(lot)
+            put_lots = kept
+
+            if not put_lots:
+                state = "wait"
+                dip_armed = s > dip_level
+            elif days_left <= 0:
+                total = sum(lot["contracts"] for lot in put_lots)
+                collateral -= total * 100.0 * put_strike
+                if s < put_strike:
+                    cash -= total * 100.0 * put_strike * stock_fee_pct
+                    shares += total * 100
+                    stats["assignments"] += total
+                    events.append({"t": t, "kind": "assigned",
+                                  "contracts": total, "strike": put_strike})
+                    state = "shares"
+                else:
+                    cash += total * 100.0 * put_strike
+                    stats["puts_expired"] += total
+                    state = "wait"
+                    dip_armed = s > dip_level
+                put_lots = []
+
+        elif state == "shares":
+            if include_calls and not call_lots and s >= ath:
+                n_new = shares // 100
+                if n_new > 0:
+                    call_strike, call_expiry = s, t + call_tenor
+                    theo = bs_call_price(s, call_strike, call_tenor / TRADING_DAYS,
+                                        sigma_iv, r, q)
+                    premium = theo * (1.0 - sell_haircut)
+                    cash += n_new * (100.0 * premium - opt_fee)
+                    call_lots.append({"contracts": n_new, "premium": premium})
+                    stats["calls_sold"] += n_new
+                    events.append({"t": t, "kind": "sell_call",
+                                  "contracts": n_new, "strike": call_strike})
+
+            if call_lots:
+                days_left = call_expiry - t
+                texp = max(days_left, 0) / TRADING_DAYS
+                theo = (bs_call_price(s, call_strike, texp, sigma_iv, r, q)
+                        if texp > 0 else max(s - call_strike, 0.0))
+                kept = []
+                for lot in call_lots:
+                    pl = (lot["premium"] - theo) / lot["premium"]
+                    if pl > call_tp or pl < -call_sl:
+                        c = lot["contracts"]
+                        cash -= c * (100.0 * theo + opt_fee)
+                        if pl > call_tp:
+                            stats["calls_tp"] += c
+                        else:
+                            stats["calls_stopped"] += c
+                        events.append({"t": t, "kind": "close_call", "contracts": c})
+                    else:
+                        kept.append(lot)
+                call_lots = kept
+                if days_left <= 0 and call_lots:
+                    total = sum(lot["contracts"] for lot in call_lots)
+                    if s > call_strike:
+                        cash += total * 100.0 * call_strike * (1.0 - stock_fee_pct)
+                        shares -= total * 100
+                        stats["called_away"] += total
+                        events.append({"t": t, "kind": "called_away",
+                                      "contracts": total, "strike": call_strike})
+                        state = "wait"
+                        dip_armed = s > dip_level
+                    else:
+                        # Worthless at expiry: the premium already collected is
+                        # kept, shares are still held, and no new call is sold
+                        # until the next fresh all-time high (see the "not
+                        # call_lots and s >= ath" gate above).
+                        stats["calls_expired"] += total
+                        events.append({"t": t, "kind": "call_expired",
+                                      "contracts": total, "strike": call_strike})
+                    call_lots = []
+
+        equity.append(cash + collateral + shares * s)
+
+    # A cohort open when the horizon ends has not yet been assigned, expired,
+    # or stopped -- it is simply still running past the edge of the chart.
+    # Counted separately rather than folded into any of the above so that
+    # puts_sold and calls_sold are exact sums of every lot's eventual bucket,
+    # including this one; a horizon that lands mid-cohort is routine (the put
+    # tenor alone can be most of a year), not an edge case to paper over.
+    stats["puts_still_open"] = sum(lot["contracts"] for lot in put_lots)
+    stats["calls_still_open"] = sum(lot["contracts"] for lot in call_lots)
+
+    return {"equity": equity, "events": events, "stats": stats}
+
+
+def simulate_wheel_family(w0=100000.0, s0=100.0, mu=0.08, sigma_rv=0.20,
+                          sigma_iv=0.24, r=0.03, q=0.0, years=5.0,
+                          x_months=6.0, y_months=3.0, dip_pct=0.05,
+                          sell_haircut=0.10, put_sl=0.30, call_tp=0.70,
+                          call_sl=0.30, stock_fee_pct=0.005, opt_fee=0.65,
+                          seed=7, **_):
+    """All four arms on one shared seeded price path -- a paired comparison,
+    so nearly all of the path's own randomness cancels out of the differences
+    between arms even though three of the four have no distribution of their
+    own to compare against.
+    """
+    path = simulate_gbm_path(s0, mu, sigma_rv, q, years, seed)
+    wheel = simulate_wheel(path, x_months, y_months, dip_pct, sell_haircut,
+                          put_sl, call_tp, call_sl, sigma_iv, r, q,
+                          stock_fee_pct, opt_fee, w0, True)
+    puts_only = simulate_wheel(path, x_months, y_months, dip_pct, sell_haircut,
+                              put_sl, call_tp, call_sl, sigma_iv, r, q,
+                              stock_fee_pct, opt_fee, w0, False)
+    dip = simulate_dip_strategy(path, x_months, dip_pct, stock_fee_pct, r, w0)
+    hold_shares = (w0 / (1.0 + stock_fee_pct)) / path[0]
+    hold = [hold_shares * s for s in path]
+    return {"path": path, "wheel": wheel, "puts_only": puts_only,
+            "dip": dip, "hold": hold}
+
+
+def cagr(final, initial, years):
+    """Annualized log return: ln(final/initial)/years. The metric every arm's
+    equity curve is reduced to for the terminal-wealth comparison, since a
+    fixed horizon otherwise favours whichever arm happened to be fully
+    invested for more of it."""
+    if final <= 0.0 or initial <= 0.0 or years <= 0.0:
+        return -math.inf
+    return math.log(final / initial) / years
+
+
+def wheel_summary(w0=100000.0, s0=100.0, mu=0.08, sigma_rv=0.20, sigma_iv=0.24,
+                  r=0.03, q=0.0, years=5.0, x_months=6.0, y_months=3.0,
+                  dip_pct=0.05, sell_haircut=0.10, put_sl=0.30, call_tp=0.70,
+                  call_sl=0.30, stock_fee_pct=0.005, opt_fee=0.65, seed=7,
+                  **_):
+    """Everything the wheel scenario's tiles and table need: the exact
+    single-contract anchors, buy-and-hold's exact distribution, and this one
+    seed's simulated outcome for all four arms."""
+    fam = simulate_wheel_family(w0, s0, mu, sigma_rv, sigma_iv, r, q, years,
+                                x_months, y_months, dip_pct, sell_haircut,
+                                put_sl, call_tp, call_sl, stock_fee_pct,
+                                opt_fee, seed)
+    hold = hold_summary(w0, mu, sigma_rv, q, years)
+    strike0 = s0 * (1.0 - dip_pct)
+    put_prob_naive = real_world_itm_prob(strike0, strike0, x_months / 12.0,
+                                         sigma_rv, mu, q, call=False)
+    call_prob_naive = real_world_itm_prob(s0, s0, y_months / 12.0, sigma_rv,
+                                          mu, q, call=True)
+    wheel_stats = fam["wheel"]["stats"]
+    assigned_rate = (wheel_stats["assignments"] /
+                    max(1, wheel_stats["puts_sold"]))
+    return {
+        "wheel_final": fam["wheel"]["equity"][-1],
+        "puts_only_final": fam["puts_only"]["equity"][-1],
+        "dip_final": fam["dip"][-1],
+        "hold_final_sample": fam["hold"][-1],
+        "hold_final_exact": hold["expected_final"],
+        "hold_median_exact": hold["median_final"],
+        "wheel_cagr": cagr(fam["wheel"]["equity"][-1], w0, years),
+        "puts_only_cagr": cagr(fam["puts_only"]["equity"][-1], w0, years),
+        "dip_cagr": cagr(fam["dip"][-1], w0, years),
+        "hold_cagr_sample": cagr(fam["hold"][-1], w0, years),
+        "hold_cagr_exact": hold["growth_rate"],
+        "put_naive_assign_prob": put_prob_naive,
+        "call_naive_calledaway_prob": call_prob_naive,
+        "sim_assign_rate": assigned_rate,
+        "puts_sold": wheel_stats["puts_sold"],
+        "assignments": wheel_stats["assignments"],
+        "calls_sold": wheel_stats["calls_sold"],
+        "called_away": wheel_stats["called_away"],
+        "calls_expired": wheel_stats["calls_expired"],
+    }
+
+
+def wheel_iv_sweep(w0=100000.0, s0=100.0, mu=0.08, sigma_rv=0.20, r=0.03,
+                   q=0.0, years=5.0, x_months=6.0, y_months=3.0, dip_pct=0.05,
+                   sell_haircut=0.10, put_sl=0.30, call_tp=0.70, call_sl=0.30,
+                   stock_fee_pct=0.005, opt_fee=0.65, points=15, n_seeds=24,
+                   spread_lo=-0.10, spread_hi=0.20, base_seed=1000, **_):
+    """Wheel CAGR against sigma_iv - sigma_rv, averaged over n_seeds paths per
+    point. Explicitly a Monte Carlo sweep, not a closed form -- there is no
+    tractable distribution for a path-dependent strategy with a stop on the
+    option's own marked value, so the "exact" sweep every other scenario has
+    (Kelly's f*, the ruin curves, the insurance band) is not available here;
+    this is the honest substitute, and the headline chart says so.
+    """
+    xs, gs = [], []
+    for i in range(points):
+        spread = spread_lo + (spread_hi - spread_lo) * i / max(1, points - 1)
+        sigma_iv = max(0.01, sigma_rv + spread)
+        total = 0.0
+        for j in range(n_seeds):
+            fam = simulate_wheel_family(w0, s0, mu, sigma_rv, sigma_iv, r, q,
+                                        years, x_months, y_months, dip_pct,
+                                        sell_haircut, put_sl, call_tp, call_sl,
+                                        stock_fee_pct, opt_fee,
+                                        base_seed + i * n_seeds + j)
+            total += cagr(fam["wheel"]["equity"][-1], w0, years)
+        xs.append(spread)
+        gs.append(total / n_seeds)
+    return xs, gs
 
 
 if __name__ == "__main__":

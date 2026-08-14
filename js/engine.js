@@ -1332,6 +1332,473 @@ window.EP = window.EP || {};
     return { sizes, growth };
   }
 
+  // ==========================================================================
+  // The wheel strategy -- mirrors lab/analytics.py section 8
+  // ==========================================================================
+  // No closed form for the strategy itself -- see the section note in
+  // analytics.py. What is exact: Black-Scholes prices, the real-world (not
+  // risk-neutral) probability a single option finishes ITM, and buy-and-hold's
+  // terminal distribution. Everything else is a seeded simulation.
+  //
+  // Phi and its inverse are approximated here (Abramowitz-Stegun 7.1.26 and
+  // Acklam's algorithm), not computed exactly the way scipy.stats.norm does in
+  // Python. That is a TOLERANCE-matched contract with analytics.py, not the
+  // bit-exact one mulberry32 and the normal generator below are -- 1e-6 is the
+  // bar tests.html holds this pair to, and both approximations clear it with
+  // room to spare (worst-case absolute error ~1.5e-7 for Phi itself).
+
+  const TRADING_DAYS = 252;
+  const TRADING_DAYS_PER_MONTH = 21;
+
+  /** Standard normal CDF, via the Abramowitz-Stegun rational approximation of
+   *  erf (max absolute error ~1.5e-7). */
+  function normCdf(x) {
+    const z = Math.abs(x) / Math.SQRT2;
+    const t = 1 / (1 + 0.3275911 * z);
+    const poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 +
+      t * (-1.453152027 + t * 1.061405429))));
+    const erf = 1 - poly * Math.exp(-z * z);
+    return 0.5 * (1 + (x < 0 ? -erf : erf));
+  }
+
+  /** Standard normal quantile, via Acklam's rational approximation (~2.6e-9
+   *  relative error). Used only for buy-and-hold's closed-form quantiles --
+   *  nothing path-dependent needs an inverse CDF. */
+  function normPpf(p) {
+    if (p <= 0) return -Infinity;
+    if (p >= 1) return Infinity;
+    const a = [-3.969683028665376e+01, 2.209460984245205e+02,
+      -2.759285104469687e+02, 1.383577518672690e+02,
+      -3.066479806614716e+01, 2.506628277459239e+00];
+    const b = [-5.447609879822406e+01, 1.615858368580409e+02,
+      -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01];
+    const c = [-7.784894002430293e-03, -3.223964580411365e-01,
+      -2.400758277161838e+00, -2.549732539343734e+00,
+      4.374664141464968e+00, 2.938163982698783e+00];
+    const d = [7.784695709041462e-03, 3.224671290700398e-01,
+      2.445134137142996e+00, 3.754408661907416e+00];
+    const plow = 0.02425, phigh = 1 - plow;
+    if (p < plow) {
+      const q = Math.sqrt(-2 * Math.log(p));
+      return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+             ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+    }
+    if (p <= phigh) {
+      const q = p - 0.5, r = q * q;
+      return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q /
+             (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+    }
+    const q = Math.sqrt(-2 * Math.log(1 - p));
+    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+
+  /** Black-Scholes d1 and d2. Exact, given the model's own assumptions.
+   *  d2 = d1 - sigma*sqrt(t) is the same expression real-world ITM
+   *  probability reuses with mu in place of r -- see realWorldItmProb. */
+  function bsD1D2(s, k, t, sigma, r, q) {
+    r = r || 0; q = q || 0;
+    if (t <= 0 || sigma <= 0) {
+      const d = s > k ? Infinity : (s < k ? -Infinity : 0);
+      return [d, d];
+    }
+    const vt = sigma * Math.sqrt(t);
+    const d1 = (Math.log(s / k) + (r - q + 0.5 * sigma * sigma) * t) / vt;
+    return [d1, d1 - vt];
+  }
+
+  /** Black-Scholes European call. Exact under the model's own assumptions. */
+  function bsCallPrice(s, k, t, sigma, r, q) {
+    r = r || 0; q = q || 0;
+    if (t <= 0) return Math.max(s - k, 0);
+    const [d1, d2] = bsD1D2(s, k, t, sigma, r, q);
+    return s * Math.exp(-q * t) * normCdf(d1) - k * Math.exp(-r * t) * normCdf(d2);
+  }
+
+  /** Black-Scholes European put, from the same d1/d2 the call uses. */
+  function bsPutPrice(s, k, t, sigma, r, q) {
+    r = r || 0; q = q || 0;
+    if (t <= 0) return Math.max(k - s, 0);
+    const [d1, d2] = bsD1D2(s, k, t, sigma, r, q);
+    return k * Math.exp(-r * t) * normCdf(-d2) - s * Math.exp(-q * t) * normCdf(-d1);
+  }
+
+  /** P(a single option finishes ITM) under the physical measure (drift mu),
+   *  not the risk-neutral one (rate r) Black-Scholes prices with. Exact. */
+  function realWorldItmProb(s, k, t, sigma, mu, q, call) {
+    mu = mu || 0; q = q || 0;
+    if (t <= 0) return (s > k) === call ? 1 : 0;
+    const [, d2] = bsD1D2(s, k, t, sigma, mu, q);
+    return call ? normCdf(d2) : normCdf(-d2);
+  }
+
+  /** E[ln(S_T/S_0)] / T: buy-and-hold's time-average growth rate. Exact. */
+  function holdGrowthRate(mu, sigma, q) {
+    return mu - (q || 0) - 0.5 * sigma * sigma;
+  }
+
+  /** Exact terminal-wealth statistics for buy-and-hold under GBM. Nothing
+   *  here is simulated -- contrast with the wheel, where nothing is exact. */
+  function holdSummary(pr) {
+    const { w0, mu, sigma, q, years } = pr;
+    const g = holdGrowthRate(mu, sigma, q);
+    const vt = sigma * Math.sqrt(Math.max(years, 0));
+    return {
+      growthRate: g,
+      expectedFinal: w0 * Math.exp((mu - (q || 0)) * years),
+      medianFinal: w0 * Math.exp(g * years),
+      pBelowStart: vt > 0 ? normCdf(-(g * years) / vt) : (g < 0 ? 1 : 0),
+      q05: w0 * Math.exp(g * years + vt * normPpf(0.05)),
+      q95: w0 * Math.exp(g * years + vt * normPpf(0.95)),
+    };
+  }
+
+  /** Standard-normal draws from the shared mulberry32 uniform stream, via
+   *  Box-Muller. The second of each pair is cached and returned on the next
+   *  call rather than discarded -- lab/analytics.py:make_normal_generator
+   *  caches in the same slot, which is what lets a seeded path agree beyond
+   *  its first draw. */
+  function makeNormalGenerator(seed) {
+    const rand = mulberry32(seed);
+    let spare = null;
+    return function randn() {
+      if (spare !== null) {
+        const z = spare;
+        spare = null;
+        return z;
+      }
+      const u1 = rand(), u2 = rand();
+      const r = Math.sqrt(-2 * Math.log(Math.max(u1, 1e-300)));
+      const theta = 2 * Math.PI * u2;
+      spare = r * Math.sin(theta);
+      return r * Math.cos(theta);
+    };
+  }
+
+  /** One daily-close price path under GBM. Not exact -- the shared randomness
+   *  every arm of the scenario is compared on, drawn once and read by all
+   *  four rather than once per arm. */
+  function simulateGbmPath(pr) {
+    // sigmaRv, not the generic "sigma" bsD1D2 and friends use -- this path is
+    // always drawn at the REALIZED vol; sigmaIv only prices the options
+    // written against it, in simulateWheel.
+    const { s0, mu, sigmaRv, q, years, seed } = pr;
+    const randn = makeNormalGenerator(seed);
+    const dt = 1 / TRADING_DAYS;
+    const n = Math.max(1, Math.round(years * TRADING_DAYS));
+    const drift = (mu - (q || 0) - 0.5 * sigmaRv * sigmaRv) * dt;
+    const vol = sigmaRv * Math.sqrt(dt);
+    const path = new Float64Array(n + 1);
+    path[0] = s0;
+    let s = s0;
+    for (let i = 1; i <= n; i++) {
+      s *= Math.exp(drift + vol * randn());
+      path[i] = s;
+    }
+    return path;
+  }
+
+  /** Buy the dip, sell at the next all-time high, repeat. No options -- the
+   *  options-free twin of the wheel's own entry/exit signal, continuous
+   *  rather than lot-quantized on purpose (see the scenario's story). Not
+   *  exact -- the entry/exit rule is path-dependent, same as the wheel's. */
+  function simulateDipStrategy(path, pr) {
+    const { xMonths, dipPct, stockFeePct, r, w0 } = pr;
+    const n = path.length - 1;
+    const window = Math.max(1, Math.round(xMonths * TRADING_DAYS_PER_MONTH));
+    const dt = 1 / TRADING_DAYS;
+    let cash = w0, shares = 0, ath = path[0], dipArmed = true;
+    const equity = new Float64Array(n + 1);
+    equity[0] = w0;
+    for (let t = 1; t <= n; t++) {
+      const s = path[t];
+      cash *= Math.exp(r * dt);
+      let hi = -Infinity;
+      for (let i = Math.max(0, t - window); i <= t; i++) if (path[i] > hi) hi = path[i];
+      const dipLevel = hi * (1 - dipPct);
+      if (s > dipLevel) dipArmed = true;
+      if (s > ath) ath = s;
+      if (shares === 0) {
+        if (dipArmed && s <= dipLevel) {
+          shares = (cash / (1 + stockFeePct)) / s;
+          cash = 0;
+          dipArmed = false;
+        }
+      } else if (s >= ath) {
+        cash = shares * s * (1 - stockFeePct);
+        shares = 0;
+      }
+      equity[t] = cash + shares * s;
+    }
+    return equity;
+  }
+
+  /** The wheel (or, with includeCalls=false, the puts-only arm) on an already-
+   *  generated price path. Not a closed form -- see the section note above
+   *  and the bookkeeping comments in lab/analytics.py:simulate_wheel, which
+   *  this mirrors line for line: `cash` is free money, `collateral` is cash
+   *  already reserved against open put lots, and the equity curve marks
+   *  options to zero between transactions rather than continuously
+   *  mark-to-market (the stop decisions, unlike the curve, do mark
+   *  continuously to the live Black-Scholes price). */
+  function simulateWheel(path, pr, includeCalls) {
+    const { xMonths, yMonths, dipPct, sellHaircut, putSl, callTp, callSl,
+            sigmaIv, r, q, stockFeePct, optFee, w0 } = pr;
+    const n = path.length - 1;
+    const dt = 1 / TRADING_DAYS;
+    const window = Math.max(1, Math.round(xMonths * TRADING_DAYS_PER_MONTH));
+    const putTenor = Math.max(1, Math.round(xMonths * TRADING_DAYS_PER_MONTH));
+    const callTenor = Math.max(1, Math.round(yMonths * TRADING_DAYS_PER_MONTH));
+
+    let cash = w0, collateral = 0, shares = 0;
+    let ath = path[0], dipArmed = true;
+    let state = "wait"; // "wait" | "puts" | "shares"
+    let putStrike = 0, putExpiry = 0, callStrike = 0, callExpiry = 0;
+    let putLots = [], callLots = [];
+
+    const equity = new Float64Array(n + 1);
+    equity[0] = w0;
+    const events = [];
+    const stats = { putsSold: 0, putsStopped: 0, putsExpired: 0, assignments: 0,
+      callsSold: 0, callsStopped: 0, callsTp: 0, calledAway: 0, callsExpired: 0,
+      putsStillOpen: 0, callsStillOpen: 0 };
+
+    for (let t = 1; t <= n; t++) {
+      const s = path[t];
+      cash *= Math.exp(r * dt);
+      collateral *= Math.exp(r * dt);
+
+      let hi = -Infinity;
+      for (let i = Math.max(0, t - window); i <= t; i++) if (path[i] > hi) hi = path[i];
+      const dipLevel = hi * (1 - dipPct);
+      if (s > dipLevel) dipArmed = true;
+      if (s > ath) ath = s;
+
+      if (state === "wait") {
+        if (dipArmed && s <= dipLevel) {
+          putStrike = s; putExpiry = t + putTenor;
+          const nNew = Math.floor(cash / (100 * putStrike));
+          if (nNew > 0) {
+            const theo = bsPutPrice(s, putStrike, putTenor / TRADING_DAYS, sigmaIv, r, q);
+            const premium = theo * (1 - sellHaircut);
+            cash -= nNew * 100 * putStrike;
+            collateral += nNew * 100 * putStrike;
+            cash += nNew * (100 * premium - optFee);
+            putLots.push({ contracts: nNew, premium });
+            stats.putsSold += nNew;
+            events.push({ t, kind: "sell_put", contracts: nNew, strike: putStrike });
+            state = "puts";
+          }
+          dipArmed = false;
+        }
+      } else if (state === "puts") {
+        const daysLeft = putExpiry - t;
+        const texp = Math.max(daysLeft, 0) / TRADING_DAYS;
+        const theo = texp > 0
+          ? bsPutPrice(s, putStrike, texp, sigmaIv, r, q)
+          : Math.max(putStrike - s, 0);
+
+        const nAdd = Math.floor(cash / (100 * putStrike));
+        if (nAdd > 0 && texp > 0) {
+          const premium = theo * (1 - sellHaircut);
+          cash -= nAdd * 100 * putStrike;
+          collateral += nAdd * 100 * putStrike;
+          cash += nAdd * (100 * premium - optFee);
+          putLots.push({ contracts: nAdd, premium });
+          stats.putsSold += nAdd;
+          events.push({ t, kind: "top_up_put", contracts: nAdd, strike: putStrike });
+        }
+
+        const kept = [];
+        for (const lot of putLots) {
+          const pl = (lot.premium - theo) / lot.premium;
+          if (pl < -putSl) {
+            const c = lot.contracts;
+            collateral -= c * 100 * putStrike;
+            cash += c * 100 * putStrike;
+            cash -= c * (100 * theo + optFee);
+            stats.putsStopped += c;
+            events.push({ t, kind: "stop_put", contracts: c });
+          } else {
+            kept.push(lot);
+          }
+        }
+        putLots = kept;
+
+        if (putLots.length === 0) {
+          state = "wait";
+          dipArmed = s > dipLevel;
+        } else if (daysLeft <= 0) {
+          let total = 0;
+          for (const lot of putLots) total += lot.contracts;
+          collateral -= total * 100 * putStrike;
+          if (s < putStrike) {
+            cash -= total * 100 * putStrike * stockFeePct;
+            shares += total * 100;
+            stats.assignments += total;
+            events.push({ t, kind: "assigned", contracts: total, strike: putStrike });
+            state = "shares";
+          } else {
+            cash += total * 100 * putStrike;
+            stats.putsExpired += total;
+            state = "wait";
+            dipArmed = s > dipLevel;
+          }
+          putLots = [];
+        }
+      } else { // "shares"
+        if (includeCalls && callLots.length === 0 && s >= ath) {
+          const nNew = Math.floor(shares / 100);
+          if (nNew > 0) {
+            callStrike = s; callExpiry = t + callTenor;
+            const theo = bsCallPrice(s, callStrike, callTenor / TRADING_DAYS, sigmaIv, r, q);
+            const premium = theo * (1 - sellHaircut);
+            cash += nNew * (100 * premium - optFee);
+            callLots.push({ contracts: nNew, premium });
+            stats.callsSold += nNew;
+            events.push({ t, kind: "sell_call", contracts: nNew, strike: callStrike });
+          }
+        }
+
+        if (callLots.length > 0) {
+          const daysLeft = callExpiry - t;
+          const texp = Math.max(daysLeft, 0) / TRADING_DAYS;
+          const theo = texp > 0
+            ? bsCallPrice(s, callStrike, texp, sigmaIv, r, q)
+            : Math.max(s - callStrike, 0);
+          const kept = [];
+          for (const lot of callLots) {
+            const pl = (lot.premium - theo) / lot.premium;
+            if (pl > callTp || pl < -callSl) {
+              const c = lot.contracts;
+              cash -= c * (100 * theo + optFee);
+              if (pl > callTp) stats.callsTp += c; else stats.callsStopped += c;
+              events.push({ t, kind: "close_call", contracts: c });
+            } else {
+              kept.push(lot);
+            }
+          }
+          callLots = kept;
+          if (daysLeft <= 0 && callLots.length > 0) {
+            let total = 0;
+            for (const lot of callLots) total += lot.contracts;
+            if (s > callStrike) {
+              cash += total * 100 * callStrike * (1 - stockFeePct);
+              shares -= total * 100;
+              stats.calledAway += total;
+              events.push({ t, kind: "called_away", contracts: total, strike: callStrike });
+              state = "wait";
+              dipArmed = s > dipLevel;
+            } else {
+              stats.callsExpired += total;
+              events.push({ t, kind: "call_expired", contracts: total, strike: callStrike });
+            }
+            callLots = [];
+          }
+        }
+      }
+
+      equity[t] = cash + collateral + shares * s;
+    }
+
+    for (const lot of putLots) stats.putsStillOpen += lot.contracts;
+    for (const lot of callLots) stats.callsStillOpen += lot.contracts;
+
+    return { equity, events, stats };
+  }
+
+  /** All four arms on one shared seeded price path -- a paired comparison, so
+   *  nearly all of the path's own randomness cancels out of the differences
+   *  between arms even though three of the four have no distribution of
+   *  their own to compare against.
+   *
+   *  pr.realPath, when present, is a real historical price series (already
+   *  rebased to start at pr.s0 by the scenario's derive()) and is used
+   *  verbatim in place of a simulated GBM path -- mu and the seed stop
+   *  mattering, since the path is no longer drawn from them. */
+  function simulateWheelFamily(pr) {
+    const path = pr.realPath || simulateGbmPath(pr);
+    const wheel = simulateWheel(path, pr, true);
+    const putsOnly = simulateWheel(path, pr, false);
+    const dip = simulateDipStrategy(path, pr);
+    const holdShares = (pr.w0 / (1 + pr.stockFeePct)) / path[0];
+    const hold = new Float64Array(path.length);
+    for (let i = 0; i < path.length; i++) hold[i] = holdShares * path[i];
+    return { path, wheel, putsOnly, dip, hold };
+  }
+
+  /** Annualized log return: ln(final/initial)/years -- the metric every arm's
+   *  equity curve is reduced to, since a fixed horizon otherwise favours
+   *  whichever arm happened to be fully invested for more of it. */
+  function cagr(final, initial, years) {
+    if (final <= 0 || initial <= 0 || years <= 0) return -Infinity;
+    return Math.log(final / initial) / years;
+  }
+
+  /** Everything the wheel scenario's tiles and table need: the exact
+   *  single-contract anchors, buy-and-hold's exact distribution, and this
+   *  one seed's simulated outcome for all four arms. */
+  function wheelSummary(pr) {
+    const fam = simulateWheelFamily(pr);
+    // holdSummary's own parameter is named "sigma" (it stands alone; see the
+    // G.hold golden cases), so the wheel's sigmaRv is mapped in explicitly
+    // rather than handed over inside a same-named pr object that has no
+    // "sigma" key at all.
+    const hold = holdSummary({ w0: pr.w0, mu: pr.mu, sigma: pr.sigmaRv,
+      q: pr.q, years: pr.years });
+    const strike0 = pr.s0 * (1 - pr.dipPct);
+    const putProbNaive = realWorldItmProb(strike0, strike0, pr.xMonths / 12,
+      pr.sigmaRv, pr.mu, pr.q, false);
+    const callProbNaive = realWorldItmProb(pr.s0, pr.s0, pr.yMonths / 12,
+      pr.sigmaRv, pr.mu, pr.q, true);
+    const ws = fam.wheel.stats;
+    const assignedRate = ws.assignments / Math.max(1, ws.putsSold);
+    const last = (arr) => arr[arr.length - 1];
+    return {
+      wheelFinal: last(fam.wheel.equity),
+      putsOnlyFinal: last(fam.putsOnly.equity),
+      dipFinal: last(fam.dip),
+      holdFinalSample: last(fam.hold),
+      holdFinalExact: hold.expectedFinal,
+      holdMedianExact: hold.medianFinal,
+      wheelCagr: cagr(last(fam.wheel.equity), pr.w0, pr.years),
+      putsOnlyCagr: cagr(last(fam.putsOnly.equity), pr.w0, pr.years),
+      dipCagr: cagr(last(fam.dip), pr.w0, pr.years),
+      holdCagrSample: cagr(last(fam.hold), pr.w0, pr.years),
+      holdCagrExact: hold.growthRate,
+      putNaiveAssignProb: putProbNaive,
+      callNaiveCalledawayProb: callProbNaive,
+      simAssignRate: assignedRate,
+      putsSold: ws.putsSold,
+      assignments: ws.assignments,
+      callsSold: ws.callsSold,
+      calledAway: ws.calledAway,
+      callsExpired: ws.callsExpired,
+    };
+  }
+
+  /** Wheel CAGR against sigmaIv - sigmaRv, averaged over nSeeds paths per
+   *  point. Explicitly a Monte Carlo sweep, not a closed form -- see
+   *  lab/analytics.py:wheel_iv_sweep for why no exact version exists. */
+  function wheelIvSweep(pr) {
+    const { points, nSeeds, spreadLo, spreadHi, baseSeed, sigmaRv } = pr;
+    const xs = [], gs = [];
+    for (let i = 0; i < points; i++) {
+      const spread = spreadLo + (spreadHi - spreadLo) * i / Math.max(1, points - 1);
+      const sigmaIv = Math.max(0.01, sigmaRv + spread);
+      let total = 0;
+      for (let j = 0; j < nSeeds; j++) {
+        const fam = simulateWheelFamily(Object.assign({}, pr, {
+          sigmaIv, seed: baseSeed + i * nSeeds + j,
+        }));
+        total += cagr(fam.wheel.equity[fam.wheel.equity.length - 1], pr.w0, pr.years);
+      }
+      xs.push(spread);
+      gs.push(total / nSeeds);
+    }
+    return { xs, gs };
+  }
+
   Object.assign(EP, {
     mulberry32,
     binomPmf, binomCdf, binomPpf, binomWeights,
@@ -1360,5 +1827,10 @@ window.EP = window.EP || {};
     insUninsuredGrowth, insInsuredGrowth, insBuyerMaxPremium, insSellerGrowth,
     insSellerMinPremium, insBuyerValue, insSellerValue, insPoolGrowth,
     insPoolLimit, insPoolBreakEven, insSummary, insPremiumCurve, insPoolCurve,
+    // the wheel strategy
+    normCdf, normPpf, bsD1D2, bsCallPrice, bsPutPrice, realWorldItmProb,
+    holdGrowthRate, holdSummary, makeNormalGenerator, simulateGbmPath,
+    simulateDipStrategy, simulateWheel, simulateWheelFamily, cagr,
+    wheelSummary, wheelIvSweep,
   });
 })(window.EP);

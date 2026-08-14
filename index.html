@@ -144,6 +144,14 @@
     font-variant-numeric: tabular-nums;
   }
   .ctl input[type="range"] { width: 100%; accent-color: var(--series-1); min-height: 24px; }
+  .ctl select {
+    width: 100%; padding: 5px 8px; font: inherit; font-size: 13px;
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--baseline); border-radius: 4px;
+    min-height: 32px; cursor: pointer;
+  }
+  .ctl select:hover { border-color: var(--text-secondary); }
+  .ctl select:focus { outline: 2px solid var(--series-1); outline-offset: 2px; }
   .ctl-actions { display: flex; gap: 8px; margin-left: auto; }
 
   /* -- KPI row ------------------------------------------------------------ */
@@ -267,6 +275,7 @@
 </div>
 
 <script src="js/engine.js"></script>
+<script src="js/market_data.js"></script>
 <script src="js/scenarios.js"></script>
 <script src="js/charts.js"></script>
 <script src="js/app.js"></script>

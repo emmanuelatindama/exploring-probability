@@ -31,13 +31,15 @@ That is a deliberate constraint, not an oversight:
 
 | Path | Role |
 |---|---|
-| `lab/analytics.py` | **Source of truth.** Seven numbered sections: the multiplicative coin, gambler's ruin, St Petersburg, the prisoner's dilemma, Monty Hall, Shannon's demon, insurance and risk pooling. |
+| `lab/analytics.py` | **Source of truth.** Eight numbered sections: the multiplicative coin, gambler's ruin, St Petersburg, the prisoner's dilemma, Monty Hall, Shannon's demon, insurance and risk pooling, the wheel strategy. |
 | `lab/verify.py` | Checks the closed forms against Monte Carlo, then writes `js/golden.js`. |
 | `js/engine.js` | Simulation + the same closed forms, mirroring `analytics.py` section for section. |
 | `js/scenarios.js` | The scenario registry. Adding a scenario touches only this file plus a chart if it needs a new form. |
 | `js/charts.js` | Plotly wrappers. Reads all colour from CSS custom properties. |
 | `js/app.js` | Page wiring: the `CHART_KINDS` registry, controls, tiles, legends, table views, theme. |
 | `tests.html` | Runs `engine.js` against `js/golden.js` in the browser. |
+| `lab/fetch_market_data.py` | Offline, one-shot: fetches real daily prices from Yahoo Finance and writes `js/market_data.js`. Not part of the Python-derives-JS-ships contract above — there is no closed form to check a price against, so it has no `verify.py` case. Re-run it to move "present day" forward. |
+| `js/market_data.js` | **Generated, not hand-edited.** `window.EP_MARKET`: real daily closes (2009–present) for 5 indices and 20 stocks, for the wheel scenario's "choose your underlying" control. |
 
 If you change a formula in `engine.js`, change it in `analytics.py` and re-run
 `python lab/verify.py`. A formula that exists in only one of the two is a bug.
@@ -148,6 +150,71 @@ tiles that looked like a wrong formula until the actual slider values were
 checked. Worth remembering when driving the page programmatically — move the
 pointer (or scroll) away from the controls row before dispatching wheel/scroll
 events.
+
+**Two different tolerance classes exist now, not one.** Every scenario before
+the wheel checked JS against Python at 1e-8/1e-9, because every quantity was
+either exact arithmetic or the shared mulberry32 PRNG, and both sides compute
+those bit-for-bit identically. The wheel introduces a second class: `normCdf`
+and `normPpf` are *approximations* in `engine.js` (Abramowitz-Stegun and
+Acklam) checked against scipy's exact routines in `analytics.py`, and every
+Black-Scholes price, real-world ITM probability, and buy-and-hold quantile
+runs through one of them. `tests.html` holds that whole family to 1e-5/1e-6,
+deliberately looser than the PRNG-only bar (`path[i]`, dip and hold equity
+never call either function, so they stay at 1e-9). Adding a scenario with its
+own transcendental approximation should reuse this split rather than
+discovering it again by watching an all-green suite turn red at 1e-9 for a
+value that is correct to six decimal places.
+
+**A relative tolerance cannot compare two numbers that are each "zero plus
+floating-point noise."** Shannon's demon's `stockGrowth` is analytically zero
+for a symmetric coin; Python and JS each land within 1 ULP of it but not of
+each other, and `abs(got-want)/abs(want)` explodes when `want` is ~1e-17. Same
+failure mode as the St Petersburg infinity case above, same fix: `tests.html`
+now switches to `absTol` whenever the golden value itself is smaller than
+1e-9, rather than trusting a relative bar to mean anything near a true zero.
+
+**A helper's own parameter name is not the scenario's field name, and passing
+`pr` straight through hides the mismatch instead of erroring on it.**
+`holdSummary`/`hold_summary` take a parameter called `sigma`, standalone; the
+wheel's own params object calls the same quantity `sigmaRv`, because `sigmaIv`
+also exists and both need distinct names. Calling `holdSummary(pr)` directly
+compiles, runs, and returns `NaN` propagated all the way through -- `pr.sigma`
+is `undefined`, and `undefined * dt` degrades to `NaN` silently rather than
+throwing. `simulateGbmPath` had the identical trap for the same reason.
+Neither was caught by writing the code carefully; both were caught by running
+it and finding `NaN`/`null` in the output. Map field names explicitly at the
+call site (`holdSummary({ sigma: pr.sigmaRv, ... })`) whenever a shared helper
+predates a scenario that needs a more specific name for the same quantity.
+
+**A cohort still open when the horizon ends is a fourth outcome, not a
+missing one.** `simulateWheel`'s bookkeeping identity is `sold = closed early
++ expired + assigned/called-away + still-open` -- the last term exists because
+a six-month put tenor and a five-year horizon routinely land mid-cohort at the
+last day simulated. Dropping it made `puts_sold` disagree with the sum of
+every *other* bucket by exactly the size of the last cohort, which reads like
+a bookkeeping bug and is actually just an unfinished trade at the edge of the
+chart.
+
+**Real market data is baked in once, offline — never fetched at request time.**
+This is a static GitHub Pages site with no backend, so `js/market_data.js` is
+generated by running `lab/fetch_market_data.py` against Yahoo Finance's public
+chart endpoint and committing the output, the same way `js/golden.js` is
+generated by `verify.py` rather than hand-written. Two consequences worth
+remembering: (1) "present day" on the wheel's real-data option is frozen at
+whenever the script last ran, not actually live — re-run it to move that
+forward; (2) it is `adjclose`, not `close` — split- and dividend-adjusted —
+because an unadjusted close would silently show a fake price collapse on every
+split date and understate a stock's real total return by however much it has
+paid in dividends since 2009.
+
+**A real price series has its own scale and currency; the wheel's contract
+math assumes neither.** 100-shares-per-contract sizing against the S&P 500's
+raw level (~4 digits) or the Nikkei's (~5 digits, in yen) would price a single
+lot far outside any sane starting-capital slider. `derive()` in the wheel's
+scenario entry rebases every real series to start at `s0` before handing it to
+`simulateWheelFamily` — indexed-to-100 is standard practice for comparing
+returns across securities, and it means the mechanics never need to know or
+care what the real security's price level or currency was.
 
 ## Dataviz
 
