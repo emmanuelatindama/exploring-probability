@@ -97,6 +97,18 @@ def verify_closed_forms():
         assert q05 <= med <= q95, f"quantiles out of order: {q05} {med} {q95}"
         print(f"  [ok  ] quantile ordering: {q05:.6g} <= {med:.6g} <= {q95:.6g}")
 
+        # SD, like the mean, is only checkable against a sample when the tail
+        # is not too heavy -- f=1.0 here is the same heavy-tailed case the
+        # mean is already excused from above, for the identical reason.
+        if c["f"] < 1.0:
+            check("SD[W_T]", float(final.std()), A.sd_final(**c), tol=2e-2, rel=True)
+        else:
+            print(f"  [skip] SD[W_T] vs sample: f=1.0 is heavy-tailed, "
+                  f"same as E[W_T] above -- checked by identity instead")
+        e2_identity = c["w0"] ** 2 * (c["p"] * mu ** 2 + (1 - c["p"]) * md ** 2) ** c["rounds"]
+        check("Var[W_T] identity", A.variance_final(**c),
+              e2_identity - A.expected_final(**c) ** 2)
+
 
 def verify_kelly():
     """f* should be the argmax of time_growth -- check against a brute sweep."""
@@ -161,6 +173,11 @@ def verify_ruin():
         # Absorption is certain, so the two outcomes must exhaust the space.
         total = A.ruin_prob(**c) + A.reach_target_prob(**c)
         check("P(ruin) + P(target) = 1", total, 1.0)
+        # Terminal wealth is two-point, so E and SD are pinned by P(ruin) alone.
+        q = A.reach_target_prob(**c)
+        mean, sd = A.ruin_terminal_stats(**c)
+        check("E[terminal] identity", mean, c["target"] * q)
+        check("SD[terminal] identity", sd, c["target"] * math.sqrt(q * (1 - q)))
 
     # The fair-coin case has an elementary closed form worth pinning separately:
     # ruin probability is 1 - k/n and duration is k(n-k), both in bets.
@@ -203,7 +220,10 @@ def verify_st_petersburg():
     # legitimate check on E[payout]. Below m^2 p < 1 the variance is finite too,
     # so the estimate actually settles.
     rng = np.random.default_rng(4242)
-    for p, m in [(0.4, 2.0), (0.5, 1.5), (0.3, 2.5)]:
+    # (0.3, 1.5) is the odd one out: m^2 p = 0.675 < 1, so unlike the other
+    # three it has a genuinely finite variance -- the branch that checks SD
+    # against a sample needs at least one case where that check can pass.
+    for p, m in [(0.4, 2.0), (0.5, 1.5), (0.3, 2.5), (0.3, 1.5)]:
         n = 2_000_000
         tosses = rng.geometric(1 - p, size=n)  # tosses until the first failure
         payouts = m ** (tosses - 1.0)
@@ -214,6 +234,18 @@ def verify_st_petersburg():
               f"{'finite' if finite_var else 'infinite'} variance)")
         check("E[payout]", float(payouts.mean()), want, tol=tol, rel=True)
         check("median payout", float(np.median(payouts)), A.sp_median(p, m))
+        # Variance needs the stricter m^2*p < 1 -- a case can have a
+        # perfectly finite mean and an infinite spread around it.
+        d_mean, d_sd = A.sp_dispersion(p, m)
+        check("dispersion mean = sp_expected", d_mean, want)
+        if finite_var:
+            check("SD[payout]", float(payouts.std()), d_sd, tol=3e-2, rel=True)
+        else:
+            ok = math.isinf(d_sd)
+            if not ok:
+                FAILURES.append((f"SD[payout] should diverge p={p} m={m}", d_sd, "inf"))
+            print(f"  [{'ok  ' if ok else 'FAIL'}] SD[payout] diverges "
+                  f"(m^2p={m*m*p:.3f} >= 1): {d_sd}")
         for tier in (1, 3, 6):
             check(f"P(payout >= m^{tier - 1})",
                   float((tosses >= tier).mean()), A.sp_survival(tier, p), tol=2e-3)
@@ -223,6 +255,12 @@ def verify_st_petersburg():
     print("\n  classic game p=0.5 m=2.0")
     check("E[payout] diverges", A.sp_expected(0.5, 2.0), math.inf)
     check("median payout = $1", A.sp_median(0.5, 2.0), 1.0)
+    classic_mean, classic_sd = A.sp_dispersion(0.5, 2.0)
+    check("dispersion mean diverges too", classic_mean, math.inf)
+    ok = math.isinf(classic_sd)
+    if not ok:
+        FAILURES.append(("classic SD[payout] should diverge", classic_sd, "inf"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] classic SD[payout] diverges: {classic_sd}")
     for tier in (1, 5, 20, 200):
         check(f"tier {tier} contributes", A.sp_tier_contribution(tier, 0.5, 2.0), 0.5)
     # Capping the house's bankroll is what makes the game worth something: for
@@ -614,41 +652,50 @@ def verify_wheel():
     ok = (s_["calls_tp"] == 0
           and s_["puts_sold"] == s_["assignments"] + s_["puts_expired"]
              + s_["puts_still_open"]
-          and s_["calls_sold"] == s_["calls_bought_back"] + s_["calls_expired"]
-             + s_["calls_still_open"])
+          and s_["calls_sold"] == s_["called_away"] + s_["calls_expired"]
+             + s_["calls_closed_on_stop"] + s_["calls_still_open"])
     if not ok:
         FAILURES.append(("take-profit disabled -> only expiry outcomes", s_,
                         "no early closes"))
     print(f"  [{'ok  ' if ok else 'FAIL'}] puts {s_['puts_sold']} = "
           f"{s_['assignments']} assigned + {s_['puts_expired']} expired; "
-          f"calls {s_['calls_sold']} = {s_['calls_bought_back']} bought back + "
+          f"calls {s_['calls_sold']} = {s_['called_away']} called away + "
           f"{s_['calls_expired']} expired -- no early close on either side")
 
-    print("\n  shares only ever ratchet up: nothing is sold, ever")
-    for seed in (1, 4, 7):
-        path = A.simulate_gbm_path(seed=seed)
-        w = A.simulate_wheel(path)
-        sold = [e for e in w["events"]
-                if e["kind"] in ("called_away", "sell_stock")]
-        ok = not sold
-        if not ok:
-            FAILURES.append((f"no share sales (seed={seed})", len(sold), 0))
-        print(f"  [{'ok  ' if ok else 'FAIL'}] seed {seed}: "
-              f"{len(sold)} share-disposal events")
-
-    print("\n  a put stop-loss would pre-empt assignment (why there isn't one)")
-    # Regression guard for the defect this rewrite fixed: the acquisition leg
-    # must actually acquire. A -30% stop on the put's own marked value fired
-    # before every assignment, so the arm sold 161 puts over the S&P's history
-    # and took delivery zero times.
-    assigned_any = 0
-    for seed in range(1, 9):
-        assigned_any += A.simulate_wheel_family(seed=seed)["wheel"]["stats"]["assignments"]
+    print("\n  the acquisition leg must actually acquire")
+    # Regression guard for a defect that has now bitten twice. A stop on the
+    # put's own marked value cannot coexist with assignment, because a put on
+    # its way to being assigned must first balloon in value and trip the stop.
+    # Measured over the S&P's 2009-2026 history, -30%, -50% and -100% stops
+    # each produced ZERO assignments in seventeen years -- the arm sat in cash
+    # while the index went up eightfold. If this count ever returns to zero,
+    # the wheel has silently stopped being the wheel.
+    assigned_any = sum(A.simulate_wheel_family(seed=s)["wheel"]["stats"]["assignments"]
+                       for s in range(1, 9))
     ok = assigned_any > 0
     if not ok:
         FAILURES.append(("wheel acquires shares over 8 seeds", assigned_any, "> 0"))
     print(f"  [{'ok  ' if ok else 'FAIL'}] {assigned_any} contracts assigned "
           f"across 8 seeds")
+
+    print("\n  one position at a time: never short a put while holding shares")
+    for seed in (1, 4, 7):
+        path = A.simulate_gbm_path(seed=seed)
+        w = A.simulate_wheel(path)
+        # Replay the event tape: a sell_put may only follow a flat account.
+        long_now, bad = False, 0
+        for e in w["events"]:
+            if e["kind"] == "assigned":
+                long_now = True
+            elif e["kind"] in ("called_away", "stop_shares"):
+                long_now = False
+            elif e["kind"] == "sell_put" and long_now:
+                bad += 1
+        ok = bad == 0
+        if not ok:
+            FAILURES.append((f"single position (seed={seed})", bad, 0))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] seed {seed}: {bad} puts sold "
+              f"while long")
 
     print("\n  lot bookkeeping balances across a batch of seeds")
     for seed in range(1, 9):
@@ -656,9 +703,9 @@ def verify_wheel():
         s_ = fam["wheel"]["stats"]
         puts_ok = (s_["puts_sold"] == s_["assignments"] + s_["puts_expired"]
                   + s_["puts_still_open"])
-        calls_ok = (s_["calls_sold"] == s_["calls_bought_back"]
+        calls_ok = (s_["calls_sold"] == s_["called_away"]
                    + s_["calls_expired"] + s_["calls_tp"]
-                   + s_["calls_still_open"])
+                   + s_["calls_closed_on_stop"] + s_["calls_still_open"])
         equity_ok = min(fam["wheel"]["equity"]) > -1e-6
         ok = puts_ok and calls_ok and equity_ok
         if not ok:
@@ -842,14 +889,15 @@ HOLD_GOLDEN = [
 # t=215), while staying light enough for tests.html to check bit for bit.
 WHEEL_SIM_CFG = dict(w0=20000.0, s0=100.0, mu=0.08, sigma_rv=0.20, sigma_iv=0.24,
                      r=0.03, q=0.0, years=1.0, x_months=6.0, y_months=3.0,
-                     dip_pct=0.05, sell_haircut=0.10, call_tp=0.70,
+                     dip_pct=0.05, sell_haircut=0.10, share_sl=0.20,
+                     call_tp=0.70,
                      stock_fee_pct=0.005, opt_fee=0.65, seed=7)
 
 # Deliberately tiny -- this is only checking that engine.js's sweep loop
 # agrees with analytics.py's, not producing a chart-quality curve.
 WHEEL_SWEEP_CFG = dict(w0=20000.0, s0=100.0, mu=0.08, sigma_rv=0.20, r=0.03,
                        q=0.0, years=1.0, x_months=6.0, y_months=3.0,
-                       dip_pct=0.05, sell_haircut=0.10,
+                       dip_pct=0.05, sell_haircut=0.10, share_sl=0.20,
                        call_tp=0.70, stock_fee_pct=0.005,
                        opt_fee=0.65, points=4, n_seeds=3, spread_lo=-0.05,
                        spread_hi=0.10, base_seed=500)
@@ -873,6 +921,7 @@ def emit_golden():
                 "timeGrowth": s["time_growth"],
                 "expectedFinal": s["expected_final"],
                 "medianFinal": s["median_final"],
+                "sdFinal": s["sd_final"],
                 "pBelowStart": s["p_below_start"],
                 "pBelowOne": s["p_below_one"],
                 "q05": s["q05"],
@@ -916,6 +965,8 @@ def emit_golden():
                 "duration": s["duration"],
                 "ruinUnbounded": s["ruin_unbounded"],
                 "fairRuinProb": s["fair_ruin_prob"],
+                "terminalMean": s["terminal_mean"],
+                "terminalSd": s["terminal_sd"],
             },
         })
 
@@ -952,6 +1003,8 @@ def emit_golden():
                 "typicalMean": s["typical_mean"],
                 "survival5": A.sp_survival(5, c["p"]),
                 "contribution5": A.sp_tier_contribution(5, c["p"], c["m"]),
+                "sd": s["sd"],
+                "m2p": s["m2p"],
             },
         })
 
@@ -1112,7 +1165,7 @@ def emit_golden():
             "q": WHEEL_SIM_CFG["q"], "years": WHEEL_SIM_CFG["years"],
             "xMonths": WHEEL_SIM_CFG["x_months"], "yMonths": WHEEL_SIM_CFG["y_months"],
             "dipPct": WHEEL_SIM_CFG["dip_pct"], "sellHaircut": WHEEL_SIM_CFG["sell_haircut"],
-            "callTp": WHEEL_SIM_CFG["call_tp"],
+            "shareSl": WHEEL_SIM_CFG["share_sl"], "callTp": WHEEL_SIM_CFG["call_tp"],
             "stockFeePct": WHEEL_SIM_CFG["stock_fee_pct"],
             "optFee": WHEEL_SIM_CFG["opt_fee"], "seed": WHEEL_SIM_CFG["seed"],
         },
@@ -1134,6 +1187,7 @@ def emit_golden():
             "years": WHEEL_SWEEP_CFG["years"], "xMonths": WHEEL_SWEEP_CFG["x_months"],
             "yMonths": WHEEL_SWEEP_CFG["y_months"], "dipPct": WHEEL_SWEEP_CFG["dip_pct"],
             "sellHaircut": WHEEL_SWEEP_CFG["sell_haircut"],
+            "shareSl": WHEEL_SWEEP_CFG["share_sl"],
             "callTp": WHEEL_SWEEP_CFG["call_tp"],
             "stockFeePct": WHEEL_SWEEP_CFG["stock_fee_pct"], "optFee": WHEEL_SWEEP_CFG["opt_fee"],
             "points": WHEEL_SWEEP_CFG["points"], "nSeeds": WHEEL_SWEEP_CFG["n_seeds"],

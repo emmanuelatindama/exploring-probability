@@ -118,6 +118,15 @@
       body.appendChild(buildCard(kind));
     }
     body.appendChild(el("p", "note", sc.note));
+
+    if (sc.mathBox) {
+      const details = el("details", "math-box");
+      details.appendChild(el("summary", null, "For math enthusiasts"));
+      const pre = el("pre");
+      pre.id = "math-box-lines";
+      details.appendChild(pre);
+      body.appendChild(details);
+    }
   }
 
   function buildCard(kind) {
@@ -511,8 +520,10 @@
           { color: getVar("--series-2"), label: "Puts only (no covered calls)" },
           { color: getVar("--series-1"), label: "The wheel" },
           { color: getVar("--series-1"), shape: "dot", label: "Put sold" },
-          { color: getVar("--series-3"), shape: "dot", label: "Assigned — shares kept for good" },
-          { color: getVar("--series-2"), shape: "dot", label: "Call sold / bought back in the money" },
+          { color: getVar("--series-3"), shape: "dot", label: "Assigned" },
+          { color: getVar("--series-2"), shape: "dot", label: "Call sold" },
+          { color: getVar("--series-3"), shape: "dot", label: "Called away" },
+          { color: getVar("--diverging-neg"), shape: "dot", label: "Shares stopped out" },
         ],
         table: tableWheelPaths(d, pr),
       }),
@@ -617,6 +628,7 @@
 
     const d = sc.compute(pr);
     renderTiles(sc, pr, d.stats);
+    renderMathBox(sc, pr, d.stats);
 
     const jobs = [];
     for (const kind of sc.charts) {
@@ -649,6 +661,15 @@
       if (t.note) tile.appendChild(el("div", "note", t.note));
       holder.appendChild(tile);
     }
+  }
+
+  /** A scenario's closed forms, for readers who want the formula behind the
+   *  tiles rather than just the number -- at most 7 lines, textContent only
+   *  (never innerHTML), same as every other computed label on this page. */
+  function renderMathBox(sc, pr, stats) {
+    const pre = $("#math-box-lines");
+    if (!pre || !sc.mathBox) return;
+    pre.textContent = sc.mathBox(pr, stats).join("\n");
   }
 
   /** Legend keys mirror the mark they stand for: a 2px stroke for lines, a
@@ -945,11 +966,13 @@
     const EVENT_LABELS = {
       sell_put: "Sold put",
       put_expired: "Put expired worthless",
-      assigned: "Assigned — shares held for good",
+      assigned: "Assigned",
       sell_call: "Sold covered call",
       close_call: "Call bought back at a profit",
-      buy_to_close_call: "Call bought back in the money",
+      close_call_on_stop: "Call bought back — shares stopping out",
       call_expired: "Call expired worthless",
+      called_away: "Called away — shares sold",
+      stop_shares: "Shares stopped out",
     };
     const rows = wheel.events.map((e) => [
       String(e.t), EVENT_LABELS[e.kind] || e.kind, String(e.contracts),

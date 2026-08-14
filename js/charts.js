@@ -1460,16 +1460,17 @@ window.EP = window.EP || {};
   // The wheel strategy
   // ==========================================================================
   /** Marker style per event kind the reader should actually notice on the
-   *  path. Assignment is the one that changes what the account *is* -- from
-   *  cash-plus-short-puts into stock it will now hold for good -- so it gets
-   *  the filled circle. Worthless expiries and take-profit closes are far too
-   *  frequent to mark without turning the line into confetti; they are left
-   *  to the table view. */
+   *  path. Assignment and being called away are the two that flip which
+   *  single position the account holds, so they get filled marks; a share
+   *  stop is the strategy's only loss cap, so it gets its own too. Worthless
+   *  expiries and take-profit closes are far too frequent to mark without
+   *  turning the line into confetti, and are left to the table view. */
   const WHEEL_EVENT_MARKS = {
     sell_put: { key: "s1", symbol: "triangle-down", label: "Put sold" },
-    assigned: { key: "s3", symbol: "circle", label: "Assigned — shares kept for good" },
+    assigned: { key: "s3", symbol: "circle", label: "Assigned" },
     sell_call: { key: "s2", symbol: "triangle-up", label: "Call sold" },
-    buy_to_close_call: { key: "s2", symbol: "x", label: "Call bought back in the money" },
+    called_away: { key: "s3", symbol: "circle-open", label: "Called away" },
+    stop_shares: { key: "neg", symbol: "x", label: "Shares stopped out" },
   };
 
   /**

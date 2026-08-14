@@ -43,6 +43,23 @@ window.EP = window.EP || {};
     return `$${v.toExponential(1)}`;
   }
 
+  /** Shared by the coin flip and Kelly: E and SD of terminal wealth, exact.
+   *  Both scenarios run the identical product-of-multipliers process; Kelly
+   *  just exposes f as a slider instead of pinning it to 1. */
+  function coinDispersionBox(pr, s) {
+    const heavy = s.sdFinal > 5 * Math.max(1, s.expectedFinal);
+    return [
+      "W_T = w0 · (multiplier each round), heads w.p. p, tails w.p. 1−p",
+      `E[W_T]  = w0(p·up + (1−p)·down)^n   = ${money(s.expectedFinal)}`,
+      `SD[W_T] = w0·√[(p·up²+(1−p)·down²)^n − (E[W_T]/w0)²]  = ${money(s.sdFinal)}`,
+      heavy
+        ? "SD this large is the same heavy tail that lifts the mean above"
+          + " the median — a fact about the game, not a bug."
+        : "Below the Kelly optimum the spread stays close to the mean;"
+          + " above it, this is what \"volatility drag\" looks like as a number.",
+    ];
+  }
+
   // Controls shared by the two multiplicative scenarios.
   const COIN_CONTROLS = {
     up: { key: "up", label: "Heads multiplier", min: 1.0, max: 2.5, step: 0.05,
@@ -107,6 +124,7 @@ window.EP = window.EP || {};
         { label: "Growth per round, typical player", value: pctSigned(s.timeGrowth),
           note: `vs ${pctSigned(s.ensembleGrowth)} expected` },
       ],
+      mathBox: coinDispersionBox,
       note:
         "The gap between those first two tiles is the whole point. The mean is " +
         "dragged upward by a vanishingly small number of enormous winners, so it " +
@@ -156,6 +174,7 @@ window.EP = window.EP || {};
         { label: "Players who end below start", value: pct(s.pBelowStart),
           note: `of ${count(pr.nPaths)}` },
       ],
+      mathBox: coinDispersionBox,
       note:
         "Growth per round peaks at f* = (p·a − q·b) / (a·b), where a is " +
         "the fractional gain and b the fractional loss. Below f* you leave growth " +
@@ -223,6 +242,14 @@ window.EP = window.EP || {};
         { label: "If the house had no limit", value: pct(s.ruinUnbounded),
           note: "ruin with no target to quit at" },
       ],
+      mathBox: (pr, s) => [
+        "Terminal wealth W is two-point: $0 or the target, nothing between",
+        `E[W]  = target · P(reach)          = ${money(s.terminalMean)}`,
+        `SD[W] = target · √[P(reach)(1−P(reach))] = ${money(s.terminalSd)}`,
+        "A two-point distribution's mean and SD contain no more information",
+        "than the single probability already on the tiles above — they are",
+        "the same fact, twice.",
+      ],
       note:
         "This game is additive: every round moves you one bet up or one bet " +
         "down, so wealth is a random walk rather than a product, and the axis " +
@@ -251,15 +278,15 @@ window.EP = window.EP || {};
         "A wager with infinite expected value that nobody will pay $20 for. " +
         "Half of all games pay exactly $1.",
       story:
-        "A casino offers you this: a coin is tossed until it comes up tails, " +
-        "and the pot doubles every time it doesn't. The expected payout is " +
-        "infinite. What would you pay to play? Nicolaus Bernoulli posed the " +
-        "question in 1713. Nobody would offer more than a few coins, and " +
-        "nobody could explain why they were right to refuse. His cousin " +
-        "Daniel published an answer from the St Petersburg Academy in 1738 " +
-        "and invented, on the way, the idea that money's worth is not its " +
-        "amount. The infinity is real. It lives entirely in outcomes you will " +
-        "never see.",
+        "A casino offers you this: the pot starts at $1, and every head " +
+        "doubles it before the next toss; the first tail ends the game and " +
+        "pays out whatever the pot reached — half the time that is still " +
+        "just $1, on the very first toss. Keep flipping heads and it " +
+        "compounds without limit, so the expected payout is infinite. " +
+        "Nicolaus Bernoulli posed this in 1713; nobody offered more than a " +
+        "few coins, and nobody could explain why they were right to " +
+        "refuse. His cousin Daniel answered from the St Petersburg Academy " +
+        "in 1738: money's worth is not its amount.",
       controls: [
         { key: "p", label: "P(the coin keeps going)", min: 0.2, max: 0.7,
           step: 0.01, value: 0.5, fmt: pct },
@@ -305,6 +332,15 @@ window.EP = window.EP || {};
         { label: `Typical average over ${count(pr.plays)} games`,
           value: money(s.typicalMean),
           note: "approximation — there is no limit to converge to" },
+      ],
+      mathBox: (pr, s) => [
+        "Payout X = m^(N−1), N = toss the first tail lands on. Exact:",
+        `E[X]  = (1−p)/(1−mp)     = ${s.divergent ? "∞ (mp≥1)" : money(s.expected)}`,
+        `SD[X] needs the STRICTER m²p<1, not just mp<1 (m²p = ${num(s.m2p)})`,
+        `SD[X] = ${s.sdDivergent ? "∞ — undefined spread" : money(s.sd)}`,
+        s.sdDivergent && !s.divergent
+          ? "A finite mean and an infinite spread, at once: this is that case."
+          : "Whenever mp is close to 1, small changes move both by a lot.",
       ],
       note:
         "The second chart is the paradox drawn directly. Each bar is one " +
@@ -371,6 +407,13 @@ window.EP = window.EP || {};
             note: `${pct(s.dominantShare)} of the population` },
         ];
       },
+      mathBox: () => [
+        "Not applicable here, honestly: with noise=0 these scores ARE the",
+        "exact expectation already, from a 16-state Markov chain over the",
+        "two players' joint history — not a sample from some distribution",
+        "with a mean and a spread of its own. The number on the tile above",
+        "is not an estimate of anything; there is nothing left to average.",
+      ],
       note:
         "Every number here is exact, not simulated. Each strategy needs at " +
         "most two bits of history — what you did last round, and whether you " +
@@ -434,6 +477,13 @@ window.EP = window.EP || {};
           note: `${num(s.ratio, 2)}× as likely to win` },
         { label: "If the host opened at random", value: pct(s.switchRandom),
           note: "no advantage to switching at all" },
+      ],
+      mathBox: (pr, s) => [
+        "Switching's outcome is Bernoulli: win the prize w.p. switchProb",
+        `E[win]  = switchProb                = ${pct(s.switchProb)}`,
+        `SD[win] = √[switchProb·(1−switchProb)] = ${num(Math.sqrt(s.switchProb * (1 - s.switchProb)), 3)}`,
+        "Same number that is already on the first tile, just named as a",
+        "distribution's own mean and spread rather than a probability.",
       ],
       note:
         "The two lines on the first chart are the whole mechanism. A knowing " +
@@ -527,6 +577,13 @@ window.EP = window.EP || {};
         { label: "Volatility harvested", value: pctSigned(s.harvest),
           note: `best: every ${s.bestInterval} period(s)` },
       ],
+      mathBox: () => [
+        "Not fully, honestly: the GROWTH RATE per period is closed form",
+        "(the four tiles above), but rebalancing makes each period's dollar",
+        "return depend on the last rebalance, so wealth's own E and SD in",
+        "dollars have no equally simple closed form — only the tiles' exact",
+        "growth rates do. Terminal wealth here is simulated, not derived.",
+      ],
       note:
         "The stock alone has zero time-average growth here by construction — " +
         "up and down are reciprocals, so a coin that is heads half the time " +
@@ -605,6 +662,14 @@ window.EP = window.EP || {};
           note: s.bandOk ? `width ${money(s.bandWidth)}`
                           : "no premium helps both sides" },
       ],
+      mathBox: (pr, s) => [
+        "The event being insured is Bernoulli: lose `loss` w.p. hazard",
+        `E[loss]  = hazard·loss              = ${money(s.expectedPayout)}`,
+        `SD[loss] = loss·√[hazard·(1−hazard)] = ${money(pr.loss * Math.sqrt(pr.hazard * (1 - pr.hazard)))}`,
+        "This pair is exactly what expected-value logic gets right on its",
+        "own terms — and still not enough, on its own, to explain why both",
+        "sides are correct to sign at a premium above hazard·loss.",
+      ],
       note:
         "Expected value says a fair premium is pi × L, and that a rational " +
         "insurer must charge more than that to survive — so on that measure " +
@@ -634,16 +699,17 @@ window.EP = window.EP || {};
         "assignment do the buying — compared against the stock alone and " +
         "against doing nothing at all.",
       story:
-        "Sell a put below a recent dip and you are paid twice: keep the " +
-        "premium if the stock recovers, or buy it at a discount if it " +
-        "doesn't. Take the shares, keep them, and sell a call at every new " +
-        "high — paid again, either way. Traders call this cycle “the " +
-        "wheel,” and it looks like manufacturing income from nothing. " +
-        "Selling puts and calls this way is decades old; running them as " +
-        "one repeating cycle is newer, popularised on trading forums in " +
-        "the 2010s. None of it beats holding the stock unless the premium " +
-        "pays more than the stock's risk is worth. Pick a real index or " +
-        "stock below to run it on what actually happened since 2009.",
+        "Sell a put and you are paid either way: keep the premium if the " +
+        "stock stays up, or buy it at a discount if it falls. Own the " +
+        "shares, and sell a call against them — paid again, either way. " +
+        "Called away, and you go right back to selling puts. Traders call " +
+        "this cycle “the wheel,” and it looks like manufacturing income " +
+        "from nothing. Selling puts and calls this way is decades old; " +
+        "running them as one repeating cycle is newer, popularised on " +
+        "trading forums in the 2010s. None of it beats holding the stock " +
+        "unless the premium pays more than the stock's risk is worth. " +
+        "Pick a real index or stock below to run it on what actually " +
+        "happened since 2009.",
       controls: [
         { key: "underlying", type: "select", label: "What are you trading?",
           value: "simulated", options: marketOptions(),
@@ -658,6 +724,15 @@ window.EP = window.EP || {};
           min: 0.10, max: 0.45, step: 0.01, value: 0.24, fmt: pct },
         { key: "dipPct", label: "Dip trigger, below the rolling high", min: 0.01,
           max: 0.15, step: 0.01, value: 0.05, fmt: pct },
+        // Tenor of the covered call, in months. A select rather than a slider
+        // because only the listed tenors are liquid enough to be realistic.
+        { key: "yMonths", type: "select", label: "Covered-call length",
+          value: "3", options: [
+            { value: "1", label: "1 month" }, { value: "3", label: "3 months" },
+            { value: "6", label: "6 months" }, { value: "9", label: "9 months" },
+            { value: "12", label: "12 months" },
+          ],
+          fmt: (v) => `${v} month${String(v) === "1" ? "" : "s"}` },
         { key: "years", label: "Horizon (simulated only — real data runs its full history)",
           min: 1, max: 18, step: 1, value: 5, int: true,
           fmt: (v) => `${Math.round(v)} yr` },
@@ -669,8 +744,8 @@ window.EP = window.EP || {};
       // ratio to w0 (how many contracts one lot buys) matters, and w0 alone
       // already exposes that. There is deliberately no stop-loss on the put:
       // see the note, and lab/analytics.py:simulate_wheel.
-      fixed: { s0: 100, r: 0.03, q: 0, xMonths: 6, yMonths: 3, sellHaircut: 0.10,
-               callTp: 0.70, stockFeePct: 0.005, optFee: 0.65 },
+      fixed: { s0: 100, r: 0.03, q: 0, xMonths: 6, sellHaircut: 0.10,
+               shareSl: 0.20, callTp: 0.70, stockFeePct: 0.005, optFee: 0.65 },
       // A real ticker replaces the simulated GBM path outright: its daily
       // closes (already split/dividend-adjusted by fetch_market_data.py) are
       // rebased to start at s0 so the wheel's 100-shares-per-contract sizing
@@ -679,6 +754,8 @@ window.EP = window.EP || {};
       // series actually has -- mu and years stop doing anything, since there
       // is now exactly one path and it is not simulated from either of them.
       derive: (pr) => {
+        // A <select> hands back a string; the tenor is arithmetic downstream.
+        pr.yMonths = Number(pr.yMonths);
         if (pr.underlying === "simulated") { delete pr.realPath; return; }
         const entry = marketEntry(pr.underlying);
         if (!entry) { pr.underlying = "simulated"; delete pr.realPath; return; }
@@ -730,29 +807,38 @@ window.EP = window.EP || {};
           value: pct(s.simAssignRate),
           note: `of ${count(s.putsSold)} puts sold — the gap is entry timing` },
       ],
+      mathBox: () => [
+        "No closed form for the account overall, honestly: entry timing,",
+        "the assignment cycle and the share stop are all path-dependent, so",
+        "there is no E/SD of terminal wealth to derive. The one exact",
+        "quantity is a single put or call's own real-world ITM probability",
+        "(the tiles above) — everything past one option is simulated.",
+      ],
       note:
-        "Two rules here follow from the word acquisition, and both are " +
-        "worth stating because the obvious alternative is a trap. First, " +
-        "the puts carry no stop-loss. A put going into the money is the " +
-        "strategy working, not a loss to cut — and a stop defined on the " +
-        "put's own marked value is self-defeating in the most literal way, " +
-        "because any path that ends in assignment must first push the put " +
-        "deep enough in to trip the stop. An earlier version of this page " +
-        "carried a -30% stop and, run over the S&P's 2009-2026 history, " +
-        "sold 161 puts and took delivery exactly zero times: an " +
-        "acquisition strategy that structurally could not acquire, sitting " +
-        "in cash for seventeen years while the thing it meant to buy went " +
-        "up eightfold. A risk control defined on the wrong variable can " +
-        "quietly delete the strategy it is meant to protect. Second, the " +
-        "shares are never sold — a call finishing in the money is bought " +
-        "back at intrinsic rather than delivered, so exposure only " +
-        "ratchets up and the comparison against buy-and-hold stays a " +
-        "comparison of the same holding. " +
-        "That is what the first two tiles are for. With no stop in the " +
-        "way, the simulation's assignment rate lands close to the exact " +
-        "formula's, and the remaining gap is pure entry timing: the wheel " +
-        "only writes after price crosses the dip line, which the formula " +
-        "does not know about. " +
+        "The wheel here holds exactly one position at a time. Sell a put; " +
+        "hold it to expiry with no stop at all, because the premium is " +
+        "banked the moment it is sold and there is nothing left on that " +
+        "leg to protect — a stop on the put's own marked value is self" +
+        "-defeating anyway, since a put on its way to assignment must " +
+        "first balloon in value and trip it. An earlier version of this " +
+        "page carried exactly that stop, at -30%, -50%, even -100%, and " +
+        "every one of them produced zero assignments over the S&P's " +
+        "2009-2026 history: an acquisition strategy that structurally " +
+        "could not acquire, sitting in cash while the index went up " +
+        "eightfold. Assigned, and the account switches entirely to " +
+        "selling covered calls at the chosen tenor, struck no lower than " +
+        "cost so being called away can never itself realise a loss. " +
+        "Called away, and it goes right back to selling puts, immediately " +
+        "— no dip required, because the account is flat again and there " +
+        "is nothing to wait for. The one loss cap in the whole strategy " +
+        "sits on the shares themselves: fall far enough below cost and " +
+        "they are sold at a loss, same as they would be under plain " +
+        "buy-and-hold. " +
+        "The first two tiles are what that buys you. With no stop fighting " +
+        "the put, the simulation's assignment rate lands close to the " +
+        "exact formula's; the remaining gap is pure entry timing, since " +
+        "the wheel only opens a new put after price crosses the dip line, " +
+        "which the formula does not know about. " +
         "The bars are one path's race, not a law: rerun it and any of the " +
         "four can win. The sweep is the number that generalises. It " +
         "answers the only question that actually decides whether selling " +

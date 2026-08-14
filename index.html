@@ -208,6 +208,20 @@
     border-left: 2px solid var(--border); padding-left: 16px; margin: 22px 0 0;
   }
 
+  /* -- math box (closed forms behind the tiles, for anyone who wants them) */
+  details.math-box { margin-top: 14px; }
+  details.math-box summary {
+    cursor: pointer; font-size: 13px; color: var(--text-secondary);
+    padding: 6px 0; min-height: 24px;
+  }
+  details.math-box summary:hover { color: var(--text-primary); }
+  details.math-box pre {
+    margin: 10px 0 0; padding: 12px 16px;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; font-size: 13px; line-height: 1.6;
+    color: var(--text-secondary); white-space: pre-wrap; max-width: 74ch;
+  }
+
   /* -- table view (the WCAG-clean twin; every value reachable) ------------ */
   details.table-view { margin-top: 14px; }
   details.table-view summary {
