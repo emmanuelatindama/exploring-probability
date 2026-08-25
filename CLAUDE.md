@@ -31,7 +31,7 @@ That is a deliberate constraint, not an oversight:
 
 | Path | Role |
 |---|---|
-| `lab/analytics.py` | **Source of truth.** Eight numbered sections: the multiplicative coin, gambler's ruin, St Petersburg, the prisoner's dilemma, Monty Hall, Shannon's demon, insurance and risk pooling, the wheel strategy. |
+| `lab/analytics.py` | **Source of truth.** Fourteen numbered sections: the multiplicative coin, gambler's ruin, St Petersburg, the prisoner's dilemma, Monty Hall, Shannon's demon, insurance and risk pooling, the wheel strategy, Parrondo's paradox, base rates, the birthday problem, the secretary problem, the two-envelope paradox, optional stopping. |
 | `lab/verify.py` | Checks the closed forms against Monte Carlo, then writes `js/golden.js`. |
 | `js/engine.js` | Simulation + the same closed forms, mirroring `analytics.py` section for section. |
 | `js/scenarios.js` | The scenario registry. Adding a scenario touches only this file plus a chart if it needs a new form. |
@@ -207,6 +207,60 @@ plausible. What catches it is printing the event counts and reading them, and
 asserting the scenario's stated goal actually happens — `verify_wheel` checks
 that assignments across a batch of seeds is greater than zero.
 
+**The same class of bug then bit the wheel twice more, and both times the
+symptom was the return, not a failing test. For a strategy scenario, measure
+*time in the position* and put it on a tile — it is the number that moves the
+result, and nothing else on the page reveals it.** Two rules, each of which
+reads as ordinary risk discipline, each of which quietly deleted most of the
+return:
+
+- **Gating put re-entry on a dip.** Waiting for price to fall 5% below its
+  rolling high before selling the *next* put left the account flat 95% of the
+  time over the S&P's 2009–2026 history, earning the cash rate through an
+  eightfold rally. The error is conceptual: the cash-secured put is the
+  instrument that pays you to wait, so waiting in cash *before* selling one is
+  strictly dominated. Puts now sell from any idle cash, immediately, whether
+  or not shares are already held.
+- **Writing the covered call as soon as the shares arrive.** Assignment
+  happens precisely when the put finished in the money — i.e. with spot
+  *below* the strike that bought the shares — so the protective floor
+  `max(spot, basis)` collapses to `basis` on exactly the paths that reach it.
+  100% of calls were struck at cost, being called away realised exactly zero
+  on the shares, and the arm could earn premium and nothing else. Calls are
+  now written only at a **record high**, which is by construction above every
+  price that ever bought shares, so the strike is always above cost.
+
+Together those two took the S&P arm from +8.8%/yr holding stock 4.6% of the
+time to +14.1%/yr holding it 100% of the time, against buy-and-hold's +12.1%.
+`verify_wheel` now guards all three properties: assignments happen, calls are
+struck above the basis, and the idle-cash fraction stays under 5%.
+
+Note the tension with the all-time-high trap recorded below: gating calls on a
+record high is safe *here* only because idle cash also buys stock outright, so
+the account is always long and a record high always finds shares to write
+against. The earlier version had no such floor, and the same gate shut the
+call leg for good after a drawdown.
+
+**A closed form should not clamp its own inputs — `derive()` should.** Several
+formulas here are only meaningful on a restricted domain: Simpson's needs
+`p_easy + delta <= 1` and `p_easy > p_hard`, Bertrand's needs `c` strictly
+inside (0, 1), gambler's ruin needs a target above the bankroll, Monty Hall
+needs a door left to switch to. The temptation is to clamp inside the formula,
+and it is wrong: for Simpson's the clamp would silently break the very
+identity the scenario exists to show (`delta_crit = (w_b - w_a)(p_easy -
+p_hard)` stops holding the moment a rate is quietly moved). Keep the closed
+form honest and total on its stated domain, and bound the sliders in the
+scenario's `derive()`, where `syncDerivedControls` will also push the clamped
+value back onto the control so the reader's slider and the maths agree.
+
+**Do not assume a ranking between competing formulas holds everywhere.** The
+three Bertrand answers are usually quoted as 1/2 > 1/3 > 1/4, and a first
+version of the test asserted that ordering — it failed at 29 of 99 threshold
+values. The endpoint and midpoint rules genuinely cross at exactly
+`c = 1/sqrt(2)`, where both equal 1/2; the classical ordering holds only
+because `sqrt(3)/2` sits above that crossing. The test now asserts the true
+statement plus the exact crossing identity.
+
 **Two arms that are supposed to differ can collapse onto each other, and a
 chart will not tell you.** Two different versions of this scenario produced a
 wheel that was, on the default seed, pixel-identical to the puts-only arm —
@@ -246,6 +300,42 @@ scenario entry rebases every real series to start at `s0` before handing it to
 `simulateWheelFamily` — indexed-to-100 is standard practice for comparing
 returns across securities, and it means the mechanics never need to know or
 care what the real security's price level or currency was.
+
+**A literal `*/` inside a `/** ... */` docstring ends the comment early, and
+the syntax error it produces is not near the mistake.** Two-envelope's
+`teCrossover` had a JSDoc line reading `exp(rate*x*/2) = 4`; the `*/` inside
+"x*/2" closed the comment two sentences before its real closing `*/`, turning
+the rest of that sentence into stray tokens. The parser reported "Unexpected
+token ')'" with no line number, and the only way to find it was a scan for
+the substring `*/[0-9a-zA-Z(]` across the newly added code. Any doc comment
+writing out a formula with a `*` immediately followed by a `/` needs a space
+or a rewrite (`x* / 2`, or spell out the operation in words) to survive being
+inside `/** */`.
+
+**A count-axis tick helper silently breaks on probability data, and the
+failure is a blank chart, not an error.** `plainDecadeTicks(lo, hi)` floors
+its low end at `Math.max(lo, 1)` because every caller before base rates was
+an integer count (games played, candidates) that is always >= 1. Handed a
+prevalence sweep from 0.0001 to 0.5, it silently clamped the axis to [1, 10]
+— a window with no data in it at all, so the chart rendered with gridlines
+and labels but not one visible point, no console error, nothing to catch it
+except looking at the actual chart. `probDecadeTicks` is the same convention
+for values that are never >= 1, labelled in percent. The lesson generalises:
+a tick helper's domain assumption (counts vs. probabilities vs. money) is not
+written down anywhere the type system enforces, so a new axis reusing an old
+helper needs its actual data range sanity-checked against a live chart, not
+just against the numbers in a stat tile.
+
+**A single seeded path's own noise can outrun the drift it is meant to
+show.** Parrondo's three-strategy walk moves by +-1 a round, so one path's
+spread after n rounds grows like sqrt(n) while its expected drift from the
+mix grows like n -- at a couple of thousand rounds the two are the same
+order of magnitude, and which line ends up highest on the chart is close to
+a coin flip, not the real long-run edge the tiles report. The fix is not a
+better chart, it is enough rounds that drift*sqrt(n) actually dominates;
+`rounds` defaults high enough for that here, and any future scenario
+plotting one seeded additive walk against a small per-round edge needs the
+same check before trusting the picture it draws.
 
 ## Dataviz
 

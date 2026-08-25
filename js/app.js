@@ -75,24 +75,162 @@
     }
   }
 
-  function selectScenario(id) {
+  function selectScenario(id, params) {
     const sc = EP.byId(id);
     if (!sc) return;
     state.id = id;
     state.values = EP.defaultValues(sc);
     delete state.seed; // Reset also means back to the reproducible default draw.
-    if (location.hash.slice(1) !== id) history.replaceState(null, "", `#${id}`);
+    if (params) applyHashParams(sc, params);
+    syncHash();
     markPicker();
     buildBody(sc);
     render();
   }
 
+  // -- the URL hash ---------------------------------------------------------
+  /* The hash carries the whole configuration, not just the scenario:
+   * `#ergodic-coin?p=0.55&rounds=200&seed=12345`. Only values that differ from
+   * the scenario's own defaults are written, so the view a reader lands on
+   * first stays a clean `#ergodic-coin` -- the query string appears exactly
+   * when there is something in it worth sharing.
+   *
+   * Everything on the way back in is validated against the control that owns
+   * the key (min/max/step, or the `options` list for a select) and silently
+   * dropped if it does not fit. A hand-edited or truncated hash therefore
+   * degrades to "that one parameter was ignored", never to a blank page.
+   */
+
+  /** `seed` is the reseed control, which is state rather than a control entry;
+   *  no scenario uses it as a control key, and one must not start doing so. */
+  const SEED_KEY = "seed";
+
+  function hashFor(sc) {
+    const parts = [];
+    for (const c of sc.controls || []) {
+      const v = state.values[c.key];
+      if (v === undefined || String(v) === String(c.value)) continue;
+      parts.push(`${encodeURIComponent(c.key)}=${encodeURIComponent(v)}`);
+    }
+    if (state.seed !== undefined) {
+      parts.push(`${SEED_KEY}=${encodeURIComponent(state.seed)}`);
+    }
+    return parts.length ? `#${sc.id}?${parts.join("&")}` : `#${sc.id}`;
+  }
+
+  /** Split `#id?a=1&b=2` into an id and a plain object of raw strings. */
+  function parseHash() {
+    const raw = location.hash.slice(1);
+    const cut = raw.indexOf("?");
+    const params = {};
+    let id = cut < 0 ? raw : raw.slice(0, cut);
+    try { id = decodeURIComponent(id); } catch (e) { /* keep it raw */ }
+    if (cut >= 0) {
+      for (const pair of raw.slice(cut + 1).split("&")) {
+        const eq = pair.indexOf("=");
+        if (eq < 1) continue; // "", "&&", "=v" -- nothing usable
+        try {
+          params[decodeURIComponent(pair.slice(0, eq))] =
+            decodeURIComponent(pair.slice(eq + 1));
+        } catch (e) { /* a truncated %-escape throws; drop just this pair */ }
+      }
+    }
+    return { id, params };
+  }
+
+  /**
+   * One raw string against the control that owns it. Returns the accepted
+   * value, or undefined for anything the control could not itself produce --
+   * off the step grid, outside the range, not one of the listed options.
+   */
+  function validControlValue(c, raw) {
+    if ((c.type || "range") === "select") {
+      const hit = (c.options || []).some((o) => String(o.value) === raw);
+      return hit ? raw : undefined;
+    }
+    const v = parseFloat(raw);
+    if (!isFinite(v) || v < c.min || v > c.max) return undefined;
+    const step = Number(c.step);
+    if (step > 0) {
+      // Anchored at min, the way the slider itself lays out its grid. The
+      // tolerance absorbs the float noise in e.g. (0.55 - 0.05) / 0.01.
+      const snapped = c.min + Math.round((v - c.min) / step) * step;
+      if (Math.abs(snapped - v) > Math.max(1e-9, step * 1e-6)) return undefined;
+    }
+    return v;
+  }
+
+  function applyHashParams(sc, params) {
+    for (const c of sc.controls || []) {
+      if (!Object.prototype.hasOwnProperty.call(params, c.key)) continue;
+      const v = validControlValue(c, params[c.key]);
+      if (v !== undefined) state.values[c.key] = v;
+    }
+    if (params[SEED_KEY] !== undefined) {
+      const s = parseInt(params[SEED_KEY], 10);
+      if (isFinite(s)) state.seed = s;
+    }
+  }
+
+  function syncHash() {
+    const sc = EP.byId(state.id);
+    if (!sc) return;
+    const next = hashFor(sc);
+    if (location.hash === next) return;
+    // replaceState, never pushState: a dragged slider must not fill the back
+    // button with one entry per frame. Wrapped because a page opened straight
+    // off the filesystem has a null origin and some browsers refuse to write
+    // history there -- a shareable URL is a nice-to-have, and it must never
+    // take the render with it when it fails.
+    try { history.replaceState(null, "", next); } catch (e) { /* file:// */ }
+  }
+
+  /**
+   * Trailing-edge throttle for the slider path. replaceState is cheap but not
+   * free -- some browsers rate-limit it -- and a drag emits far more input
+   * events than the URL needs to see. The last one always lands.
+   */
+  let hashTimer = null;
+  function scheduleHashSync() {
+    if (hashTimer) return;
+    hashTimer = setTimeout(() => { hashTimer = null; syncHash(); }, 200);
+  }
+
   // -- body -----------------------------------------------------------------
+  /**
+   * Typeset a subtree exactly once, whenever MathJax is ready to do it.
+   *
+   * The library is loaded async, so at build time `window.MathJax` may still be
+   * the bare config object with no typesetPromise on it yet. The flag on the
+   * node is what guarantees "once": whichever attempt gets there first wins and
+   * every later one is a no-op, so wiring this to a `toggle` event as a second
+   * chance cannot cause a second typeset.
+   */
+  function typesetOnce(node) {
+    if (!node || node.dataset.typeset === "1") return;
+    const MJ = window.MathJax;
+    if (!MJ || !MJ.typesetPromise) return;
+    node.dataset.typeset = "1";
+    MJ.typesetPromise([node]);
+  }
+
   function buildBody(sc) {
     $("#sc-title").textContent = sc.name;
     $("#sc-blurb").textContent = sc.blurb;
     const body = $("#scenario-body");
     body.textContent = "";
+    reseedBtn = null; // the old one just went out of the DOM with body
+    seedProbePending = false;
+
+    // One line, above everything, answering "why should I care?" before the
+    // reader has to invest in the story or the controls. Static per scenario,
+    // so it is built here rather than in render().
+    if (sc.why) {
+      const why = el("p", "why");
+      why.appendChild(el("span", "why-label", "Why it is worth exploring"));
+      why.appendChild(document.createTextNode(sc.why));
+      body.appendChild(why);
+    }
 
     if (sc.story) {
       const story = el("aside", "story");
@@ -119,17 +257,31 @@
     }
     body.appendChild(el("p", "note", sc.note));
 
+    // The verdict reads the live stats, so unlike the note it is rebuilt on
+    // every render. Only the shell is created here.
+    if (sc.verdict) {
+      const box = el("aside", "verdict");
+      box.id = "verdict";
+      box.appendChild(el("h3", null, "So what should you actually do?"));
+      box.appendChild(el("p", "verdict-headline", ""));
+      box.appendChild(el("p", "verdict-body", ""));
+      body.appendChild(box);
+    }
+
     if (sc.mathBox) {
       const details = el("details", "math-box");
-      details.open = true; // typeset math, opt out of rather than into
       details.appendChild(el("summary", null, "For math enthusiasts"));
       const holder = el("div");
       holder.id = "math-box-lines";
       details.appendChild(holder);
 
       if (sc.notation && Object.keys(sc.notation).length > 0) {
-        const notationDiv = el("div", "notation-legend");
-        notationDiv.appendChild(el("h4", null, "Notation"));
+        // Nested one level deeper than the formulas on purpose: opening the
+        // math box should show the closed forms, not half a screen of
+        // definitions. The definitions are one further click for whoever
+        // wants them.
+        const notation = el("details", "notation-legend");
+        notation.appendChild(el("summary", null, "What the symbols mean"));
         const list = el("dl");
         for (const [term, definition] of Object.entries(sc.notation)) {
           const dt = el("dt", null, term);
@@ -137,14 +289,14 @@
           list.appendChild(dt);
           list.appendChild(dd);
         }
-        notationDiv.appendChild(list);
-        details.appendChild(notationDiv);
+        notation.appendChild(list);
+        details.appendChild(notation);
         // The dt terms carry \(...\) delimiters too, same convention as the
-        // math-box lines rendered below -- typeset them once here since,
-        // unlike the formulas, the notation never changes on a re-render.
-        if (window.MathJax && window.MathJax.typesetPromise) {
-          window.MathJax.typesetPromise([notationDiv]);
-        }
+        // math-box lines. Unlike the formulas, the notation never changes on a
+        // re-render, so it is typeset once and never again -- renderMathBox
+        // must not reach it, or every slider frame would re-typeset it.
+        typesetOnce(notation);
+        notation.addEventListener("toggle", () => typesetOnce(notation));
       }
 
       body.appendChild(details);
@@ -167,7 +319,10 @@
 
     const details = el("details", "table-view");
     details.appendChild(el("summary", null, "Table view"));
-    const holder = el("div");
+    // The holder scrolls, not the page: a table wider than a phone viewport
+    // would otherwise widen the document and give the whole page a horizontal
+    // scrollbar. See .table-holder in index.html.
+    const holder = el("div", "table-holder");
     holder.id = `table-${kind}`;
     details.appendChild(holder);
     card.appendChild(details);
@@ -212,6 +367,11 @@
         select.value = state.values[c.key];
         select.addEventListener("change", () => {
           state.values[c.key] = select.value;
+          // A select can switch a scenario between simulated and real data,
+          // which is exactly the thing that decides whether reseeding does
+          // anything -- so re-run the probe. Sliders never change that.
+          seedProbePending = true;
+          syncHash();
           scheduleRender();
         });
         box.appendChild(select);
@@ -226,6 +386,7 @@
         input.addEventListener("input", () => {
           state.values[c.key] = parseFloat(input.value);
           val.textContent = c.fmt(state.values[c.key]);
+          scheduleHashSync();
           scheduleRender();
         });
         box.appendChild(input);
@@ -239,9 +400,14 @@
     reseed.type = "button";
     reseed.addEventListener("click", () => {
       state.seed = (Math.random() * 0x7fffffff) | 0;
+      syncHash(); // a draw the reader liked should be shareable
       render();
     });
     actions.appendChild(reseed);
+    // Rendered for every scenario, then hidden again for the ones where it
+    // provably does nothing -- see probeSeedSensitivity.
+    reseedBtn = reseed;
+    seedProbePending = true;
 
     const reset = el("button", "ghost", "Reset");
     reset.type = "button";
@@ -541,11 +707,14 @@
           { color: getVar("--series-4"), label: "Buy the dip, sell the high" },
           { color: getVar("--series-2"), label: "Puts only (no covered calls)" },
           { color: getVar("--series-1"), label: "The wheel" },
-          { color: getVar("--series-1"), shape: "dot", label: "Put sold" },
+          // Shapes mirror WHEEL_EVENT_MARKS in charts.js, not a generic dot:
+          // assigned and called-away share a hue and differ only filled-vs-open
+          // on the chart, so a dot for both made them indistinguishable here.
+          { color: getVar("--series-1"), shape: "tri-down", label: "Put sold" },
           { color: getVar("--series-3"), shape: "dot", label: "Assigned" },
-          { color: getVar("--series-2"), shape: "dot", label: "Call sold" },
-          { color: getVar("--series-3"), shape: "dot", label: "Called away" },
-          { color: getVar("--diverging-neg"), shape: "dot", label: "Shares stopped out" },
+          { color: getVar("--series-2"), shape: "tri-up", label: "Call sold" },
+          { color: getVar("--series-3"), shape: "dot-open", label: "Called away" },
+          { color: getVar("--diverging-neg"), shape: "cross", label: "Shares stopped out" },
         ],
         table: tableWheelPaths(d, pr),
       }),
@@ -569,7 +738,7 @@
 
     "wheel-sweep": {
       title: "The wheel's growth rate vs its own edge",
-      cap: "Monte Carlo, not closed form — averaged over several seeds per point, because no exact formula exists for a strategy with a stop on the option's own marked value.",
+      cap: "Monte Carlo, not closed form — averaged over several seeds per point, because the assignment cycle, the record-high call trigger and the share stop are all path-dependent.",
       short: true,
       render: (node, d, pr) => ({
         plot: EP.wheelSweep(node, d, pr),
@@ -581,7 +750,273 @@
         table: tableWheelSweep(d, pr),
       }),
     },
+
+    "pa-drift": {
+      title: "Drift vs how often you play game B",
+      cap: "Closed form — the stationary distribution of a 3-state Markov chain, not a simulated average.",
+      short: true,
+      render: (node, d, pr) => ({
+        plot: EP.paDrift(node, d, pr),
+        legend: [
+          { color: getVar("--series-1"), label: "Winning" },
+          { color: getVar("--diverging-neg"), label: "Losing" },
+          { color: getVar("--deemphasis"), shape: "dot", label: "Pure A or pure B" },
+        ],
+        table: tablePaDrift(d),
+      }),
+    },
+
+    "pa-paths": {
+      title: "One seeded walk, three strategies",
+      cap: "Linear scale — capital moves by exactly one dollar a round, additive like gambler's ruin.",
+      render: (node, d, pr) => ({
+        plot: EP.paPaths(node, d, pr),
+        legend: [
+          { color: getVar("--deemphasis"), label: "Game A alone" },
+          { color: getVar("--series-2"), label: "Game B alone" },
+          { color: getVar("--series-1"), label: "Your mix" },
+        ],
+        table: tablePaPaths(d, pr),
+      }),
+    },
+
+    "br-prevalence": {
+      title: "P(sick | positive) vs how common the disease is",
+      cap: "Closed form — Bayes' theorem, swept over the one input that decides the most.",
+      short: true,
+      render: (node, d, pr) => ({
+        plot: EP.brPrevalence(node, d, pr),
+        legend: [
+          { color: getVar("--series-1"), label: "P(sick | positive)" },
+          { color: getVar("--series-1"), shape: "dot", label: "Your prevalence" },
+        ],
+        table: tableBrPrevalence(d),
+      }),
+    },
+
+    "br-grid": {
+      title: "The same theorem, as a population",
+      cap: "Bayes' theorem multiplied through by a headcount — the natural-frequency form.",
+      short: true,
+      render: (node, d) => ({
+        plot: EP.brGrid(node, d),
+        legend: [
+          { color: getVar("--series-1"), shape: "rect", label: "Actually sick" },
+          { color: getVar("--deemphasis"), shape: "rect", label: "Actually healthy" },
+        ],
+        table: tableBrGrid(d),
+      }),
+    },
+
+    "bd-collision": {
+      title: "Collision odds vs group size",
+      cap: "Closed form, exact.",
+      short: true,
+      render: (node, d, pr) => ({
+        plot: EP.bdCollision(node, d, pr),
+        legend: [
+          { color: getVar("--series-1"), label: "P(shared birthday)" },
+          { color: getVar("--series-1"), shape: "dot", label: "Your group" },
+        ],
+        table: tableBdCollision(d),
+      }),
+    },
+
+    "bd-hash": {
+      title: "The security version: bits vs items needed",
+      cap: "Approximation — see the note below. Log scale on the item count.",
+      short: true,
+      render: (node, d, pr) => ({
+        plot: EP.bdHash(node, d, pr),
+        legend: [
+          { color: getVar("--series-1"), label: "n for 50% odds (approx)" },
+          { color: getVar("--series-1"), shape: "dot", label: "Your digest length" },
+        ],
+        table: tableBdHash(d),
+      }),
+    },
+
+    "sec-threshold": {
+      title: "P(win) vs how many you skip",
+      cap: "Closed form, exact — and deliberately flat near the top.",
+      short: true,
+      render: (node, d, pr) => ({
+        plot: EP.secThreshold(node, d, pr),
+        legend: [
+          { color: getVar("--series-1"), label: "P(win)" },
+          { color: getVar("--series-1"), shape: "dot", label: "Optimal skip" },
+          { color: getVar("--series-2"), shape: "dot", label: "Your skip" },
+        ],
+        table: tableSecThreshold(d),
+      }),
+    },
+
+    "sec-asymptotic": {
+      title: "The optimum, converging to 1/e",
+      cap: "Closed form at every n — the limit is a fact about this curve, not an approximation drawing it.",
+      short: true,
+      render: (node, d, pr) => ({
+        plot: EP.secAsymptotic(node, d, pr),
+        legend: [
+          { color: getVar("--series-1"), label: "Optimal P(win)" },
+          { color: getVar("--series-1"), shape: "dot", label: "Your n" },
+        ],
+        table: tableSecAsymptotic(d),
+      }),
+    },
+
+    "te-gain": {
+      title: "Expected gain from swapping vs what you found",
+      cap: "Closed form, under an exponential prior on the smaller amount.",
+      render: (node, d, pr) => ({
+        plot: EP.teGain(node, d, pr),
+        legend: [
+          { color: getVar("--series-1"), label: "Swapping gains on average" },
+          { color: getVar("--diverging-neg"), label: "Swapping loses on average" },
+          { color: getVar("--series-1"), shape: "dot", label: "What you found" },
+        ],
+        table: tableTeGain(d),
+      }),
+    },
+
+    "te-prob": {
+      title: "P(you're holding the smaller half)",
+      cap: "Closed form — why the gain chart above changes sign.",
+      short: true,
+      render: (node, d, pr) => ({
+        plot: EP.teProb(node, d, pr),
+        legend: [
+          { color: getVar("--series-1"), label: "P(smaller half)" },
+          { color: getVar("--series-1"), shape: "dot", label: "What you found" },
+        ],
+        table: tableTeProb(d),
+      }),
+    },
+
+    "os-curve": {
+      title: "False positives, accumulating",
+      cap: "Exact forward DP, not simulated — the same binomial-weight idea Shannon's demon and the insurance pool use.",
+      short: true,
+      render: (node, d, pr) => ({
+        plot: EP.osCurve(node, d, pr),
+        legend: [
+          { color: getVar("--diverging-neg"), label: "Cumulative false-positive rate" },
+        ],
+        table: tableOsCurve(d),
+      }),
+    },
+
+    "os-paths": {
+      title: "A few seeded z-statistics vs the moving boundary",
+      cap: "In z-units the bar is fixed; what moves is the walk. Each new look is another free run at a wall it has not yet crossed.",
+      render: (node, d, pr) => ({
+        plot: EP.osPaths(node, d, pr),
+        legend: [
+          { color: getVar("--deemphasis"), label: "One test's accumulating z-statistic" },
+          { color: getVar("--diverging-neg"), label: "Significance boundary (±z)" },
+        ],
+        table: tableOsPaths(d, pr),
+      }),
+    },
+
+    "simpson-bars": {
+      title: "The same two treatments, counted two ways",
+      cap: "Exact rates, not simulated. The two subgroups are one comparison; the pooled bar behind the divider is the same cases with the subgroup thrown away — not a third subgroup.",
+      render: (node, d) => ({
+        plot: EP.simpsonBars(node, d),
+        legend: [
+          { color: getVar("--series-1"), shape: "rect", label: "Treatment A" },
+          { color: getVar("--series-2"), shape: "rect", label: "Treatment B" },
+          // The wash on the chart is lighter than this. A 10px swatch at the
+          // drawn alpha is invisible against the surface, so the key is
+          // nudged up to the point where it reads as a key at all -- same
+          // reasoning as the band swatch on `ins-band`.
+          { shape: "band", fill: withAlpha(getVar("--deemphasis"), 0.18),
+            label: d.bars.reverses
+              ? "Pooled — where the order flips"
+              : "Pooled — the order holds here" },
+        ],
+        table: tableSimpsonBars(d),
+      }),
+    },
+
+    "simpson-boundary": {
+      title: "How big an effect has to be to survive pooling",
+      cap: "Closed form, exact — the boundary is the allocation gap times the difficulty gap, and it does not depend on the effect itself.",
+      short: true,
+      render: (node, d) => ({
+        plot: EP.simpsonBoundary(node, d),
+        legend: [
+          { color: getVar("--diverging-neg"),
+            label: "The effect a given allocation gap can swamp" },
+          { shape: "band", fill: withAlpha(getVar("--diverging-neg"), 0.16),
+            label: "Below the line — pooling reverses the trend" },
+          { color: d.boundary.reverses
+              ? getVar("--diverging-neg") : getVar("--series-1"),
+            shape: "dot",
+            label: d.boundary.reverses
+              ? `You (${F().pct(d.boundary.deltaNow)} effect) — reversed`
+              : `You (${F().pct(d.boundary.deltaNow)} effect) — survives` },
+        ],
+        table: tableSimpsonBoundary(d),
+      }),
+    },
+
+    "bertrand-curves": {
+      title: "Three definitions of “at random”, three exact answers",
+      cap: "Closed form at every threshold. The curves meet only at the two degenerate ends; everywhere in between the question has three different correct answers.",
+      render: (node, d) => ({
+        plot: EP.bertrandCurves(node, d),
+        legend: bertrandLegend(d),
+        table: tableBertrandCurves(d),
+      }),
+    },
+
+    "bertrand-chords": {
+      title: "What each rule actually draws",
+      cap: "A diagram, not a plot: equal aspect so the circle is a circle, and no axes because the coordinates mean nothing. The midpoint cloud is the lesson — each rule spreads chord middles differently, and that is the whole disagreement.",
+      tall: true,
+      render: (node, d) => ({
+        plot: EP.bertrandChords(node, d),
+        legend: [
+          { color: getVar("--series-1"),
+            label: `Chord longer than ${F().num(d.chords.cNow, 2)} × the diameter` },
+          { color: getVar("--series-1"), shape: "dot", label: "…and its midpoint" },
+          { color: getVar("--series-2"), label: "Chord shorter than that" },
+          { color: getVar("--series-2"), shape: "dot", label: "…and its midpoint" },
+          { color: getVar("--baseline"), label: "The circle" },
+          { color: getVar("--deemphasis"),
+            label: "Midpoints inside this circle make long chords" },
+        ],
+        table: tableBertrandChords(d),
+      }),
+    },
   };
+
+  /** Legend for the three-rule curve chart, built from the same fixed
+   *  rule→slot mapping charts.js draws with, so a colour can never drift
+   *  between the line and the key that names it. Each rule gets a stroke for
+   *  its curve and a dot for its answer at the reader's own threshold —
+   *  those markers are three different colours, so one shared dot row could
+   *  not honestly stand for them. */
+  function bertrandLegend(d) {
+    const t = EP.theme();
+    const c = d.curves;
+    const items = EP.BERTRAND_SERIES.map((s) => ({
+      color: t[s.colorKey], label: s.label,
+    }));
+    for (const s of EP.BERTRAND_SERIES) {
+      items.push({
+        color: t[s.colorKey], shape: "dot",
+        label: `${s.label} at your threshold — ${F().pct(c.pNow[s.key])}`,
+      });
+    }
+    items.push({
+      color: getVar("--muted"),
+      label: `Your threshold (${F().num(c.cNow, 3)} × the diameter)`,
+    });
+    return items;
+  }
 
   /** Shared legend for the two charts that colour by strategy. */
   function strategyLegend() {
@@ -630,13 +1065,75 @@
    * right behaviour -- the reader did not touch that slider.
    */
   function syncDerivedControls(sc, pr) {
+    let changed = false;
     for (const c of sc.controls || []) {
       if (pr[c.key] === undefined || pr[c.key] === state.values[c.key]) continue;
       state.values[c.key] = pr[c.key];
+      changed = true;
       const input = document.getElementById(`ctl-${c.key}`);
       const val = document.getElementById(`ctl-${c.key}-val`);
       if (input) input.value = pr[c.key];
       if (val) val.textContent = c.fmt(pr[c.key]);
+    }
+    // The hash mirrors state.values, so a clamp that rewrites one has to
+    // rewrite the other -- otherwise a shared link carries the pre-clamp
+    // number the page itself refused to use.
+    if (changed) scheduleHashSync();
+  }
+
+  // -- does "New random draw" do anything here? -----------------------------
+  /* Half the scenarios on this page are pure closed form -- Monty Hall, base
+   * rates, the birthday problem and the rest never draw a random number -- and
+   * for those the reseed button is a control that visibly does nothing.
+   *
+   * Rather than keep a list of which ones (a list that goes stale the moment a
+   * scenario is added or changes), ask the scenario directly: compute it twice,
+   * once on its own seed and once on a neighbouring one, and compare the two
+   * results. That is the button's semantics exactly -- "does changing the seed
+   * change what you see" -- so it cannot disagree with what the reader would
+   * observe. It also tracks a scenario whose answer depends on its controls:
+   * the wheel is a simulated GBM path on its default underlying, but a real
+   * ticker is one fixed price series, so reseeding stops mattering the moment
+   * the reader picks one, and the button disappears with it.
+   *
+   * Cost is one extra compute, only when the probe is pending -- on a scenario
+   * switch or a select change, never on a slider frame. On a stochastic
+   * scenario the comparison exits at the first differing number, and on a
+   * deterministic one the whole result is small (a few curves of a few hundred
+   * points) precisely because nothing was simulated.
+   */
+  let reseedBtn = null;
+  let seedProbePending = false;
+
+  /** Structural equality over the plain objects, arrays and typed arrays a
+   *  compute() returns. NaN equals NaN here: two identical unsimulated results
+   *  should compare equal even where the maths produced a NaN. */
+  function sameData(a, b, depth) {
+    if (a === b) return true;
+    if (typeof a === "number" && typeof b === "number") {
+      return Number.isNaN(a) && Number.isNaN(b);
+    }
+    if (depth > 12) return true; // deeper than anything on this page nests
+    if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+    if (typeof a.length === "number" && typeof b.length === "number") {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (!sameData(a[i], b[i], depth + 1)) return false;
+      }
+      return true;
+    }
+    const ka = Object.keys(a);
+    if (ka.length !== Object.keys(b).length) return false;
+    for (const k of ka) if (!sameData(a[k], b[k], depth + 1)) return false;
+    return true;
+  }
+
+  function probeSeedSensitivity(sc, pr, d) {
+    try {
+      const other = Object.assign({}, pr, { seed: (pr.seed | 0) + 1 });
+      return !sameData(d, sc.compute(other), 0);
+    } catch (e) {
+      return true; // if the probe cannot run, leave the control alone
     }
   }
 
@@ -649,8 +1146,13 @@
     syncDerivedControls(sc, pr);
 
     const d = sc.compute(pr);
+    if (seedProbePending) {
+      seedProbePending = false;
+      if (reseedBtn) reseedBtn.hidden = !probeSeedSensitivity(sc, pr, d);
+    }
     renderTiles(sc, pr, d.stats);
     renderMathBox(sc, pr, d.stats);
+    renderVerdict(sc, pr, d.stats);
 
     const jobs = [];
     for (const kind of sc.charts) {
@@ -690,6 +1192,37 @@
    *  via textContent (never innerHTML, same as every other computed label on
    *  this page); MathJax then scans those text nodes for \(...\) and \[...\]
    *  and typesets the math in place without needing the source to be HTML. */
+  /** The scenario's conclusion, recomputed from the live parameters.
+   *
+   *  Some scenarios genuinely change their advice as you drag a slider -- past
+   *  the Kelly optimum the same game flips from worth playing to ruinous, and
+   *  an insurance premium outside the band stops being mutually good. Others
+   *  (Monty Hall, the birthday problem) reach the same conclusion whatever you
+   *  set, and their verdict says so rather than manufacturing false contingency.
+   *
+   *  `tone` picks the accent colour, but it is never the only carrier of the
+   *  message -- the headline text says the same thing in words, per the
+   *  never-colour-alone rule in CLAUDE.md. */
+  const VERDICT_TONES = { good: "--series-3", bad: "--diverging-neg",
+                          neutral: "--series-1" };
+
+  function renderVerdict(sc, pr, stats) {
+    const box = $("#verdict");
+    if (!box || !sc.verdict) return;
+    let v;
+    try {
+      v = sc.verdict(pr, stats);
+    } catch (e) {
+      box.hidden = true;
+      return;
+    }
+    if (!v || !v.headline) { box.hidden = true; return; }
+    box.hidden = false;
+    box.style.borderLeftColor = getVar(VERDICT_TONES[v.tone] || VERDICT_TONES.neutral);
+    box.querySelector(".verdict-headline").textContent = v.headline;
+    box.querySelector(".verdict-body").textContent = v.body || "";
+  }
+
   function renderMathBox(sc, pr, stats) {
     const holder = $("#math-box-lines");
     if (!holder || !sc.mathBox) return;
@@ -724,6 +1257,29 @@
         key.style.height = "10px";
         key.style.width = "10px";
         key.style.borderRadius = "50%";
+      } else if (it.shape === "dot-open") {
+        // Mirrors Plotly's circle-open: the ring, not a filled disc. Without
+        // this an open marker and a filled one in the same hue produce two
+        // byte-identical legend rows.
+        key.style.height = "10px";
+        key.style.width = "10px";
+        key.style.borderRadius = "50%";
+        key.style.background = "transparent";
+        key.style.border = `2px solid ${it.fill || it.color}`;
+      } else if (it.shape === "tri-up" || it.shape === "tri-down") {
+        key.style.height = "10px";
+        key.style.width = "10px";
+        key.style.clipPath = it.shape === "tri-up"
+          ? "polygon(50% 0%, 100% 100%, 0% 100%)"
+          : "polygon(0% 0%, 100% 0%, 50% 100%)";
+      } else if (it.shape === "cross") {
+        key.style.height = "10px";
+        key.style.width = "10px";
+        key.style.background = "transparent";
+        key.style.color = it.fill || it.color;
+        key.style.font = "700 12px/10px system-ui, sans-serif";
+        key.style.textAlign = "center";
+        key.textContent = "✕";
       }
       row.appendChild(key);
       row.appendChild(el("span", null, it.label));
@@ -1032,12 +1588,248 @@
     return { head: ["Implied − realized vol", "Wheel's growth rate"], rows };
   }
 
+  function tablePaDrift(d) {
+    const { qs, drifts } = d.driftCurve;
+    const step = Math.max(1, Math.round(qs.length / 14));
+    const rows = [];
+    for (let i = 0; i < qs.length; i += step) {
+      rows.push([F().pct(qs[i]), drifts[i].toFixed(4)]);
+    }
+    return { head: ["P(play B)", "Drift ($/round)"], rows };
+  }
+
+  function tablePaPaths(d, pr) {
+    const { pathsA, pathsB, pathsMix } = d.sim;
+    const rows = sampledRounds(pr.rounds).map((t) => [
+      String(t), String(pathsA[0][t]), String(pathsB[0][t]), String(pathsMix[0][t]),
+    ]);
+    return { head: ["Round", "Game A", "Game B", "Mixed"], rows };
+  }
+
+  function tableBrPrevalence(d) {
+    const { xs, ys } = d.prevalenceCurve;
+    const step = Math.max(1, Math.round(xs.length / 14));
+    const rows = [];
+    for (let i = 0; i < xs.length; i += step) {
+      rows.push([F().pct(xs[i]), F().pct(ys[i])]);
+    }
+    return { head: ["Prevalence", "P(sick | positive)"], rows };
+  }
+
+  function tableBrGrid(d) {
+    const { tp, fp, fn, tn } = d.stats;
+    return {
+      head: ["", "Actually sick", "Actually healthy", "Total"],
+      rows: [
+        ["Tested positive", F().count(tp), F().count(fp), F().count(tp + fp)],
+        ["Tested negative", F().count(fn), F().count(tn), F().count(fn + tn)],
+        ["Total", F().count(tp + fn), F().count(fp + tn), F().count(tp + fp + fn + tn)],
+      ],
+    };
+  }
+
+  function tableBdCollision(d) {
+    const { xs, ys } = d.collisionCurve;
+    const step = Math.max(1, Math.round(xs.length / 14));
+    const rows = [];
+    for (let i = 0; i < xs.length; i += step) {
+      rows.push([String(xs[i]), F().pct(ys[i])]);
+    }
+    return { head: ["Group size", "P(collision)"], rows };
+  }
+
+  function tableBdHash(d) {
+    const { xs, ys } = d.hashBitsCurve;
+    const step = Math.max(1, Math.round(xs.length / 14));
+    const rows = [];
+    for (let i = 0; i < xs.length; i += step) {
+      rows.push([F().num(xs[i], 0), ys[i].toExponential(2)]);
+    }
+    return { head: ["Digest bits", "Items for 50% odds (approx)"], rows };
+  }
+
+  function tableSecThreshold(d) {
+    const { xs, ys } = d.winCurve;
+    const step = Math.max(1, Math.round(xs.length / 14));
+    const rows = [];
+    for (let i = 0; i < xs.length; i += step) {
+      rows.push([String(xs[i]), F().pct(ys[i])]);
+    }
+    return { head: ["Skip", "P(win)"], rows };
+  }
+
+  function tableSecAsymptotic(d) {
+    const { ns, ys } = d.asymptotic;
+    return {
+      head: ["n", "Optimal P(win)"],
+      rows: ns.map((n, i) => [F().count(n), F().pct(ys[i])]),
+    };
+  }
+
+  function tableTeGain(d) {
+    const { xs, gains, probs } = d.gainCurve;
+    const step = Math.max(1, Math.round(xs.length / 14));
+    const rows = [];
+    for (let i = 0; i < xs.length; i += step) {
+      rows.push([F().money(xs[i]), F().money(gains[i]), F().pct(probs[i])]);
+    }
+    return { head: ["Amount found", "Expected gain from swapping", "P(smaller half)"], rows };
+  }
+
+  function tableTeProb(d) {
+    const { xs, probs } = d.gainCurve;
+    const step = Math.max(1, Math.round(xs.length / 14));
+    const rows = [];
+    for (let i = 0; i < xs.length; i += step) {
+      rows.push([F().money(xs[i]), F().pct(probs[i])]);
+    }
+    return { head: ["Amount found", "P(smaller half)"], rows };
+  }
+
+  function tableOsCurve(d) {
+    const { xs, ys } = d.fpCurve;
+    const step = Math.max(1, Math.round(xs.length / 10));
+    const rows = [];
+    for (let i = 0; i < xs.length; i += step) {
+      rows.push([String(xs[i]), F().pct(ys[i])]);
+    }
+    const last = xs.length - 1;
+    if (rows.length && rows[rows.length - 1][0] !== String(xs[last])) {
+      rows.push([String(xs[last]), F().pct(ys[last])]);
+    }
+    return { head: ["Look", "Cumulative false-positive rate"], rows };
+  }
+
+  function tableOsPaths(d, pr) {
+    const { allZ } = d.sim;
+    const shown = Math.min(allZ.length, 8);
+    const rows = [];
+    for (let look = 0; look < pr.looks; look += Math.max(1, Math.round(pr.looks / 12))) {
+      rows.push([String(look + 1)].concat(
+        Array.from({ length: shown }, (_, p) => F().num(allZ[p][look], 2))));
+    }
+    return {
+      head: ["Look"].concat(Array.from({ length: shown }, (_, p) => `Path ${p + 1}`)),
+      rows,
+    };
+  }
+
+  /** One row per group, with the A−B gap and the verdict spelled out in
+   *  words: the reversal is a sign change, and a sign is exactly the thing a
+   *  reader should not have to infer from two bar heights. */
+  function tableSimpsonBars(d) {
+    const b = d.bars;
+    const rows = b.groups.map((g, i) => {
+      const diff = b.a[i] - b.b[i];
+      return [
+        g, F().pct(b.a[i]), F().pct(b.b[i]), F().pctSigned(diff),
+        diff === 0 ? "tied" : diff > 0 ? "A is better" : "B is better",
+      ];
+    });
+    return {
+      head: ["Group", "Treatment A", "Treatment B", "A − B", "Verdict"],
+      rows,
+    };
+  }
+
+  function tableSimpsonBoundary(d) {
+    const bd = d.boundary;
+    const step = Math.max(1, Math.round(bd.gaps.length / 14));
+    const rows = [];
+    for (let i = 0; i < bd.gaps.length; i += step) {
+      rows.push([
+        F().pct(bd.gaps[i]), F().pct(bd.deltaCrit[i]),
+        bd.deltaNow > bd.deltaCrit[i] ? "survives pooling" : "reverses",
+      ]);
+    }
+    return {
+      head: [
+        "Allocation gap",
+        "Effect needed to survive pooling",
+        `Your effect (${F().pct(bd.deltaNow)})`,
+      ],
+      rows,
+    };
+  }
+
+  function tableBertrandCurves(d) {
+    const c = d.curves;
+    const step = Math.max(1, Math.round(c.cs.length / 14));
+    const rows = [];
+    for (let i = 0; i < c.cs.length; i += step) {
+      rows.push([
+        F().num(c.cs[i], 3), F().pct(c.endpoints[i]),
+        F().pct(c.radius[i]), F().pct(c.midpoint[i]),
+      ]);
+    }
+    // The reader's own threshold always gets its own row, wherever the
+    // sampling above happened to land.
+    rows.push([
+      `${F().num(c.cNow, 3)} (yours)`, F().pct(c.pNow.endpoints),
+      F().pct(c.pNow.radius), F().pct(c.pNow.midpoint),
+    ]);
+    return {
+      head: ["Chord ÷ diameter", "Random endpoints", "Random radius",
+             "Random midpoint"],
+      rows,
+    };
+  }
+
+  /** The midpoint cloud, counted into rings.
+   *
+   *  A row per chord would be hundreds of rows of coordinates nobody reads.
+   *  The rings are the same information the picture carries -- how far from
+   *  the centre this rule puts its midpoints -- in the form a screen reader
+   *  or a copy-paste can actually use, which is the whole job of the table
+   *  view for a chart whose content is a shape. */
+  const MIDPOINT_RINGS = 5;
+
+  function tableBertrandChords(d) {
+    const c = d.chords;
+    const n = c.mx.length;
+    const total = new Array(MIDPOINT_RINGS).fill(0);
+    const long = new Array(MIDPOINT_RINGS).fill(0);
+    let nLong = 0;
+    for (let i = 0; i < n; i++) {
+      const r = Math.hypot(c.mx[i], c.my[i]);
+      // A midpoint exactly on the rim lands in the last ring, not past it.
+      const k = Math.min(MIDPOINT_RINGS - 1, Math.floor(r * MIDPOINT_RINGS));
+      total[k]++;
+      if (c.long[i]) { long[k]++; nLong++; }
+    }
+    const rows = [];
+    for (let k = 0; k < MIDPOINT_RINGS; k++) {
+      rows.push([
+        `${F().num(k / MIDPOINT_RINGS, 2)} – ${F().num((k + 1) / MIDPOINT_RINGS, 2)}`,
+        F().count(total[k]), F().pct(n ? total[k] / n : 0), F().count(long[k]),
+      ]);
+    }
+    rows.push(["All chords", F().count(n), F().pct(n ? 1 : 0), F().count(nLong)]);
+    return {
+      head: [`Midpoint distance from centre (${c.label})`, "Chords", "Share",
+             "Longer than the threshold"],
+      rows,
+    };
+  }
+
   // -- boot -----------------------------------------------------------------
+  /** Whatever is in the hash, land on a working page: an unknown or empty id
+   *  falls back to the first scenario, and syncHash then rewrites the bad
+   *  fragment to the one actually on screen. */
+  function openFromHash() {
+    const { id, params } = parseHash();
+    if (EP.byId(id)) selectScenario(id, params);
+    else selectScenario(EP.SCENARIOS[0].id);
+  }
+
   function boot() {
     initTheme();
     buildPicker();
-    const fromHash = location.hash.slice(1);
-    selectScenario(EP.byId(fromHash) ? fromHash : EP.SCENARIOS[0].id);
+    openFromHash();
+    // Only a real navigation (a pasted or hand-edited fragment, or a bookmark
+    // followed from this same page) fires this -- history.replaceState does
+    // not, so the writes above cannot loop back round through here.
+    window.addEventListener("hashchange", openFromHash);
     window.addEventListener("resize", () => {
       if (window.Plotly) {
         document.querySelectorAll(".plot").forEach((p) => Plotly.Plots.resize(p));

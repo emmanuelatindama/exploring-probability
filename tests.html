@@ -481,6 +481,246 @@
     });
   }
 
+  // -- 12. Parrondo's paradox ---------------------------------------------
+  for (const c of G.parrondo) {
+    const p = c.params;
+    group(`Parrondo's paradox — q=${p.q}, eps=${p.eps}, pBad=${p.p_bad}, pGood=${p.p_good}`);
+    const got = EP.paSummary({
+      q: p.q, eps: p.eps, pBad: p.p_bad, pGood: p.p_good,
+    });
+    // Cramer's rule (JS) and np.linalg.lstsq (Python) are different
+    // algorithms solving the same 3x3 system, so this is the same
+    // different-numerical-path allowance Shannon's binomial-weight sums get.
+    check("driftA", got.driftA, c.expect.driftA, { relTol: 1e-8 });
+    check("driftB", got.driftB, c.expect.driftB, { relTol: 1e-8 });
+    check("driftMix", got.driftMix, c.expect.driftMix, { relTol: 1e-8 });
+    check("bestQ", got.bestQ, c.expect.bestQ, { relTol: 1e-8 });
+    check("bestDrift", got.bestDrift, c.expect.bestDrift, { relTol: 1e-8 });
+    check("paradox", got.paradox, c.expect.paradox, { exact: true });
+    const [qs, drifts] = EP.paDriftCurve(p.eps, p.p_bad, p.p_good, 21);
+    c.driftCurve.qs.forEach((want, i) => check(`drift curve q[${i}]`, qs[i], want,
+      { exact: true }));
+    c.driftCurve.drifts.forEach((want, i) => check(`drift curve drift[${i}]`,
+      drifts[i], want, { relTol: 1e-8 }));
+  }
+
+  group("Seeded Parrondo walk — draw order must reproduce exactly");
+  {
+    const c = G.parrondoSim.config;
+    const sim = EP.simulateParrondo({
+      nPaths: c.n_paths, rounds: c.rounds, q: c.q, eps: c.eps,
+      pBad: c.p_bad, pGood: c.p_good, w0: c.w0, seed: c.seed,
+    });
+    G.parrondoSim.firstA.forEach((want, i) =>
+      check(`path A[${i}]`, sim.pathsA[0][i], want, { exact: true }));
+    G.parrondoSim.firstB.forEach((want, i) =>
+      check(`path B[${i}]`, sim.pathsB[0][i], want, { exact: true }));
+    G.parrondoSim.firstMix.forEach((want, i) =>
+      check(`path mix[${i}]`, sim.pathsMix[0][i], want, { exact: true }));
+    G.parrondoSim.termA.forEach((want, i) =>
+      check(`terminal A ${i + 1}`, sim.pathsA[i][sim.pathsA[i].length - 1], want,
+        { exact: true }));
+    G.parrondoSim.termB.forEach((want, i) =>
+      check(`terminal B ${i + 1}`, sim.pathsB[i][sim.pathsB[i].length - 1], want,
+        { exact: true }));
+    G.parrondoSim.termMix.forEach((want, i) =>
+      check(`terminal mix ${i + 1}`, sim.pathsMix[i][sim.pathsMix[i].length - 1],
+        want, { exact: true }));
+  }
+
+  // -- 13. Base rates -------------------------------------------------------
+  for (const c of G.baserates) {
+    const p = c.params;
+    group(`Base rates — prior=${p.prior}, sens=${p.sens}, spec=${p.spec}`);
+    const got = EP.brSummary(p);
+    for (const key of Object.keys(c.expect)) {
+      check(key, got[key], c.expect[key], { relTol: 1e-9 });
+    }
+    const [xs, ys] = EP.brPrevalenceCurve(p.sens, p.spec, 40);
+    c.prevalenceCurve.xs.forEach((want, i) =>
+      check(`prevalence curve x[${i}]`, xs[i], want, { relTol: 1e-9 }));
+    c.prevalenceCurve.ys.forEach((want, i) =>
+      check(`prevalence curve y[${i}]`, ys[i], want, { relTol: 1e-9 }));
+  }
+
+  // -- 14. The birthday problem ----------------------------------------------
+  for (const c of G.birthday) {
+    const p = c.params;
+    group(`Birthday problem — n=${p.n}, days=${p.days}, bits=${p.bits}`);
+    const got = EP.bdSummary(p);
+    check("collisionProb", got.collisionProb, c.expect.collisionProb, { relTol: 1e-9 });
+    check("pairs", got.pairs, c.expect.pairs, { exact: true });
+    check("halfLifeN", got.halfLifeN, c.expect.halfLifeN, { exact: true });
+    // The hash-bits approximation is a closed-form sqrt, computed identically
+    // in both languages, but still an APPROXIMATION of the true collision
+    // count -- not a bit-exactness question, so it gets the tighter bar
+    // anyway since there is no transcendental-approximation function involved.
+    check("hashN50", got.hashN50, c.expect.hashN50, { relTol: 1e-9 });
+    const [cxs, cys] = EP.bdCollisionCurve(p.days, 80);
+    c.collisionCurve.xs.forEach((want, i) =>
+      check(`collision curve x[${i}]`, cxs[i], want, { exact: true }));
+    c.collisionCurve.ys.forEach((want, i) =>
+      check(`collision curve y[${i}]`, cys[i], want, { relTol: 1e-9 }));
+    const [bxs, bys] = EP.bdHashBitsCurve(8, 64, 20);
+    c.hashBitsCurve.xs.forEach((want, i) =>
+      check(`hash bits curve x[${i}]`, bxs[i], want, { relTol: 1e-9 }));
+    c.hashBitsCurve.ys.forEach((want, i) =>
+      check(`hash bits curve y[${i}]`, bys[i], want, { relTol: 1e-9 }));
+  }
+
+  // -- 15. The secretary problem ----------------------------------------------
+  for (const c of G.secretary) {
+    const p = c.params;
+    group(`Secretary problem — s=${p.s}, n=${p.n}`);
+    const got = EP.secSummary(p);
+    for (const key of Object.keys(c.expect)) {
+      check(key, got[key], c.expect[key], { relTol: 1e-9 });
+    }
+    const [xs, ys] = EP.secWinCurve(p.n);
+    c.winCurve.xs.forEach((want, i) => check(`win curve x[${i}]`, xs[i], want,
+      { exact: true }));
+    c.winCurve.ys.forEach((want, i) => check(`win curve y[${i}]`, ys[i], want,
+      { relTol: 1e-9 }));
+  }
+
+  group("Secretary problem — asymptotic convergence to 1/e");
+  {
+    const [ns, ys] = EP.secAsymptoticCurve(5, 500, 30);
+    G.secretaryAsymptotic.ns.forEach((want, i) =>
+      check(`n[${i}]`, ns[i], want, { exact: true }));
+    G.secretaryAsymptotic.ys.forEach((want, i) =>
+      check(`optimal P(win)[${i}]`, ys[i], want, { relTol: 1e-9 }));
+  }
+
+  // -- 16. The two-envelope paradox --------------------------------------------
+  for (const c of G.twoenv) {
+    const p = c.params;
+    group(`Two-envelope paradox — x=${p.x}, rate=${p.rate}`);
+    const got = EP.teSummary(p);
+    check("pSmaller", got.pSmaller, c.expect.pSmaller, { relTol: 1e-9 });
+    check("swapGain", got.swapGain, c.expect.swapGain, { relTol: 1e-9 });
+    check("crossover", got.crossover, c.expect.crossover, { relTol: 1e-9 });
+    check("meanSmaller", got.meanSmaller, c.expect.meanSmaller, { relTol: 1e-9 });
+    check("shouldSwap", got.shouldSwap, c.expect.shouldSwap, { exact: true });
+    const [gxs, ggains, gprobs] = EP.teGainCurve(p.rate, 40);
+    c.gainCurve.xs.forEach((want, i) => check(`gain curve x[${i}]`, gxs[i], want,
+      { relTol: 1e-9 }));
+    c.gainCurve.gains.forEach((want, i) => check(`gain curve gain[${i}]`,
+      ggains[i], want, { relTol: 1e-9 }));
+    c.gainCurve.probs.forEach((want, i) => check(`gain curve prob[${i}]`,
+      gprobs[i], want, { relTol: 1e-9 }));
+  }
+
+  // -- 17. Optional stopping ---------------------------------------------------
+  // z_crit and everything downstream of it goes through normPpf, the same
+  // Acklam-approximation family the wheel scenario already holds to a looser
+  // bar than the PRNG-only checks above -- see CLAUDE.md's "two tolerance
+  // classes" note.
+  for (const c of G.optstop) {
+    const p = c.params;
+    group(`Optional stopping — looks=${p.looks}, batch=${p.batch}, alpha=${p.alpha}`);
+    const got = EP.osSummary(p);
+    check("cumFp", got.cumFp, c.expect.cumFp, { relTol: 1e-5 });
+    check("nominalAlpha", got.nominalAlpha, c.expect.nominalAlpha, { exact: true });
+    check("bonferroniAlpha", got.bonferroniAlpha, c.expect.bonferroniAlpha,
+      { exact: true });
+    check("totalN", got.totalN, c.expect.totalN, { exact: true });
+    check("zCrit", got.zCrit, c.expect.zCrit, { relTol: 1e-6 });
+    const [xs, ys] = EP.osFalsePositiveCurve(p.looks, p.batch, p.alpha);
+    c.fpCurve.xs.forEach((want, i) => check(`FP curve x[${i}]`, xs[i], want,
+      { exact: true }));
+    c.fpCurve.ys.forEach((want, i) => check(`FP curve y[${i}]`, ys[i], want,
+      { relTol: 1e-5 }));
+  }
+
+  group("Seeded optional-stopping walk — draw order must reproduce exactly");
+  {
+    const c = G.optstopSim.config;
+    const sim = EP.simulateOptionalStopping({
+      nPaths: c.n_paths, looks: c.looks, batch: c.batch, alpha: c.alpha,
+      seed: c.seed,
+    });
+    G.optstopSim.zPaths.forEach((wantPath, pi) => {
+      wantPath.forEach((want, i) => {
+        // The z-statistic itself is exact PRNG arithmetic (no normPpf in its
+        // own computation -- only the boundary comparison uses it), so this
+        // stays at the tight bar.
+        check(`path ${pi + 1} z[${i}]`, sim.allZ[pi][i], want, { relTol: 1e-9 });
+      });
+    });
+    G.optstopSim.firstSig.forEach((want, i) => {
+      check(`path ${i + 1} first significant look`, sim.firstSig[i], want,
+        { exact: true });
+    });
+  }
+
+  group("Simpson's paradox — closed forms, counts and the reversal curve");
+  for (const c of G.simpsons) {
+    const p = c.params;
+    const got = EP.simpsonsSummary(p);
+    for (const k of Object.keys(c.expect)) {
+      if (k === "counts") continue;
+      check(`d=${p.delta} wA=${p.wA} ${k}`, got[k], c.expect[k],
+        typeof c.expect[k] === "boolean" ? { exact: true } : { relTol: 1e-9 });
+    }
+    if (c.counts) {
+      for (const k of Object.keys(c.counts)) {
+        check(`d=${p.delta} counts.${k}`, got.counts[k], c.counts[k],
+          { relTol: 1e-9 });
+      }
+    }
+    if (c.deltaCurve) {
+      const [xs, ys] = EP.simpsonsDeltaCurve(p.pEasy, p.pHard, p.wA, p.wB, 41);
+      c.deltaCurve.xs.forEach((w, i) =>
+        check(`d=${p.delta} delta curve x[${i}]`, xs[i], w, { relTol: 1e-9 }));
+      c.deltaCurve.ys.forEach((w, i) =>
+        check(`d=${p.delta} delta curve y[${i}]`, ys[i], w, { relTol: 1e-9 }));
+    }
+  }
+
+  group("Bertrand's paradox — three closed forms, both curves, seeded chords");
+  for (const c of G.bertrand) {
+    const p = c.params;
+    const got = EP.bertrandSummary(p);
+    for (const k of Object.keys(c.expect)) {
+      check(`c=${p.c.toFixed(3)} ${k}`, got[k], c.expect[k],
+        typeof c.expect[k] === "boolean" ? { exact: true } : { relTol: 1e-9 });
+    }
+    if (c.cdfCurve) {
+      const [ts, ce, cr, cm] = EP.bertrandCdfCurve(41);
+      c.cdfCurve.ts.forEach((w, i) =>
+        check(`cdf t[${i}]`, ts[i], w, { relTol: 1e-9 }));
+      c.cdfCurve.endpoints.forEach((w, i) =>
+        check(`cdf endpoints[${i}]`, ce[i], w, { relTol: 1e-9 }));
+      c.cdfCurve.radius.forEach((w, i) =>
+        check(`cdf radius[${i}]`, cr[i], w, { relTol: 1e-9 }));
+      c.cdfCurve.midpoint.forEach((w, i) =>
+        check(`cdf midpoint[${i}]`, cm[i], w, { relTol: 1e-9 }));
+    }
+    if (c.cCurve) {
+      const [cs, pe, prr, pm] = EP.bertrandCCurve(41);
+      c.cCurve.cs.forEach((w, i) =>
+        check(`c curve c[${i}]`, cs[i], w, { relTol: 1e-9 }));
+      c.cCurve.endpoints.forEach((w, i) =>
+        check(`c curve endpoints[${i}]`, pe[i], w, { relTol: 1e-9 }));
+      c.cCurve.radius.forEach((w, i) =>
+        check(`c curve radius[${i}]`, prr[i], w, { relTol: 1e-9 }));
+      c.cCurve.midpoint.forEach((w, i) =>
+        check(`c curve midpoint[${i}]`, pm[i], w, { relTol: 1e-9 }));
+    }
+    if (c.samples) {
+      for (const m of Object.keys(c.samples)) {
+        const got2 = EP.bertrandSample(m, c.samples[m].length, p.radius, p.c, p.seed);
+        c.samples[m].forEach((w, i) => {
+          for (const f of ["x1", "y1", "x2", "y2", "mx", "my", "u", "length"]) {
+            check(`sample ${m}[${i}].${f}`, got2[i][f], w[f], { relTol: 1e-9 });
+          }
+          check(`sample ${m}[${i}].long`, got2[i].long, w.long, { exact: true });
+        });
+      }
+    }
+  }
+
   // -- summary --------------------------------------------------------------
   const s = document.getElementById("summary");
   s.textContent = failed === 0

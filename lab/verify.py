@@ -12,6 +12,7 @@ Two jobs:
 Run:  python lab/verify.py
 """
 
+import itertools
 import json
 import math
 import os
@@ -109,6 +110,76 @@ def verify_closed_forms():
         check("Var[W_T] identity", A.variance_final(**c),
               e2_identity - A.expected_final(**c) ** 2)
 
+        # -- the two multipliers and the AM-GM gap between them ---------------
+        p, up, down, f = c["p"], c["up"], c["down"], c["f"]
+        am = A.arithmetic_mean_multiplier(p, up, down, f)
+        gm = A.geometric_mean_multiplier(p, up, down, f)
+        check("E[m] = 1 + ensemble_growth", am, 1 + g_ens)
+        # A bounded two-point variable, so its sample mean is a legitimate
+        # check -- unlike E[W_T], which is a product of `rounds` of them.
+        rng_m = np.random.default_rng(9001)
+        draws = np.where(rng_m.random(2_000_000) < p, mu, md)
+        check("E[m] vs one-round sample mean", float(draws.mean()), am, tol=2e-3)
+        # ln m is thin-tailed too, so exp(mean of the log) is a fair estimate of
+        # the geometric mean -- the whole reason the time average is estimable
+        # when the ensemble average is not.
+        check("G vs sample geometric mean", float(np.exp(np.log(draws).mean())),
+              gm, tol=2e-3)
+        check("ln G = time_growth", math.log(gm),
+              A.time_growth(p, up, down, f), tol=1e-12)
+        # AM-GM: the gap is non-negative, and zero only when the two
+        # multipliers coincide.
+        drag = A.volatility_drag(p, up, down, f)
+        ok = drag >= 0.0 and abs(drag - (am - gm)) < 1e-15
+        if not ok:
+            FAILURES.append(("volatility drag = AM - GM >= 0", drag, am - gm))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] volatility drag (AM-GM gap): "
+              f"{am:.6f} - {gm:.6f} = {drag:.6f}")
+
+        # median_half_life: G^h must be exactly 1/2 when the typical path decays.
+        h = A.median_half_life(p, up, down, f)
+        if math.isfinite(h):
+            check("G^half_life = 1/2", gm ** h, 0.5, tol=1e-12)
+        else:
+            ok = gm >= 1.0
+            if not ok:
+                FAILURES.append(("half-life inf only when G >= 1", gm, ">= 1"))
+            print(f"  [{'ok  ' if ok else 'FAIL'}] half-life is +inf because "
+                  f"G = {gm:.6f} >= 1 (nothing is decaying)")
+        d = A.doubling_time(p, up, down, f)
+        if math.isfinite(d):
+            check("G^doubling_time = 2", gm ** d, 2.0, tol=1e-12)
+        # The two are mutually exclusive: a path cannot both halve and double.
+        ok = not (math.isfinite(h) and math.isfinite(d))
+        if not ok:
+            FAILURES.append(("half-life and doubling time both finite", h, d))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] half-life {h:.4g} / doubling "
+              f"time {d:.4g} -- exactly one is finite")
+
+        # break_even_heads against a brute-force integer search, and against
+        # the exact tail probability prob_below already computes.
+        T = c["rounds"]
+        kstar = A.break_even_heads(T, p, up, down, f)
+        if math.isfinite(kstar):
+            k_int = math.ceil(kstar)
+            hi = c["w0"] * mu ** k_int * md ** (T - k_int)
+            lo = c["w0"] * mu ** (k_int - 1) * md ** (T - k_int + 1)
+            ok = hi >= c["w0"] * (1 - 1e-12) and lo < c["w0"] * (1 + 1e-12)
+            if not ok:
+                FAILURES.append((f"break-even brute force k={k_int}", (lo, hi), c["w0"]))
+            print(f"  [{'ok  ' if ok else 'FAIL'}] break-even needs {kstar:.4f} "
+                  f"heads (ceil {k_int}); {k_int} heads -> ${hi:.2f}, "
+                  f"{k_int - 1} -> ${lo:.2f}, start ${c['w0']:.2f}")
+            check("P(k >= break-even) = 1 - P(W_T < w0)",
+                  float(A.binom.sf(k_int - 1, T, p)),
+                  1.0 - A.prob_below(c["w0"], **c), tol=1e-12)
+            # And the Monte Carlo agrees the paths that clear it are the
+            # paths that finished whole.
+            check("MC P(finish >= start)", float((final >= c["w0"]).mean()),
+                  float(A.binom.sf(k_int - 1, T, p)), tol=3e-3)
+        s = A.summary(**c)
+        check("expected_heads = rounds * p", s["expected_heads"], T * p)
+
 
 def verify_kelly():
     """f* should be the argmax of time_growth -- check against a brute sweep."""
@@ -134,6 +205,107 @@ def verify_kelly():
     if f != 0.0:
         FAILURES.append(("kelly negative edge", f, 0.0))
     print(f"  [{'ok  ' if f == 0.0 else 'FAIL'}] negative edge -> f*={f} (expect 0)")
+
+    # -- kelly_growth: the value at the argmax, against the same brute sweep --
+    print("\nGrowth at f*, and the fraction where growth returns to zero")
+    for p, up, down in [(0.5, 1.5, 0.6), (0.6, 1.4, 0.7), (0.5, 2.0, 0.5),
+                        (0.55, 1.6, 0.65)]:
+        b = 1 - down
+        grid = np.linspace(0, min(1.0, 1 / b) * 0.999, 200_001)
+        g = np.array([A.time_growth(p, up, down, x) for x in grid])
+        # An inequality, not an equality: the brute grid can only *under*state
+        # the maximum, and it can understate it badly when f* is clamped to the
+        # edge of the domain (p=0.6, up=1.4, down=0.7 has f* = 1.0 exactly,
+        # while the grid stops at 0.999). So: kelly_growth must dominate every
+        # grid point, and must not exceed the best of them by more than the
+        # curvature over one grid step allows.
+        g_star = A.kelly_growth(p, up, down)
+        g_brute = float(np.nanmax(g))
+        ok = g_star >= g_brute - 1e-12 and (g_star - g_brute) < 1e-6
+        if not ok:
+            FAILURES.append((f"kelly_growth p={p}", g_star, g_brute))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] kelly_growth p={p} up={up} "
+              f"down={down}: closed form {g_star:.10f} >= brute max "
+              f"{g_brute:.10f} (by {g_star - g_brute:.2e})")
+
+        # zero_growth_fraction: g must actually vanish there, it must sit above
+        # f*, and it must be the *second* root (g > 0 strictly between).
+        f0 = A.zero_growth_fraction(p, up, down)
+        f_star = A.kelly_fraction(p, up, down)
+        check(f"g(f0) = 0 at p={p}", A.time_growth(p, up, down, f0), 0.0, tol=1e-10)
+        ok = (f0 > f_star > 0
+              and A.time_growth(p, up, down, 0.5 * (f_star + f0)) > 0
+              and A.time_growth(p, up, down, min(f0 * 1.05, (1 / b) * 0.999)) < 0)
+        if not ok:
+            FAILURES.append((f"zero-growth bracketing p={p}", f0, f_star))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] p={p}: f*={f_star:.6f}, "
+              f"growth returns to zero at f0={f0:.6f} (ratio {f0 / f_star:.4f})")
+
+    # At p = 1/2 the second root is available in closed form, f0 = 2 f*, and
+    # zero_growth_fraction takes that exact branch rather than bisecting.
+    for up, down in [(1.5, 0.6), (2.0, 0.5), (1.2, 0.9)]:
+        a, b = up - 1, 1 - down
+        check(f"p=1/2 closed form f0 = (a-b)/(ab), up={up}",
+              A.zero_growth_fraction(0.5, up, down), (a - b) / (a * b), tol=1e-12)
+        check(f"p=1/2: f0 = 2 f*, up={up}", A.zero_growth_fraction(0.5, up, down),
+              2 * A.kelly_fraction(0.5, up, down), tol=1e-12)
+
+    # A negative edge has no positive zero-growth fraction: growth is negative
+    # for every f > 0, so the only root is f = 0 itself.
+    f0 = A.zero_growth_fraction(0.3, 1.5, 0.6)
+    ok = f0 == 0.0
+    if not ok:
+        FAILURES.append(("zero-growth fraction, negative edge", f0, 0.0))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] negative edge -> f0={f0} (expect 0)")
+
+    # -- doubling time -------------------------------------------------------
+    for p, up, down, f in [(0.6, 1.4, 0.7, 0.25), (0.5, 1.5, 0.6, 0.25),
+                           (0.5, 1.5, 0.6, 1.0)]:
+        t = A.doubling_time(p, up, down, f)
+        g = A.time_growth(p, up, down, f)
+        if math.isfinite(t):
+            check(f"exp(g*T2) = 2 at p={p} f={f}", math.exp(g * t), 2.0, tol=1e-12)
+        else:
+            ok = g <= 0
+            if not ok:
+                FAILURES.append(("doubling time inf only when g <= 0", g, "<= 0"))
+            print(f"  [{'ok  ' if ok else 'FAIL'}] doubling time is +inf because "
+                  f"g = {g:.6f} <= 0")
+
+    # -- half Kelly: an APPROXIMATION, true in the small-edge limit only ------
+    # The classic claim is that betting f*/2 keeps 3/4 of the Kelly growth
+    # rate. That is the second-order Taylor picture -- g(f) ~ g''(f*)(f-f*)^2/2
+    # around a parabola through the origin -- and it is exact only as the edge
+    # goes to zero. Reported at several edges rather than asserted as identity.
+    print("\nHalf Kelly vs 3/4 of Kelly growth (approximation, small-edge limit)")
+    ratios = []
+    for label, (p, up, down) in [
+        ("tiny edge   p=0.5005 up=1.01 down=0.99", (0.5005, 1.01, 0.99)),
+        ("small edge  p=0.51   up=1.05 down=0.95", (0.51, 1.05, 0.95)),
+        ("scenario    p=0.6    up=1.4  down=0.7 ", (0.6, 1.4, 0.7)),
+        ("defaults    p=0.5    up=1.5  down=0.6 ", (0.5, 1.5, 0.6)),
+    ]:
+        f_star = A.kelly_fraction(p, up, down)
+        g_full = A.kelly_growth(p, up, down)
+        g_half = A.time_growth(p, up, down, 0.5 * f_star)
+        ratio = g_half / g_full
+        ratios.append((label, ratio))
+        print(f"  [info] {label}: g(f*)={g_full:.6g}, g(f* / 2)={g_half:.6g}, "
+              f"ratio {ratio:.6f} (3/4 = 0.75, off by {ratio - 0.75:+.2e})")
+    # The tolerance is set from what the maths actually delivers, not from what
+    # would make the test pass: the tiny-edge case lands within 1e-4 of 3/4, and
+    # the drift away from it is the honest content of "this is an
+    # approximation". Only the small-edge limit is asserted.
+    tiny = ratios[0][1]
+    check("half-Kelly ratio -> 3/4 in the small-edge limit", tiny, 0.75, tol=1e-4)
+    # Every case must at least stay in the neighbourhood, and must never exceed
+    # 3/4 by much -- g is concave, so half Kelly cannot beat the parabola badly.
+    for label, ratio in ratios:
+        ok = 0.70 <= ratio <= 0.78
+        if not ok:
+            FAILURES.append((f"half-Kelly ratio {label}", ratio, "in [0.70, 0.78]"))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] {label}: ratio {ratio:.6f} "
+              f"within [0.70, 0.78]")
 
 
 # -- 1b. gambler's ruin ------------------------------------------------------
@@ -271,6 +443,53 @@ def verify_st_petersburg():
     # The capped expectation must converge to the uncapped one when it exists.
     check("cap -> E[payout] when m*p < 1", A.sp_capped_expected(0.4, 2.0, 400),
           A.sp_expected(0.4, 2.0), tol=1e-9, rel=True)
+
+    # -- Bernoulli's log-utility resolution ----------------------------------
+    # E[ln X] is the one moment that converges everywhere, including on the
+    # classic game where E[X] does not. ln X is thin-tailed (it is a linear
+    # function of a geometric count), so unlike E[X] it *is* legitimate to
+    # check against a sample mean -- which is exactly the distinction
+    # CLAUDE.md warns about.
+    print("\n  log utility E[ln X] and the certainty equivalent exp(E[ln X])")
+    for p, m in [(0.5, 2.0), (0.4, 2.0), (0.6, 1.5), (0.5, 3.0), (0.3, 2.5)]:
+        n = 2_000_000
+        tosses = rng.geometric(1 - p, size=n)
+        log_payouts = (tosses - 1.0) * math.log(m)
+        want = A.sp_log_utility(p, m)
+        print(f"\n  case p={p} m={m}  (E[X] "
+              f"{'diverges' if m * p >= 1 else 'is finite'})")
+        check("E[ln X]", float(log_payouts.mean()), want, tol=4e-3)
+        # exp of a sample mean, not a sample mean of exp -- the second would be
+        # the heavy-tailed quantity this file refuses to check.
+        check("certainty equivalent", float(np.exp(log_payouts.mean())),
+              A.sp_certainty_equivalent(p, m), tol=6e-3, rel=True)
+        # The closed form itself, against the series it came from, summed far
+        # enough out that the tail is below float noise.
+        series = sum((nn - 1) * math.log(m) * p ** (nn - 1) * (1 - p)
+                     for nn in range(1, 4000))
+        check("E[ln X] = ln(m) p/(1-p) vs the series", want, series, tol=1e-10)
+
+    # The classic game, stated exactly. This module's payout convention is
+    # m^(N-1) -- $1, $2, $4, ... -- so the log player's certainty equivalent is
+    # 2^(0.5/0.5) = exactly $2.00. The "about $4" figure quoted for Bernoulli's
+    # resolution belongs to the 2^N statement of the game (payouts $2, $4, $8),
+    # which is twice this one at every tier and so has exactly twice the CE.
+    ce = A.sp_certainty_equivalent(0.5, 2.0)
+    check("classic game E[ln X] = ln 2", A.sp_log_utility(0.5, 2.0), math.log(2.0))
+    check("classic game certainty equivalent = $2.00 exactly", ce, 2.0, tol=1e-12)
+    print(f"  [info] classic game: E[X] is infinite, median is $1.00, and the "
+          f"log player's certainty equivalent is ${ce:.4f} "
+          f"(${2 * ce:.4f} under the 2^N statement of the same game)")
+    # And the number stays finite across the whole divergent regime, which is
+    # the entire point of the resolution.
+    for p, m in [(0.5, 2.0), (0.5, 3.0), (0.9, 10.0)]:
+        u = A.sp_log_utility(p, m)
+        ok = math.isfinite(u) and not math.isfinite(A.sp_expected(p, m))
+        if not ok:
+            FAILURES.append((f"log utility finite where E[X] is not, p={p} m={m}",
+                             u, "finite"))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] p={p} m={m}: E[X]=inf but "
+              f"E[ln X]={u:.6f}, CE=${A.sp_certainty_equivalent(p, m):.4f}")
 
     # sp_typical_mean is an approximation and is checked as one: it should land
     # within a few tens of percent of the median sample mean, which is all the
@@ -564,6 +783,62 @@ def verify_shannon():
     check("Kelly fraction of the symmetric trendless coin = 1/2",
           A.sd_summary(rounds=200, p=0.5, vol=0.3, w=0.5)["kelly_w"], 0.5, tol=1e-6)
 
+    # -- sd_optimal_weight: EXACT at interval = 1, checked by brute sweep -----
+    # Per-period rebalancing makes the portfolio's growth term-for-term the
+    # coin's time_growth with f = w, so the closed-form Kelly fraction is the
+    # exact argmax. A grid sweep over w confirms it.
+    print("\n  optimal weight (exact at interval=1) vs a brute sweep over w")
+    for p, vol in [(0.5, 0.3), (0.5, 0.1), (0.55, 0.3), (0.45, 0.2)]:
+        grid = np.linspace(0.0, 1.0, 100_001)
+        gs = np.array([A.sd_cycle_growth(1, p, vol, float(x), 0.0) for x in grid])
+        w_brute = float(grid[int(np.nanargmax(gs))])
+        w_form = A.sd_optimal_weight(p, vol)
+        ok = abs(w_form - w_brute) < 1e-4      # the grid's own spacing is 1e-5
+        if not ok:
+            FAILURES.append((f"optimal weight p={p} vol={vol}", w_form, w_brute))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] p={p} vol={vol}: closed form "
+              f"{w_form:.6f}, brute {w_brute:.6f}")
+
+    # -- the continuous-time harvest identity, as an APPROXIMATION ------------
+    # w(1-w)sigma^2/2 is the Ito result for a continuously rebalanced portfolio
+    # of a driftless GBM and cash. The page simulates a discrete binomial move
+    # instead, so this is NOT the same quantity and is not asserted equal to
+    # it. What follows is a report of the size of the gap, which grows like
+    # sigma^4 -- negligible at a 5% move and a percent of the answer at 60%.
+    print("\n  continuous-time harvest w(1-w)sigma^2/2 vs the EXACT discrete "
+          "sd_cycle_growth(interval=1), p=0.5, trendless stock")
+    print(f"    {'vol':>6}  {'sigma':>9}  {'exact discrete':>15}  "
+          f"{'continuous':>12}  {'abs gap':>11}  {'rel gap':>9}")
+    worst = 0.0
+    for w in (0.5, 0.3):
+        for vol in (0.05, 0.10, 0.20, 0.30, 0.45, 0.60):
+            exact = A.sd_cycle_growth(1, 0.5, vol, w, 0.0)
+            approx = A.sd_harvest_continuous(vol, w)
+            rel = (approx - exact) / exact
+            worst = max(worst, abs(rel))
+            print(f"    w={w}  {vol:>6.2f}  {math.log1p(vol):>9.6f}  "
+                  f"{exact:>15.9f}  {approx:>12.9f}  "
+                  f"{approx - exact:>+11.2e}  {rel:>+9.4%}")
+    # The only thing asserted is the *shape* of the error: the approximation is
+    # an over-estimate that vanishes with the move size. A tolerance pinning
+    # them together would be asserting something untrue.
+    ok = worst < 0.02
+    if not ok:
+        FAILURES.append(("continuous harvest gap over the sweep", worst, "< 2%"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] worst relative gap across the sweep: "
+          f"{worst:.4%} (at the largest move; it is 1e-4 at vol=0.05)")
+    # Fourth-order shape check: halving the move should cut the relative gap by
+    # roughly four, since the leading error term is O(sigma^4) against an
+    # O(sigma^2) answer.
+    g1 = abs(A.sd_harvest_continuous(0.20, 0.5) / A.sd_cycle_growth(1, 0.5, 0.20, 0.5, 0.0) - 1)
+    g2 = abs(A.sd_harvest_continuous(0.10, 0.5) / A.sd_cycle_growth(1, 0.5, 0.10, 0.5, 0.0) - 1)
+    ratio = g1 / g2
+    ok = 3.0 < ratio < 5.0
+    if not ok:
+        FAILURES.append(("continuous harvest error is O(sigma^4)", ratio, "~4"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] halving the move divides the relative "
+          f"gap by {ratio:.2f} (expect ~4: the error is O(sigma^4))")
+
 
 # -- 1g. insurance and risk pooling --------------------------------------------
 def mc_pool_growth(members, wealth, loss, hazard, n=200_000, seed=99):
@@ -677,6 +952,68 @@ def verify_wheel():
         FAILURES.append(("wheel acquires shares over 8 seeds", assigned_any, "> 0"))
     print(f"  [{'ok  ' if ok else 'FAIL'}] {assigned_any} contracts assigned "
           f"across 8 seeds")
+
+    print("\n  the income leg must leave the shares room to appreciate")
+    # The mirror-image defect of the one above, and it bit just as hard. If a
+    # covered call is written the instant the shares arrive, `max(spot, basis)`
+    # is `basis` -- assignment happens precisely when spot is BELOW the strike
+    # that bought them -- so every call is struck at cost and being called away
+    # realises exactly zero on the shares. Measured on the S&P over 2009-2026
+    # that rule struck 100% of its calls at the basis and, with the account
+    # flat 95% of the time, turned an 8.35x index into +8.8%/yr. Writing only
+    # when price is back near its rolling high is what fixes it, so: some
+    # meaningful share of calls must be struck strictly ABOVE the basis.
+    above, total = 0, 0
+    for seed in range(1, 9):
+        w = A.simulate_wheel(A.simulate_gbm_path(seed=seed))
+        basis = None
+        for e in w["events"]:
+            if e["kind"] == "assigned":
+                basis = e["strike"]
+            elif e["kind"] == "sell_call" and basis is not None:
+                total += 1
+                if e["strike"] > basis * (1 + 1e-12):
+                    above += 1
+    frac = above / total if total else 0.0
+    ok = total > 0 and frac >= 0.25
+    if not ok:
+        FAILURES.append(("calls struck above cost basis", f"{above}/{total}",
+                         ">= 25%"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] {above}/{total} calls struck above "
+          f"the basis ({frac * 100:.0f}%) across 8 seeds")
+
+    print("\n  the account is not left sitting in cash")
+    # The put leg re-sells the same day a put resolves, so an account that is
+    # neither long nor short a put should be a rounding error, not a regime.
+    # Gating put re-entry on a dip (an earlier rule) left the S&P arm flat for
+    # 95% of seventeen years, earning the cash rate through an eightfold rally.
+    for seed in (1, 4, 7):
+        path = A.simulate_gbm_path(seed=seed)
+        w = A.simulate_wheel(path)
+        n = len(path) - 1
+        put_open = long_now = False
+        idle = 0
+        by_t = {}
+        for e in w["events"]:
+            by_t.setdefault(e["t"], []).append(e["kind"])
+        for t in range(1, n + 1):
+            for k in by_t.get(t, ()):
+                if k == "sell_put":
+                    put_open = True
+                elif k == "put_expired":
+                    put_open = False
+                elif k == "assigned":
+                    put_open, long_now = False, True
+                elif k in ("called_away", "stop_shares"):
+                    long_now = False
+            if not put_open and not long_now:
+                idle += 1
+        ok = idle / n < 0.05
+        if not ok:
+            FAILURES.append((f"wheel idle fraction (seed={seed})",
+                             f"{idle / n:.1%}", "< 5%"))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] seed {seed}: idle "
+              f"{idle / n * 100:.1f}% of days")
 
     print("\n  one position at a time: never short a put while holding shares")
     for seed in (1, 4, 7):
@@ -816,6 +1153,661 @@ def verify_insurance():
     check("pool curve at n=50", growth[49], A.ins_pool_growth(50, 100000.0, 30000.0, 0.05))
 
 
+# -- 1h. Parrondo's paradox ---------------------------------------------------
+def mc_parrondo_drift(q, eps=0.005, p_bad=0.1, p_good=0.75, n_paths=2000,
+                      rounds=4000, seed=606):
+    """Vectorised Monte Carlo of the long-run drift under the mixed strategy,
+    independent of mulberry32 -- this checks the stationary-distribution
+    formula, not the seeded-draw contract (simulate_parrondo's job)."""
+    rng = np.random.default_rng(seed)
+    x = np.zeros(n_paths, dtype=np.int64)
+    for _ in range(rounds):
+        residue = x % 3
+        p_win = np.where(rng.random(n_paths) < q,
+                         np.where(residue == 0, p_bad, p_good) - eps,
+                         0.5 - eps)
+        x += np.where(rng.random(n_paths) < p_win, 1, -1)
+    return float(x.mean()) / rounds
+
+
+def verify_parrondo():
+    print("\nParrondo's paradox: stationary-distribution drift vs Monte Carlo")
+    for q, eps in [(0.0, 0.005), (1.0, 0.005), (0.5, 0.005), (0.5, 0.01)]:
+        got = mc_parrondo_drift(q, eps)
+        want = A.pa_drift(q, eps)
+        check(f"drift q={q} eps={eps}", got, want, tol=5e-3)
+
+    print("\n  the paradox itself")
+    s = A.pa_summary(q=0.5, eps=0.005)
+    ok = s["drift_a"] < 0.0 and s["drift_b"] < 0.0 and s["drift_mix"] > 0.0
+    if not ok:
+        FAILURES.append(("Parrondo paradox at classic parameters", s, "A<0, B<0, mix>0"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] A alone {s['drift_a']*100:+.3f} %, "
+          f"B alone {s['drift_b']*100:+.3f} %, 50/50 mix "
+          f"{s['drift_mix']*100:+.3f} % -- both lose, the mix wins")
+
+    pi = A.pa_stationary(0.5, 0.005)
+    ok = abs(pi.sum() - 1.0) < 1e-9 and bool((pi >= -1e-12).all())
+    if not ok:
+        FAILURES.append(("Parrondo stationary distribution valid", list(pi),
+                         "sums to 1, non-negative"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] stationary distribution sums to 1 "
+          f"and is non-negative: {pi}")
+
+    # Each PURE game is exactly fair at eps=0 -- q=0 trivially (game A never
+    # depends on the residue, so its stationary distribution is uniform and
+    # its drift is 2*0.5-1=0 identically); q=1 because game B's own
+    # stationary distribution happens to weight p_bad and p_good into an
+    # exact wash. Neither claim extends to a MIX of the two: mixing what is
+    # individually fair still couples the residue you tend to be in with
+    # which game's probability applies there, and that coupling alone -- not
+    # eps -- is enough to produce a non-zero drift. That a q=0.5 mix of two
+    # eps=0 games is *not* fair is a fact about this game, not a bug; an
+    # earlier version of this check wrongly asserted it should be zero
+    # everywhere and flagged a false failure.
+    check("pure A is exactly fair at eps=0", A.pa_drift(0.0, 0.0, 0.1, 0.75), 0.0)
+    check("pure B is exactly fair at eps=0", A.pa_drift(1.0, 0.0, 0.1, 0.75), 0.0,
+          tol=1e-9)
+    mix_drift = A.pa_drift(0.5, 0.0, 0.1, 0.75)
+    ok = abs(mix_drift) > 1e-6
+    if not ok:
+        FAILURES.append(("mixing two fair eps=0 games stays biased", mix_drift, "!= 0"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] a 50/50 mix of two individually-fair "
+          f"eps=0 games is itself biased ({mix_drift*100:+.3f} %/round) -- the "
+          f"coupling, not the house edge, is what Parrondo's mechanism runs on")
+
+
+# -- 1i. Base rates ------------------------------------------------------------
+def verify_base_rates():
+    print("\nBase rates: Bayes' theorem vs Monte Carlo, and internal identities")
+    rng = np.random.default_rng(707)
+    for prior, sens, spec in [(0.01, 0.95, 0.95), (0.1, 0.9, 0.8), (0.001, 0.99, 0.99)]:
+        n = 2_000_000
+        sick = rng.random(n) < prior
+        pos = np.where(sick, rng.random(n) < sens, rng.random(n) < (1 - spec))
+        got = float(sick[pos].mean()) if pos.any() else 0.0
+        want = A.br_posterior_positive(prior, sens, spec)
+        check(f"P(disease|+) prior={prior} sens={sens} spec={spec}", got, want, tol=5e-3)
+        got_neg = float(sick[~pos].mean()) if (~pos).any() else 0.0
+        want_neg = A.br_posterior_negative(prior, sens, spec)
+        check(f"P(disease|-) prior={prior} sens={sens} spec={spec}", got_neg, want_neg,
+              tol=5e-3)
+
+    tp, fp, fn, tn = A.br_counts(0.01, 0.95, 0.95, 1000)
+    check("counts reproduce posterior", tp / (tp + fp),
+          A.br_posterior_positive(0.01, 0.95, 0.95))
+    check("population accounted for", tp + fp + fn + tn, 1000.0)
+
+    classic = A.br_posterior_positive(0.01, 0.95, 0.95)
+    ok = abs(classic - 0.161) < 0.001
+    if not ok:
+        FAILURES.append(("classic 95%/95%/1% posterior ~ 16.1%", classic, 0.161))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] classic parameters give "
+          f"{classic*100:.2f} % (not 95 %) -- the base-rate fallacy in one number")
+
+    xs, ys = A.br_prevalence_curve(0.95, 0.95)
+    ok = all(a <= b + 1e-12 for a, b in zip(ys, ys[1:]))
+    if not ok:
+        FAILURES.append(("posterior monotone increasing in prevalence", ys, "non-decreasing"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] P(disease|+) rises monotonically with prevalence")
+
+
+# -- 1j. The birthday problem --------------------------------------------------
+def verify_birthday():
+    print("\nBirthday problem: closed form vs Monte Carlo, and the hash extension")
+    rng = np.random.default_rng(808)
+    for n, days in [(23, 365), (10, 365), (50, 365), (5, 30)]:
+        trials = 200_000
+        draws = rng.integers(0, days, size=(trials, n))
+        # Sort each row and look for an adjacent equal pair -- a vectorised
+        # stand-in for "fewer than n unique values" that needs no per-row set.
+        sorted_draws = np.sort(draws, axis=1)
+        collided = (np.diff(sorted_draws, axis=1) == 0).any(axis=1)
+        got = float(collided.mean())
+        want = A.bd_collision_prob(n, days)
+        check(f"P(collision) n={n} days={days}", got, want, tol=5e-3)
+
+    check("n=23, d=365 is the classic ~50.7%", A.bd_collision_prob(23, 365), 0.5073,
+          tol=2e-4)
+    check("pairs(23) = 253", A.bd_pairs(23), 253.0)
+    check("half-life n for d=365 is 23", A.bd_half_life_n(365), 23)
+    check("n > days forces a collision", A.bd_collision_prob(400, 365), 1.0)
+
+    print("\n  hash-bits approximation vs exact enumeration (small bit counts)")
+    for bits in (8, 10, 12, 14):
+        days = 2 ** bits
+        exact = A.bd_half_life_n(float(days))
+        approx = A.bd_hash_n50_approx(bits)
+        ratio = approx / exact
+        ok = 0.85 <= ratio <= 1.15
+        if not ok:
+            FAILURES.append((f"hash approx @ {bits} bits", approx, f"~{exact}"))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] {bits} bits: exact {exact}, "
+              f"approx {approx:.1f} (ratio {ratio:.3f})")
+
+
+# -- 1k. The secretary problem --------------------------------------------------
+def exact_secretary(s, n):
+    """Brute-force reference: enumerate all n! permutations exactly. Only
+    used for small n -- an independent check on the closed form, not how it
+    is computed."""
+    wins = total = 0
+    for perm in itertools.permutations(range(n)):
+        total += 1
+        best_before = min(perm[:s]) if s > 0 else n
+        pick = n - 1
+        for i in range(s, n):
+            if perm[i] < best_before:
+                pick = i
+                break
+        if perm[pick] == 0:
+            wins += 1
+    return wins / total
+
+
+def mc_secretary(s, n, trials=50_000, seed=909):
+    rng = np.random.default_rng(seed)
+    wins = 0
+    for _ in range(trials):
+        perm = rng.permutation(n)
+        best_before = perm[:s].min() if s > 0 else n
+        pick = n - 1
+        for i in range(s, n):
+            if perm[i] < best_before:
+                pick = i
+                break
+        if perm[pick] == 0:
+            wins += 1
+    return wins / trials
+
+
+def verify_secretary():
+    print("\nSecretary problem: closed form vs brute-force enumeration (small n)")
+    for s, n in [(0, 6), (1, 6), (2, 6), (3, 7), (0, 8)]:
+        got = exact_secretary(s, n)
+        want = A.sec_win_prob(s, n)
+        check(f"exact n={n} s={s}", got, want, tol=1e-9)
+
+    print("\n  hand cases")
+    check("n=1", A.sec_win_prob(0, 1), 1.0)
+    check("n=2, s=0", A.sec_win_prob(0, 2), 0.5)
+    check("n=2, s=1", A.sec_win_prob(1, 2), 0.5)
+
+    print("\n  larger n vs Monte Carlo")
+    for s, n in [(37, 100), (10, 50), (0, 100)]:
+        got = mc_secretary(s, n)
+        want = A.sec_win_prob(s, n)
+        check(f"MC n={n} s={s}", got, want, tol=8e-3)
+
+    print("\n  convergence to 1/e")
+    ns, ys = A.sec_asymptotic_curve(min_n=50, max_n=2000, points=30)
+    ok = abs(ys[-1] - (1.0 / math.e)) < 0.01
+    if not ok:
+        FAILURES.append(("optimal win prob converges to 1/e", ys[-1], 1.0 / math.e))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] at n={ns[-1]}: optimal P(win) = "
+          f"{ys[-1]*100:.3f} % (1/e = {100/math.e:.3f} %)")
+
+    best_s, best_p = A.sec_optimal(100)
+    check("optimal skip at n=100 is 37", float(best_s), 37.0)
+    ok = abs(best_s / 100 - 1 / math.e) < 0.05
+    print(f"  [{'ok  ' if ok else 'FAIL'}] optimal fraction {best_s/100:.3f} "
+          f"~ 1/e = {1/math.e:.3f}")
+
+
+# -- 1l. The two-envelope paradox ----------------------------------------------
+def verify_two_envelope():
+    print("\nTwo-envelope paradox: closed form vs Monte Carlo")
+    rng = np.random.default_rng(1010)
+    for rate in (0.01, 0.05, 0.002):
+        n = 4_000_000
+        s = rng.exponential(1.0 / rate, size=n)
+        smaller_shown = rng.random(n) < 0.5
+        x = np.where(smaller_shown, s, 2.0 * s)
+        for frac in (0.3, 1.0, 3.0):
+            x0 = frac / rate
+            width = 0.2 / rate
+            in_bin = (x >= x0 - width / 2) & (x < x0 + width / 2)
+            if in_bin.sum() < 1000:
+                continue
+            got = float(smaller_shown[in_bin].mean())
+            want = A.te_p_smaller(x0, rate)
+            check(f"P(smaller | x~{frac}/rate) rate={rate}", got, want, tol=2e-2)
+
+    print("\n  exact identities")
+    for rate in (0.01, 0.05):
+        xstar = A.te_crossover(rate)
+        check(f"gain(x*) = 0, rate={rate}", A.te_swap_gain(xstar, rate), 0.0, tol=1e-6)
+        check(f"P(smaller|x*) = 1/3, rate={rate}", A.te_p_smaller(xstar, rate),
+              1.0 / 3.0, tol=1e-9)
+
+    rate = 0.02
+    n = 4_000_000
+    s = rng.exponential(1.0 / rate, size=n)
+    smaller_shown = rng.random(n) < 0.5
+    x = np.where(smaller_shown, s, 2.0 * s)
+    other = np.where(smaller_shown, 2.0 * s, s)
+    unconditional_gain = float((other - x).mean())
+    ok = abs(unconditional_gain) < 0.05 * (1.0 / rate)
+    if not ok:
+        FAILURES.append(("unconditional swap gain ~ 0", unconditional_gain, 0.0))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] unconditional E[gain from always "
+          f"swapping] ~ 0: got {unconditional_gain:.3f} "
+          f"(mean smaller = {1/rate:.1f})")
+
+    xstar = A.te_crossover(0.01)
+    below = A.te_swap_gain(xstar * 0.5, 0.01)
+    above = A.te_swap_gain(xstar * 1.5, 0.01)
+    ok = below > 0.0 and above < 0.0
+    if not ok:
+        FAILURES.append(("swap gain changes sign at crossover", (below, above), "(+, -)"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] gain is positive below the crossover "
+          f"({below:+.2f}) and negative above it ({above:+.2f})")
+
+
+# -- 1m. Optional stopping ------------------------------------------------------
+def mc_optional_stopping(looks, batch, alpha, n=60_000, seed=1111):
+    """Vectorised Monte Carlo, independent of the forward DP: walk n paths all
+    the way out and check, at each look boundary, whether the moving boundary
+    was ever crossed."""
+    rng = np.random.default_rng(seed)
+    z = A.os_z_threshold(alpha)
+    total = looks * batch
+    steps = np.where(rng.random((n, total)) < 0.5, 1, -1).astype(np.int32)
+    cum = np.cumsum(steps, axis=1)
+    ever = np.zeros(n, dtype=bool)
+    for look in range(1, looks + 1):
+        idx = look * batch - 1
+        boundary = z * math.sqrt(look * batch)
+        ever |= np.abs(cum[:, idx]) >= boundary
+    return float(ever.mean())
+
+
+def verify_optional_stopping():
+    print("\nOptional stopping: forward DP vs Monte Carlo")
+    for looks, batch, alpha in [(40, 20, 0.05), (10, 50, 0.05), (20, 10, 0.10)]:
+        got = mc_optional_stopping(looks, batch, alpha)
+        want = A.os_false_positive_rate(looks, batch, alpha)
+        check(f"cumulative FP rate looks={looks} batch={batch} alpha={alpha}",
+              got, want, tol=8e-3)
+
+    print("\n  structural properties")
+    # A single look is exactly a discrete two-sided binomial tail test, so it
+    # can be checked against scipy's own binomial CDF directly -- an
+    # independent exact computation, not another Monte Carlo estimate. It is
+    # NOT expected to equal the nominal continuous alpha: at batch=50 the
+    # z=1.96 boundary (13.86 in S-units) snaps up to the nearest reachable
+    # even integer (14), and that discreteness alone moves the true rate to
+    # ~6.5%. An earlier version of this check wrongly asserted equality to
+    # the nominal 5% and flagged this real, expected gap as a failure.
+    batch = 50
+    z = A.os_z_threshold(0.05)
+    h_hi = math.ceil((z * math.sqrt(batch) + batch) / 2)
+    exact_single_look = float(A.binom.sf(h_hi - 1, batch, 0.5)
+                              + A.binom.cdf(batch - h_hi, batch, 0.5))
+    xs, ys = A.os_false_positive_curve(looks=1, batch=batch, alpha=0.05)
+    check("single look matches the exact binomial tail (not the nominal alpha)",
+          ys[0], exact_single_look, tol=1e-9)
+
+    # The discreteness gap narrows as the per-look sample size grows -- a much
+    # larger batch should land close to the nominal continuous alpha.
+    xs, ys = A.os_false_positive_curve(looks=1, batch=4000, alpha=0.05)
+    ok = abs(ys[0] - 0.05) < 3e-3
+    if not ok:
+        FAILURES.append(("large-batch single look approaches nominal alpha", ys[0], 0.05))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] batch=4000: single-look rate "
+          f"{ys[0]*100:.3f} % is close to the nominal 5 % "
+          f"(batch=50 gives {exact_single_look*100:.2f} % -- discreteness, not error)")
+
+    xs, ys = A.os_false_positive_curve(looks=60, batch=15, alpha=0.05)
+    ok = all(a <= b + 1e-12 for a, b in zip(ys, ys[1:]))
+    if not ok:
+        FAILURES.append(("cumulative FP rate monotone non-decreasing", ys, "non-decreasing"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] cumulative false-positive rate never "
+          f"decreases across {len(ys)} looks")
+
+    late = ys[-1]
+    ok = late > 3.0 * 0.05
+    if not ok:
+        FAILURES.append(("many looks inflate FP rate well past nominal", late, "> 0.15"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] after {len(ys)} looks: cumulative "
+          f"rate {late*100:.1f} % vs nominal 5 %")
+
+    check("Bonferroni alpha = 0.05/40", A.os_bonferroni_alpha(looks=40, alpha=0.05),
+          0.05 / 40)
+
+
+# -- 1n. Simpson's paradox ------------------------------------------------------
+def mc_simpsons(p_easy, p_hard, delta, w_a, w_b, n=1_000_000, seed=2024):
+    """Monte Carlo, independent of the algebra: draw each treatment's cases
+    from its own easy/hard mix, flip a success for each at that subgroup's
+    own rate, and report the four subgroup rates and the two pooled rates as
+    plain sample fractions."""
+    rng = np.random.default_rng(seed)
+    out = {}
+    for tag, w, bump in (("a", w_a, delta), ("b", w_b, 0.0)):
+        easy = rng.random(n) < w
+        rate = np.where(easy, p_easy + bump, p_hard + bump)
+        succ = rng.random(n) < rate
+        out[f"easy_{tag}"] = float(succ[easy].mean()) if easy.any() else 0.0
+        out[f"hard_{tag}"] = float(succ[~easy].mean()) if (~easy).any() else 0.0
+        out[f"pooled_{tag}"] = float(succ.mean())
+    return out
+
+
+def verify_simpsons():
+    print("\nSimpson's paradox: closed forms vs Monte Carlo, and the reversal "
+          "condition brute-forced")
+    cases = [
+        dict(p_easy=0.9, p_hard=0.4, delta=0.05, w_a=0.2, w_b=0.8),
+        dict(p_easy=0.7, p_hard=0.3, delta=0.15, w_a=0.35, w_b=0.65),
+        dict(p_easy=0.6, p_hard=0.5, delta=0.20, w_a=0.1, w_b=0.9),
+    ]
+    for c in cases:
+        print(f"\n  case {c}")
+        mc = mc_simpsons(**c)
+        s = A.simpsons_summary(**c)
+        # Absolute tolerance, as always for probabilities. The pooled rates
+        # get all 1e6 draws (SE ~5e-4), but a subgroup rate only gets its own
+        # share: at w_b = 0.9 the hard-B cell is 100k draws, SE ~1.6e-3, so
+        # the subgroup bar has to be the looser one. Tightening it to 3e-3
+        # flagged a 2-sigma sample as a formula error.
+        check("rate A|easy", mc["easy_a"], s["rate_easy_a"], tol=8e-3)
+        check("rate A|hard", mc["hard_a"], s["rate_hard_a"], tol=8e-3)
+        check("rate B|easy", mc["easy_b"], s["rate_easy_b"], tol=8e-3)
+        check("rate B|hard", mc["hard_b"], s["rate_hard_b"], tol=8e-3)
+        check("pooled A", mc["pooled_a"], s["pooled_a"], tol=3e-3)
+        check("pooled B", mc["pooled_b"], s["pooled_b"], tol=3e-3)
+        check("pooled diff = delta - delta_critical", s["pooled_diff"],
+              c["delta"] - s["delta_critical"])
+        # The simulation must reproduce the qualitative verdict too, not just
+        # the six numbers -- that is the claim the scenario actually makes.
+        mc_reverses = ((mc["easy_a"] > mc["easy_b"]) and (mc["hard_a"] > mc["hard_b"])
+                       and (mc["pooled_a"] < mc["pooled_b"]))
+        ok = mc_reverses == s["reverses"]
+        if not ok:
+            FAILURES.append(("simulated verdict matches `reverses`", mc_reverses,
+                             s["reverses"]))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] simulated verdict: "
+              f"reverses={mc_reverses} (closed form: {s['reverses']})")
+
+    print("\n  reversal condition brute-forced over a parameter grid")
+    grid_n = grid_bad = 0
+    for p_hard in (0.1, 0.3, 0.5):
+        for gap in (0.05, 0.2, 0.4):
+            p_easy = p_hard + gap
+            for w_a in (0.1, 0.3, 0.5, 0.7, 0.9):
+                for w_b in (0.1, 0.3, 0.5, 0.7, 0.9):
+                    for delta in (-0.25, -0.1, -0.02, 0.0, 0.02, 0.05, 0.1, 0.25):
+                        if not (0.0 <= p_hard + delta and p_easy + delta <= 1.0):
+                            continue
+                        crit0 = (w_b - w_a) * (p_easy - p_hard)
+                        if abs(delta - crit0) < 1e-12:
+                            # Exactly on the boundary. (w_b - w_a)*(p_easy -
+                            # p_hard) is a product of two floats and lands a
+                            # few ULPs away from the delta it is being
+                            # compared with -- 0.4 * 0.05 is
+                            # 0.020000000000000004, not 0.02 -- so a strict
+                            # inequality and a sign test can genuinely
+                            # disagree here while both are right about every
+                            # point that is not measure-zero. Skipped rather
+                            # than papered over with a fuzzy comparison,
+                            # which would weaken the test everywhere else.
+                            continue
+                        grid_n += 1
+                        # Brute force: recompute both pooled rates from the
+                        # four subgroup rates directly, with no reference to
+                        # delta_critical, and read the verdict off them.
+                        ae, ah = p_easy + delta, p_hard + delta
+                        pa = w_a * ae + (1 - w_a) * ah
+                        pb = w_b * p_easy + (1 - w_b) * p_hard
+                        brute = ((ae > p_easy and ah > p_hard and pa < pb)
+                                 or (ae < p_easy and ah < p_hard and pa > pb))
+                        got = A.simpsons_reverses(p_easy, p_hard, delta, w_a, w_b)
+                        crit = A.simpsons_delta_critical(p_easy, p_hard, w_a, w_b)
+                        # And the closed-form criterion, stated as the
+                        # inequality rather than as a sign comparison.
+                        crit_form = (0.0 < delta < crit) or (crit < delta < 0.0)
+                        if not (brute == got == crit_form):
+                            grid_bad += 1
+                            if grid_bad <= 3:
+                                FAILURES.append(
+                                    (f"reversal grid p_easy={p_easy:.2f} "
+                                     f"p_hard={p_hard} w_a={w_a} w_b={w_b} "
+                                     f"delta={delta}",
+                                     (brute, got, crit_form), "all equal"))
+    ok = grid_bad == 0
+    print(f"  [{'ok  ' if ok else 'FAIL'}] {grid_n} parameter combinations: "
+          f"brute force, `simpsons_reverses`, and delta < (w_b - w_a)(p_easy - "
+          f"p_hard) agree in {grid_n - grid_bad} of them")
+
+    print("\n  the reversal boundary is exactly delta_critical")
+    for c in cases:
+        crit = A.simpsons_delta_critical(c["p_easy"], c["p_hard"], c["w_a"], c["w_b"])
+        eps = 1e-9
+        just_below = A.simpsons_reverses(c["p_easy"], c["p_hard"], crit - eps,
+                                         c["w_a"], c["w_b"])
+        just_above = A.simpsons_reverses(c["p_easy"], c["p_hard"], crit + eps,
+                                         c["w_a"], c["w_b"])
+        ok = just_below and not just_above
+        if not ok:
+            FAILURES.append((f"boundary at delta_critical={crit:.6f}",
+                             (just_below, just_above), "(True, False)"))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] crit={crit:.4f}: reverses just "
+              f"below ({just_below}) and not just above ({just_above})")
+
+    print("\n  the counts table is internally consistent (no off-by-one margins)")
+    bad = 0
+    for c in cases:
+        for n_a, n_b in ((200, 200), (37, 91), (1, 1000), (50, 50), (7, 13)):
+            k = A.simpsons_counts(n_a=n_a, n_b=n_b, **c)
+            checks = [
+                k["easy_a"] + k["hard_a"] == k["n_a"],
+                k["easy_b"] + k["hard_b"] == k["n_b"],
+                k["succ_easy_a"] + k["succ_hard_a"] == k["succ_a"],
+                k["succ_easy_b"] + k["succ_hard_b"] == k["succ_b"],
+                0 <= k["succ_easy_a"] <= k["easy_a"],
+                0 <= k["succ_hard_a"] <= k["hard_a"],
+                0 <= k["succ_easy_b"] <= k["easy_b"],
+                0 <= k["succ_hard_b"] <= k["hard_b"],
+                k["succ_a"] <= k["n_a"], k["succ_b"] <= k["n_b"],
+            ]
+            if not all(checks):
+                bad += 1
+                FAILURES.append((f"counts consistent n_a={n_a} n_b={n_b}", k,
+                                 "parts sum to the whole"))
+    ok = bad == 0
+    print(f"  [{'ok  ' if ok else 'FAIL'}] 15 count tables: every margin is the "
+          f"sum of its own cells, every cell within its total")
+
+    # The counts view must not flip the verdict at a sensible group size --
+    # a rounded table that disagrees with the rates it came from is worse
+    # than no table.
+    k = A.simpsons_counts(**cases[0], n_a=200, n_b=200)
+    ok = (k["rate_easy_a"] > k["rate_easy_b"] and k["rate_hard_a"] > k["rate_hard_b"]
+          and k["rate_a"] < k["rate_b"])
+    if not ok:
+        FAILURES.append(("counts table shows the same reversal as the rates", k,
+                         "reversal preserved"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] the 200/200 count table reverses too: "
+          f"A {k['succ_easy_a']}/{k['easy_a']} and {k['succ_hard_a']}/{k['hard_a']} "
+          f"beats B {k['succ_easy_b']}/{k['easy_b']} and "
+          f"{k['succ_hard_b']}/{k['hard_b']}, but {k['succ_a']}/{k['n_a']} loses to "
+          f"{k['succ_b']}/{k['n_b']}")
+
+    xs, ys = A.simpsons_delta_curve(**{k2: v for k2, v in cases[0].items()
+                                       if k2 != "delta"})
+    ok = all(b - a > -1e-12 for a, b in zip(ys, ys[1:]))
+    if not ok:
+        FAILURES.append(("pooled diff increases with delta", ys, "non-decreasing"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] pooled difference rises monotonically "
+          f"with the true effect, crossing zero once")
+
+
+# -- 1o. Bertrand's paradox -----------------------------------------------------
+def mc_bertrand(method, c, n=2_000_000, seed=3131, radius=1.0):
+    """Monte Carlo that implements the three sampling rules *geometrically*
+    and reads the chord length off the two endpoints with Pythagoras -- no
+    reference to any of the closed forms, which is the whole point: a
+    simulation that reused `1 - c^2` would only prove `1 - c^2 == 1 - c^2`.
+
+    Returns (fraction longer than 2Rc, mean length, midpoint distances / R).
+    """
+    rng = np.random.default_rng(seed)
+    if method == "endpoints":
+        a1 = rng.random(n) * 2 * math.pi
+        a2 = rng.random(n) * 2 * math.pi
+        x1, y1 = radius * np.cos(a1), radius * np.sin(a1)
+        x2, y2 = radius * np.cos(a2), radius * np.sin(a2)
+    else:
+        phi = rng.random(n) * 2 * math.pi
+        if method == "radius":
+            # Uniform along a uniformly chosen radius.
+            d = radius * rng.random(n)
+        elif method == "midpoint":
+            # Uniform over the disc, by rejection sampling in the bounding
+            # square -- deliberately not the sqrt() inverse-CDF trick the
+            # sampler in analytics.py uses, so the two cannot share a bug.
+            xs, ys = [], []
+            need = n
+            while need > 0:
+                bx = rng.random(need * 2) * 2 - 1
+                by = rng.random(need * 2) * 2 - 1
+                keep = bx * bx + by * by <= 1.0
+                xs.append(bx[keep]); ys.append(by[keep])
+                need -= int(keep.sum())
+            mxa = np.concatenate(xs)[:n] * radius
+            mya = np.concatenate(ys)[:n] * radius
+            d = np.hypot(mxa, mya)
+            phi = np.arctan2(mya, mxa)
+        else:
+            raise ValueError(method)
+        mx, my = d * np.cos(phi), d * np.sin(phi)
+        half = np.sqrt(np.maximum(0.0, radius * radius - d * d))
+        dx, dy = -np.sin(phi), np.cos(phi)
+        x1, y1 = mx + half * dx, my + half * dy
+        x2, y2 = mx - half * dx, my - half * dy
+    length = np.hypot(x2 - x1, y2 - y1)
+    u = np.hypot(0.5 * (x1 + x2), 0.5 * (y1 + y2)) / radius
+    return float((length > 2.0 * radius * c).mean()), float(length.mean()), u
+
+
+def verify_bertrand():
+    print("\nBertrand's paradox: three closed forms vs three geometric Monte Carlos")
+    root3_2 = math.sqrt(3.0) / 2.0
+    for c in (root3_2, 0.5, 0.25, 0.95):
+        print(f"\n  c = L/(2R) = {c:.6f}")
+        for method in A.BERTRAND_METHODS:
+            got, mean_len, u = mc_bertrand(method, c)
+            want = A.bertrand_prob(method, c)
+            # Absolute tolerance: probabilities, ~3.5e-4 standard error at 2M.
+            check(f"P(long) {method}", got, want, tol=3e-3)
+            check(f"E[length] {method}", mean_len,
+                  A.bertrand_mean_length(method, 1.0), tol=3e-3)
+            # The midpoint-distance CDF is what a scatter of the three clouds
+            # actually shows, so check it away from the one threshold above.
+            for t in (0.2, 0.5, 0.8):
+                check(f"F_u({t}) {method}", float((u <= t).mean()),
+                      A.bertrand_midpoint_cdf(method, t), tol=3e-3)
+
+    print("\n  the classical identity at c = sqrt(3)/2 (inscribed triangle's side)")
+    check("random endpoints = 1/3", A.bertrand_prob_endpoints(root3_2), 1.0 / 3.0,
+          tol=1e-12)
+    check("random radius    = 1/2", A.bertrand_prob_radius(root3_2), 1.0 / 2.0,
+          tol=1e-12)
+    check("random midpoint  = 1/4", A.bertrand_prob_midpoint(root3_2), 1.0 / 4.0,
+          tol=1e-12)
+
+    print("\n  structural identities")
+    for c in (0.1, root3_2, 0.5, 0.9, 0.999):
+        thresh = A.bertrand_threshold(c)
+        for method in A.BERTRAND_METHODS:
+            check(f"P = F_u(sqrt(1-c^2)) {method} c={c:.4f}",
+                  A.bertrand_prob(method, c),
+                  A.bertrand_midpoint_cdf(method, thresh), tol=1e-12)
+    check("c -> 0: every rule says 'certainly longer' (endpoints)",
+          A.bertrand_prob_endpoints(0.0), 1.0)
+    check("c -> 1: every rule says 'never longer' (midpoint)",
+          A.bertrand_prob_midpoint(1.0), 0.0)
+
+    # The random-radius rule is the most generous everywhere in (0,1):
+    # sqrt(1-c^2) > 1-c^2 trivially, and with c = sin(theta) the comparison
+    # against the endpoints rule is cos(theta) > 1 - 2*theta/pi, which holds
+    # strictly on (0, pi/2) and touches only at the two ends.
+    bad = 0
+    for i in range(1, 1000):
+        c = i / 1000.0
+        pe, pr, pm = (A.bertrand_prob_endpoints(c), A.bertrand_prob_radius(c),
+                      A.bertrand_prob_midpoint(c))
+        if not (pr > pm and pr > pe):
+            bad += 1
+    ok = bad == 0
+    if not ok:
+        FAILURES.append(("random radius is the largest answer on (0,1)", bad, 0))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] the random-radius rule gives the "
+          f"largest probability at all 999 interior c values")
+
+    # The other two DO cross, which an earlier version of this check wrongly
+    # asserted they did not: P_midpoint = 1 - c^2 beats P_endpoints for small
+    # c and loses for large c, swapping where c^2 = (2/pi) arcsin c. So there
+    # is no fixed ranking of the three rules -- only the radius rule keeps its
+    # place -- and the crossing sits below the classical c = sqrt(3)/2, which
+    # is why the classical statement reads 1/3 > 1/4 rather than the other way
+    # round.
+    lo, hi = 0.3, 0.99
+    gap = lambda x: A.bertrand_prob_midpoint(x) - A.bertrand_prob_endpoints(x)
+    ok = gap(lo) > 0 > gap(hi)
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if gap(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    cross = 0.5 * (lo + hi)
+    ok = ok and abs(gap(cross)) < 1e-12 and cross < root3_2
+    if not ok:
+        FAILURES.append(("midpoint and endpoints cross exactly once below "
+                         "sqrt(3)/2", cross, "a root in (0.3, 0.99)"))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] P_midpoint and P_endpoints swap "
+          f"order at c = {cross:.9f} (below the classical {root3_2:.6f}), so "
+          f"only the radius rule has a fixed place in the ranking")
+
+    # And that root is exactly 1/sqrt(2): c^2 = (2/pi) arcsin c has the
+    # solution arcsin c = pi/4, where both rules give exactly 1/2. Found
+    # numerically first, then recognised -- so it is asserted as an identity
+    # rather than as "the bisection landed near 0.7071".
+    inv_root2 = 1.0 / math.sqrt(2.0)
+    check("the crossing is exactly 1/sqrt(2)", cross, inv_root2, tol=1e-12)
+    check("P_midpoint(1/sqrt2) = 1/2", A.bertrand_prob_midpoint(inv_root2), 0.5,
+          tol=1e-12)
+    check("P_endpoints(1/sqrt2) = 1/2", A.bertrand_prob_endpoints(inv_root2), 0.5,
+          tol=1e-12)
+
+    print("\n  the seeded samplers reproduce their own rules")
+    for method in A.BERTRAND_METHODS:
+        emp = A.bertrand_empirical(method, n=60000, radius=1.0, c=root3_2, seed=4242)
+        check(f"seeded sample P(long) {method}", emp,
+              A.bertrand_prob(method, root3_2), tol=8e-3)
+    # Geometry sanity: every sampled chord's endpoints sit on the circle, and
+    # its midpoint is where the sampler says it is.
+    bad = 0
+    for method in A.BERTRAND_METHODS:
+        for ch in A.bertrand_sample(method, n=500, radius=2.5, c=root3_2, seed=11):
+            r1 = math.hypot(ch["x1"], ch["y1"])
+            r2 = math.hypot(ch["x2"], ch["y2"])
+            mid = math.hypot(0.5 * (ch["x1"] + ch["x2"]),
+                             0.5 * (ch["y1"] + ch["y2"]))
+            leng = math.hypot(ch["x2"] - ch["x1"], ch["y2"] - ch["y1"])
+            if (abs(r1 - 2.5) > 1e-9 or abs(r2 - 2.5) > 1e-9
+                    or abs(mid - 2.5 * ch["u"]) > 1e-9
+                    or abs(leng - ch["length"]) > 1e-9):
+                bad += 1
+    ok = bad == 0
+    if not ok:
+        FAILURES.append(("sampled chords are chords", bad, 0))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] 1500 sampled chords: both endpoints on "
+          f"the circle, reported midpoint distance and length match the geometry")
+
+
 # -- 2. golden values for the JS engine --------------------------------------
 GOLDEN_CASES = [
     dict(w0=100.0, rounds=100, p=0.5, up=1.5, down=0.6, f=1.0),
@@ -871,6 +1863,59 @@ INS_GOLDEN = [
          hazard=0.02, members=200),
 ]
 
+
+PA_GOLDEN = [
+    dict(q=0.5, eps=0.005, p_bad=0.1, p_good=0.75),
+    dict(q=0.0, eps=0.005, p_bad=0.1, p_good=0.75),
+    dict(q=1.0, eps=0.005, p_bad=0.1, p_good=0.75),
+    dict(q=0.6, eps=0.01, p_bad=0.15, p_good=0.7),
+]
+
+BR_GOLDEN = [
+    dict(prior=0.01, sens=0.95, spec=0.95, population=1000),
+    dict(prior=0.1, sens=0.9, spec=0.8, population=1000),
+    dict(prior=0.001, sens=0.99, spec=0.99, population=100000),
+]
+
+BD_GOLDEN = [
+    dict(n=23, days=365.0, bits=8),
+    dict(n=10, days=365.0, bits=16),
+    dict(n=50, days=1000.0, bits=32),
+]
+
+SEC_GOLDEN = [
+    dict(s=37, n=100),
+    dict(s=7, n=20),
+    dict(s=0, n=50),
+]
+
+TE_GOLDEN = [
+    dict(x=100.0, rate=0.01),
+    dict(x=500.0, rate=0.01),
+    dict(x=50.0, rate=0.05),
+]
+
+SIMPSONS_GOLDEN = [
+    dict(p_easy=0.9, p_hard=0.4, delta=0.05, w_a=0.2, w_b=0.8, n_a=200, n_b=200),
+    dict(p_easy=0.7, p_hard=0.3, delta=0.15, w_a=0.35, w_b=0.65, n_a=137, n_b=91),
+    # delta above the critical value: no reversal, so the JS side is checked
+    # on the false branch as well as the true one.
+    dict(p_easy=0.9, p_hard=0.4, delta=0.35, w_a=0.2, w_b=0.8, n_a=50, n_b=50),
+    # w_a == w_b: delta_critical is exactly zero, the degenerate boundary.
+    dict(p_easy=0.8, p_hard=0.2, delta=0.05, w_a=0.5, w_b=0.5, n_a=100, n_b=100),
+]
+
+BERTRAND_GOLDEN = [
+    dict(c=math.sqrt(3.0) / 2.0, radius=1.0, n=200, seed=7),   # the classic
+    dict(c=0.5, radius=1.0, n=120, seed=7),
+    dict(c=0.25, radius=2.5, n=80, seed=99),
+]
+
+OS_GOLDEN = [
+    dict(looks=40, batch=20, alpha=0.05),
+    dict(looks=10, batch=50, alpha=0.05),
+    dict(looks=20, batch=10, alpha=0.10),
+]
 
 WHEEL_BS_GOLDEN = [
     dict(s=100.0, k=95.0, t=0.5, sigma=0.24, r=0.03, q=0.0, mu=0.08),
@@ -928,6 +1973,22 @@ def emit_golden():
                 "q95": s["q95"],
                 "kellyF": s["kelly_f"],
                 "sigmaLog": s["sigma_log"],
+                # medianHalfLife and doublingTime are +Infinity in the cases
+                # where the typical path is not decaying / not growing. json
+                # writes the bare token `Infinity`, which is invalid JSON and
+                # valid JavaScript -- golden.js is loaded as a script, and
+                # tests.html's default comparison already has a non-finite
+                # equality branch, the same one St Petersburg's `expected`
+                # relies on.
+                "arithmeticMultiplier": s["arithmetic_multiplier"],
+                "geometricMultiplier": s["geometric_multiplier"],
+                "volatilityDrag": s["volatility_drag"],
+                "medianHalfLife": s["median_half_life"],
+                "breakEvenHeads": s["break_even_heads"],
+                "expectedHeads": s["expected_heads"],
+                "kellyGrowth": s["kelly_growth"],
+                "zeroGrowthF": s["zero_growth_f"],
+                "doublingTime": s["doubling_time"],
             },
         })
 
@@ -1005,6 +2066,8 @@ def emit_golden():
                 "contribution5": A.sp_tier_contribution(5, c["p"], c["m"]),
                 "sd": s["sd"],
                 "m2p": s["m2p"],
+                "logUtility": s["log_utility"],
+                "certaintyEquivalent": s["certainty_equivalent"],
             },
         })
 
@@ -1068,6 +2131,8 @@ def emit_golden():
                 "harvest": s["harvest"],
                 "bestInterval": s["best_interval"], "bestGrowth": s["best_growth"],
                 "kellyW": s["kelly_w"],
+                "harvestContinuous": s["harvest_continuous"],
+                "optimalWeight": s["optimal_weight"],
             },
             "intervalCurve": {"xs": cxs, "gs": cgs},
         })
@@ -1116,6 +2181,183 @@ def emit_golden():
             },
             "premiumCurve": {"xs": pxs, "buyer": pbuy, "seller": psell},
             "poolCurve": {"sizes": psizes, "growth": pgrowth},
+        })
+
+    # -- Parrondo's paradox ---------------------------------------------------
+    parrondo = []
+    for c in PA_GOLDEN:
+        s = A.pa_summary(**c)
+        qs, drifts = A.pa_drift_curve(c["eps"], c["p_bad"], c["p_good"], points=21)
+        parrondo.append({
+            "params": c,
+            "expect": {
+                "driftA": s["drift_a"], "driftB": s["drift_b"],
+                "driftMix": s["drift_mix"], "bestQ": s["best_q"],
+                "bestDrift": s["best_drift"], "paradox": s["paradox"],
+            },
+            "driftCurve": {"qs": qs, "drifts": drifts},
+        })
+
+    pa_cfg = dict(n_paths=4, rounds=60, q=0.5, eps=0.005, p_bad=0.1, p_good=0.75,
+                  w0=0, seed=7)
+    pa_a, pa_b, pa_mix = A.simulate_parrondo(**pa_cfg)
+    parrondo_sim = {
+        "config": pa_cfg,
+        "firstA": pa_a[0], "firstB": pa_b[0], "firstMix": pa_mix[0],
+        "termA": [p[-1] for p in pa_a], "termB": [p[-1] for p in pa_b],
+        "termMix": [p[-1] for p in pa_mix],
+    }
+
+    # -- base rates -------------------------------------------------------------
+    baserates = []
+    for c in BR_GOLDEN:
+        s = A.br_summary(**c)
+        pxs, pys = A.br_prevalence_curve(c["sens"], c["spec"], points=40)
+        baserates.append({
+            "params": c,
+            "expect": {
+                "posteriorPos": s["posterior_pos"], "posteriorNeg": s["posterior_neg"],
+                "tp": s["tp"], "fp": s["fp"], "fn": s["fn"], "tn": s["tn"],
+                "positives": s["positives"], "precision": s["precision"],
+            },
+            "prevalenceCurve": {"xs": pxs, "ys": pys},
+        })
+
+    # -- the birthday problem -----------------------------------------------
+    birthday = []
+    for c in BD_GOLDEN:
+        s = A.bd_summary(**c)
+        cxs, cys = A.bd_collision_curve(c["days"], max_n=80)
+        bxs, bys = A.bd_hash_bits_curve(min_bits=8, max_bits=64, points=20)
+        birthday.append({
+            "params": c,
+            "expect": {
+                "collisionProb": s["collision_prob"], "pairs": s["pairs"],
+                "halfLifeN": s["half_life_n"], "hashN50": s["hash_n50"],
+            },
+            "collisionCurve": {"xs": cxs, "ys": cys},
+            "hashBitsCurve": {"xs": bxs, "ys": bys},
+        })
+
+    # -- the secretary problem -----------------------------------------------
+    secretary = []
+    for c in SEC_GOLDEN:
+        s = A.sec_summary(**c)
+        wxs, wys = A.sec_win_curve(c["n"])
+        secretary.append({
+            "params": c,
+            "expect": {
+                "winProb": s["win_prob"], "bestS": s["best_s"],
+                "bestProb": s["best_prob"], "bestFraction": s["best_fraction"],
+                "invE": s["inv_e"],
+            },
+            "winCurve": {"xs": wxs, "ys": wys},
+        })
+
+    asym_ns, asym_ys = A.sec_asymptotic_curve(min_n=5, max_n=500, points=30)
+    secretary_asymptotic = {"ns": asym_ns, "ys": asym_ys}
+
+    # -- the two-envelope paradox ---------------------------------------------
+    twoenv = []
+    for c in TE_GOLDEN:
+        s = A.te_summary(**c)
+        gxs, ggains, gprobs = A.te_gain_curve(c["rate"], points=40)
+        twoenv.append({
+            "params": c,
+            "expect": {
+                "pSmaller": s["p_smaller"], "swapGain": s["swap_gain"],
+                "crossover": s["crossover"], "meanSmaller": s["mean_smaller"],
+                "shouldSwap": s["should_swap"],
+            },
+            "gainCurve": {"xs": gxs, "gains": ggains, "probs": gprobs},
+        })
+
+    # -- optional stopping ----------------------------------------------------
+    optstop = []
+    for c in OS_GOLDEN:
+        s = A.os_summary(**c)
+        cxs, cys = A.os_false_positive_curve(c["looks"], c["batch"], c["alpha"])
+        optstop.append({
+            "params": c,
+            "expect": {
+                "cumFp": s["cum_fp"], "nominalAlpha": s["nominal_alpha"],
+                "bonferroniAlpha": s["bonferroni_alpha"], "totalN": s["total_n"],
+                "zCrit": s["z_crit"],
+            },
+            "fpCurve": {"xs": cxs, "ys": cys},
+        })
+
+    os_cfg = dict(n_paths=4, looks=10, batch=20, alpha=0.05, seed=7)
+    os_z, os_first_sig = A.simulate_optional_stopping(**os_cfg)
+    optstop_sim = {
+        "config": os_cfg, "zPaths": os_z, "firstSig": os_first_sig,
+    }
+
+    # -- Simpson's paradox ----------------------------------------------------
+    # `params` is emitted in camelCase because tests.html hands it straight to
+    # EP.simpsonsSummary(p); the Python call above uses the snake_case case
+    # dict. Same split the wheel's config already needs.
+    simpsons = []
+    for c in SIMPSONS_GOLDEN:
+        s = A.simpsons_summary(**c)
+        k = s["counts"]
+        dxs, dys = A.simpsons_delta_curve(c["p_easy"], c["p_hard"], c["w_a"],
+                                          c["w_b"], points=41)
+        simpsons.append({
+            "params": {
+                "pEasy": c["p_easy"], "pHard": c["p_hard"], "delta": c["delta"],
+                "wA": c["w_a"], "wB": c["w_b"], "nA": c["n_a"], "nB": c["n_b"],
+            },
+            "expect": {
+                "rateEasyA": s["rate_easy_a"], "rateHardA": s["rate_hard_a"],
+                "rateEasyB": s["rate_easy_b"], "rateHardB": s["rate_hard_b"],
+                "pooledA": s["pooled_a"], "pooledB": s["pooled_b"],
+                "subgroupDiff": s["subgroup_diff"], "pooledDiff": s["pooled_diff"],
+                "deltaCritical": s["delta_critical"], "reverses": s["reverses"],
+                "allocationGap": s["allocation_gap"],
+                "difficultyGap": s["difficulty_gap"],
+            },
+            "counts": {
+                "easyA": k["easy_a"], "hardA": k["hard_a"], "nA": k["n_a"],
+                "easyB": k["easy_b"], "hardB": k["hard_b"], "nB": k["n_b"],
+                "succEasyA": k["succ_easy_a"], "succHardA": k["succ_hard_a"],
+                "succA": k["succ_a"],
+                "succEasyB": k["succ_easy_b"], "succHardB": k["succ_hard_b"],
+                "succB": k["succ_b"],
+                "rateEasyA": k["rate_easy_a"], "rateHardA": k["rate_hard_a"],
+                "rateEasyB": k["rate_easy_b"], "rateHardB": k["rate_hard_b"],
+                "rateA": k["rate_a"], "rateB": k["rate_b"],
+            },
+            "deltaCurve": {"xs": dxs, "ys": dys},
+        })
+
+    # -- Bertrand's paradox ---------------------------------------------------
+    bertrand = []
+    for c in BERTRAND_GOLDEN:
+        s = A.bertrand_summary(**c)
+        ts, ce, cr, cm = A.bertrand_cdf_curve(points=41)
+        cs, pe, pr_, pm = A.bertrand_c_curve(points=41)
+        samples = {}
+        for m in A.BERTRAND_METHODS:
+            chords = A.bertrand_sample(m, n=6, radius=c["radius"], c=c["c"],
+                                       seed=c["seed"])
+            samples[m] = chords
+        bertrand.append({
+            "params": c,
+            "expect": {
+                "c": s["c"], "length": s["length"], "threshold": s["threshold"],
+                "pEndpoints": s["p_endpoints"], "pRadius": s["p_radius"],
+                "pMidpoint": s["p_midpoint"], "spread": s["spread"],
+                "meanLenEndpoints": s["mean_len_endpoints"],
+                "meanLenRadius": s["mean_len_radius"],
+                "meanLenMidpoint": s["mean_len_midpoint"],
+                "empEndpoints": s["emp_endpoints"], "empRadius": s["emp_radius"],
+                "empMidpoint": s["emp_midpoint"],
+                "classicC": s["classic_c"], "isClassic": s["is_classic"],
+            },
+            "cdfCurve": {"ts": ts, "endpoints": ce, "radius": cr, "midpoint": cm},
+            "cCurve": {"cs": cs, "endpoints": pe, "radius": pr_, "midpoint": pm},
+            "samples": samples,
         })
 
     # -- the wheel strategy ---------------------------------------------------
@@ -1206,6 +2448,13 @@ def emit_golden():
         "monty": monty, "montySim": monty_sim,
         "shannon": shannon, "shannonSim": sd_sim,
         "insurance": insurance,
+        "parrondo": parrondo, "parrondoSim": parrondo_sim,
+        "baserates": baserates,
+        "birthday": birthday,
+        "secretary": secretary, "secretaryAsymptotic": secretary_asymptotic,
+        "twoenv": twoenv,
+        "optstop": optstop, "optstopSim": optstop_sim,
+        "simpsons": simpsons, "bertrand": bertrand,
         "wheelBs": wheel_bs, "hold": hold, "normals": normals,
         "wheelSim": wheel_sim, "wheelSweep": wheel_sweep,
     }
@@ -1220,7 +2469,11 @@ def emit_golden():
     print(f"  wrote {out} ({len(cases)} coin cases, {len(ruin)} ruin cases, "
           f"{len(stpete)} St Petersburg cases, {len(pd)} dilemma cases, "
           f"{len(monty)} Monty Hall cases, {len(shannon)} Shannon cases, "
-          f"{len(insurance)} insurance cases, "
+          f"{len(insurance)} insurance cases, {len(parrondo)} Parrondo cases, "
+          f"{len(baserates)} base-rate cases, {len(birthday)} birthday cases, "
+          f"{len(secretary)} secretary cases, {len(twoenv)} two-envelope cases, "
+          f"{len(optstop)} optional-stopping cases, "
+          f"{len(simpsons)} Simpson cases, {len(bertrand)} Bertrand cases, "
           f"{len(prng)} PRNG streams, {len(binom)} binomial points)")
 
 
@@ -1234,6 +2487,14 @@ if __name__ == "__main__":
     verify_shannon()
     verify_insurance()
     verify_wheel()
+    verify_parrondo()
+    verify_base_rates()
+    verify_birthday()
+    verify_secretary()
+    verify_two_envelope()
+    verify_optional_stopping()
+    verify_simpsons()
+    verify_bertrand()
     emit_golden()
 
     print()

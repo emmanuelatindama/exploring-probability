@@ -39,7 +39,12 @@ criterion, and the second scenario shows where it comes from.
 - **Shannon's demon** — harvesting a growth rate out of a stock that goes nowhere
 - **Insurance and risk pooling** — a contract with negative expected value that both sides are right to sign
 - **The wheel strategy** — selling cash-secured puts and covered calls, against holding the stock outright; can run on a simulated stock or on real daily prices (5 indices, 20 stocks, 2009–present)
-- *Parrondo's paradox*, *base rates*, *the birthday problem*, *the secretary problem*, *the two-envelope paradox*, *optional stopping* — declared, not yet built
+- **Parrondo's paradox** — two losing games mixed into a winning one, via a 3-state Markov chain's stationary distribution
+- **Base rates and the 95% test** — Bayes' theorem, shown as both probabilities and a population of people
+- **The birthday problem** — collision odds among n people, extended to cryptographic hash lengths
+- **The secretary problem** — optimal stopping over a random permutation, converging to 1/e
+- **The two-envelope paradox** — the "always swap" argument dissolves once a real prior replaces the improper one it needs
+- **Optional stopping** — repeated significance testing as gambler's ruin, with a boundary that moves outward instead of sitting still
 
 ## Running it locally
 

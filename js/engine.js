@@ -93,6 +93,58 @@ window.EP = window.EP || {};
     return p * Math.log(mu) + (1 - p) * Math.log(md);
   }
 
+  /** E[m] = p*mUp + (1-p)*mDown -- the ensemble multiplier. Exact.
+   *  Mirrors lab/analytics.py:arithmetic_mean_multiplier. */
+  function arithmeticMeanMultiplier(p, up, down, f) {
+    const [mu, md] = multipliers(up, down, f);
+    return p * mu + (1 - p) * md;
+  }
+
+  /** G = mUp^p * mDown^(1-p) -- the multiplier the typical path compounds at.
+   *  Exact; ln G is timeGrowth. Zero when either outcome is non-positive, which
+   *  matches timeGrowth's -Infinity. Mirrors
+   *  lab/analytics.py:geometric_mean_multiplier. */
+  function geometricMeanMultiplier(p, up, down, f) {
+    const [mu, md] = multipliers(up, down, f);
+    if (mu <= 0 || md <= 0) return 0;
+    return Math.pow(mu, p) * Math.pow(md, 1 - p);
+  }
+
+  /** E[m] - G: the AM-GM gap, >= 0 always and zero only when mUp === mDown.
+   *  Mirrors lab/analytics.py:volatility_drag. */
+  function volatilityDrag(p, up, down, f) {
+    return arithmeticMeanMultiplier(p, up, down, f)
+         - geometricMeanMultiplier(p, up, down, f);
+  }
+
+  /** Rounds for the typical (geometric-mean) path to halve: ln(2)/|ln G|.
+   *
+   *  Exact for the trajectory w0*G^T. Sign convention: positive rounds when
+   *  G < 1 (the typical path is decaying) and +Infinity when G >= 1, where
+   *  there is no halving at all -- see doublingTime for the growing case.
+   *  Mirrors lab/analytics.py:median_half_life. */
+  function medianHalfLife(p, up, down, f) {
+    const g = geometricMeanMultiplier(p, up, down, f);
+    if (g <= 0) return 0;
+    if (g >= 1) return Infinity;
+    return Math.LN2 / Math.abs(Math.log(g));
+  }
+
+  /** Heads needed over `rounds` to finish at or above the starting stake:
+   *  k >= T * ln(1/mDown) / ln(mUp/mDown). Returned unrounded on purpose, to be
+   *  read against summary()'s expectedHeads. Degenerate mUp === mDown and
+   *  mDown <= 0 cases are handled without dividing by zero.
+   *  Mirrors lab/analytics.py:break_even_heads. */
+  function breakEvenHeads(rounds, p, up, down, f) {
+    const T = rounds;
+    const [mu, md] = multipliers(up, down, f);
+    if (md <= 0) return mu >= 1 ? T : Infinity;
+    if (mu <= 0) return Infinity;
+    const lu = Math.log(mu), ld = Math.log(md);
+    if (lu === ld) return ld >= 0 ? 0 : Infinity;
+    return T * (-ld) / (lu - ld);
+  }
+
   function expectedFinal(w0, rounds, p, up, down, f) {
     return w0 * Math.pow(1 + ensembleGrowth(p, up, down, f), rounds);
   }
@@ -126,9 +178,62 @@ window.EP = window.EP || {};
   /** Bet fraction maximising time growth: f* = (p*a - q*b) / (a*b). */
   function kellyFraction(p, up, down) {
     const a = up - 1, b = 1 - down, q = 1 - p;
-    if (a <= 0 || b <= 0) return NaN;
+    // Both degenerate coins are reachable from the sliders and the closed
+    // form divides by a*b. a = 0 is "nothing to win, stake nothing"; b = 0 is
+    // a free roll where Kelly is unbounded and only the f <= 1 cap binds --
+    // NOT an edgeless coin, which is what returning NaN used to imply.
+    if (a <= 0) return 0;
+    if (b <= 0) return p > 0 ? 1 : 0;
     const f = (p * a - q * b) / (a * b);
     return Math.max(0, Math.min(f, 1 / b - 1e-12));
+  }
+
+  // `growthAtFraction(f, p, up, down)` is not defined separately: it is exactly
+  // timeGrowth(p, up, down, f). Same choice as lab/analytics.py.
+
+  /** max_f timeGrowth -- the growth rate achieved at f*. Exact (a composition
+   *  of two closed forms). Mirrors lab/analytics.py:kelly_growth. */
+  function kellyGrowth(p, up, down) {
+    return timeGrowth(p, up, down, kellyFraction(p, up, down));
+  }
+
+  /**
+   * The positive f > f* at which timeGrowth returns to zero -- past it, staking
+   * more makes you poorer than not playing.
+   *
+   * EXACT ONLY AT p = 1/2, where (1+af)(1-bf) = 1 gives f0 = (a-b)/(ab) = 2f*.
+   * For any other p the equation (1+af)^p (1-bf)^(1-p) = 1 is transcendental,
+   * so this is a NUMERICAL ROOT FIND: bisection on [f*, 1/b), 200 halvings,
+   * stopping once the bracket is under `tol` = 1e-13. The loop is written in
+   * the same order as lab/analytics.py:zero_growth_fraction so both sides land
+   * on the same double. Returns 0 for a non-positive edge.
+   */
+  function zeroGrowthFraction(p, up, down, tol, iters) {
+    if (tol === undefined) tol = 1e-13;
+    if (iters === undefined) iters = 200;
+    const a = up - 1, b = 1 - down;
+    if (a <= 0 || b <= 0) return NaN;
+    const fStar = kellyFraction(p, up, down);
+    if (fStar <= 0) return 0;
+    if (Math.abs(p - 0.5) < 1e-15) return (a - b) / (a * b);
+    let lo = fStar;
+    let hi = (1 / b) * (1 - 1e-12);
+    if (lo >= hi || timeGrowth(p, up, down, hi) > 0) return hi;
+    for (let i = 0; i < iters; i++) {
+      if (hi - lo <= tol) break;
+      const mid = 0.5 * (lo + hi);
+      if (timeGrowth(p, up, down, mid) > 0) lo = mid; else hi = mid;
+    }
+    return 0.5 * (lo + hi);
+  }
+
+  /** Rounds for the typical path to double: ln(2)/E[ln m], +Infinity when the
+   *  time-average growth is not positive. Exact.
+   *  Mirrors lab/analytics.py:doubling_time. */
+  function doublingTime(p, up, down, f) {
+    const g = timeGrowth(p, up, down, f);
+    if (!isFinite(g) || g <= 0) return Infinity;
+    return Math.LN2 / g;
   }
 
   function sigmaLog(p, up, down, f) {
@@ -163,6 +268,19 @@ window.EP = window.EP || {};
       q95: quantileFinal(0.95, w0, rounds, p, up, down, f),
       kellyF: kellyFraction(p, up, down),
       sigmaLog: sigmaLog(p, up, down, f),
+      // The two multipliers whose disagreement is the whole scenario, and the
+      // AM-GM gap between them.
+      arithmeticMultiplier: arithmeticMeanMultiplier(p, up, down, f),
+      geometricMultiplier: geometricMeanMultiplier(p, up, down, f),
+      volatilityDrag: volatilityDrag(p, up, down, f),
+      medianHalfLife: medianHalfLife(p, up, down, f),
+      // breakEvenHeads next to expectedHeads is the "you need 55 and expect 50"
+      // comparison; breakEvenHeads is deliberately unrounded.
+      breakEvenHeads: breakEvenHeads(rounds, p, up, down, f),
+      expectedHeads: rounds * p,
+      kellyGrowth: kellyGrowth(p, up, down),
+      zeroGrowthF: zeroGrowthFraction(p, up, down),
+      doublingTime: doublingTime(p, up, down, f),
     };
   }
 
@@ -639,6 +757,31 @@ window.EP = window.EP || {};
     return (1 - p) * geo + Math.pow(p, L) * Math.pow(m, L - 1);
   }
 
+  /**
+   * E[ln X], Daniel Bernoulli's 1738 resolution. Exact, in closed form.
+   *
+   * X = m^(N-1) with N geometric, so E[ln X] = ln(m) * E[N-1] and
+   * E[N-1] = p/(1-p) by the standard Sum j x^j = x/(1-x)^2 identity. Hence
+   * E[ln X] = ln(m) * p/(1-p) -- convergent for every p < 1 and finite m,
+   * including the classic game whose E[X] is infinite.
+   * Mirrors lab/analytics.py:sp_log_utility.
+   */
+  function spLogUtility(p, m) {
+    if (m <= 0) return -Infinity;
+    if (p >= 1) return m > 1 ? Infinity : (m < 1 ? -Infinity : 0);
+    if (p <= 0) return 0;
+    return Math.log(m) * p / (1 - p);
+  }
+
+  /** exp(E[ln X]) = m^(p/(1-p)): what a log-utility player would swap the game
+   *  for. Exact. With this module's m^(N-1) payout convention the classic
+   *  p = 1/2, m = 2 game gives exactly $2.00; the "about $4" figure usually
+   *  quoted belongs to the 2^N statement of the game, which pays double at
+   *  every tier. Mirrors lab/analytics.py:sp_certainty_equivalent. */
+  function spCertaintyEquivalent(p, m) {
+    return Math.exp(spLogUtility(p, m));
+  }
+
   /** APPROXIMATION -- see the docstring in lab/analytics.py:sp_typical_mean. */
   function spTypicalMean(plays, p, m) {
     if (plays < 1 || p <= 0 || p >= 1) return spCappedExpected(p, m, 1);
@@ -672,6 +815,9 @@ window.EP = window.EP || {};
       sd,
       sdDivergent: !isFinite(sd),
       m2p: m * m * p,
+      // Bernoulli's own 1738 answer: E[ln X] converges where E[X] does not.
+      logUtility: spLogUtility(p, m),
+      certaintyEquivalent: spCertaintyEquivalent(p, m),
     };
   }
 
@@ -1144,6 +1290,32 @@ window.EP = window.EP || {};
     return [xs[best], gs[best]];
   }
 
+  /**
+   * APPROXIMATION -- the continuous-time rebalancing premium, w(1-w)sigma^2/2.
+   *
+   * NOT exact for the discrete binomial game this page simulates. It is the Ito
+   * result for a continuously rebalanced portfolio of a driftless GBM and cash;
+   * here sigma is taken as the per-period log move ln(1+vol), and the two agree
+   * only to O(sigma^2). The exact discrete answer is
+   * sdCycleGrowth(1, 0.5, vol, w, 0); lab/verify.py prints the gap between them
+   * rather than asserting equality.
+   * Mirrors lab/analytics.py:sd_harvest_continuous.
+   */
+  function sdHarvestContinuous(vol, w) {
+    const sigma = Math.log1p(Math.max(1e-9, vol));
+    return w * (1 - w) * sigma * sigma / 2;
+  }
+
+  /** The stock weight maximising growth. EXACT at interval = 1, where the
+   *  per-period growth is term-for-term the coin's timeGrowth with f = w, so
+   *  the maximiser is kellyFraction -- exactly 1/2 for the symmetric trendless
+   *  stock. An approximation for interval > 1, where the optimum drifts with
+   *  the cycle length. Mirrors lab/analytics.py:sd_optimal_weight. */
+  function sdOptimalWeight(p, vol) {
+    const [up, down] = sdMoves(vol);
+    return kellyFraction(p, up, down);
+  }
+
   function sdSummary(pr) {
     const { rounds, p, vol, w, interval, cost } = pr;
     const [up, down] = sdMoves(vol);
@@ -1162,6 +1334,10 @@ window.EP = window.EP || {};
       // The weight that harvests most is the Kelly fraction for this coin --
       // exactly 1/2 for a symmetric trendless stock, Shannon's rule on the page.
       kellyW: kellyFraction(p, up, down),
+      // APPROXIMATION -- the continuous-time identity, not the discrete game.
+      harvestContinuous: sdHarvestContinuous(vol, w),
+      // Exact at interval = 1; see sdOptimalWeight.
+      optimalWeight: sdOptimalWeight(p, vol),
     };
   }
 
@@ -1570,57 +1746,62 @@ window.EP = window.EP || {};
     return equity;
   }
 
-  /** The wheel, or with includeCalls=false the puts-only arm. A strict
-   *  single-position cycle: sell a cash-secured put, hold it to expiry, take
-   *  assignment if it finishes in the money, then write covered calls until
-   *  the shares are called away (or stopped out), and start over.
+  /** The wheel, or with includeCalls=false the puts-only arm. Tuned to
+   *  maximise time holding the stock: any idle cash sells a cash-secured put
+   *  whether or not shares are already held, a stub too small for a contract
+   *  buys stock outright, and covered calls are written only at a *record*
+   *  high -- a new maximum of the whole path so far, which is by construction
+   *  above every price that ever bought shares.
    *
-   *  Mirrors analytics.py:simulate_wheel. See that docstring for why the put
-   *  carries no stop while the shares do -- briefly, the put's premium is
-   *  banked up front so there is nothing to protect, and a stop on the put's
-   *  marked value blocks the assignment the strategy exists to get (a -30%,
-   *  -50% or -100% stop each produced zero assignments across the S&P's
-   *  2009-2026 history). */
+   *  Mirrors analytics.py:simulate_wheel. See that docstring for the two rule
+   *  sets this replaced and why each destroyed most of the return: gating put
+   *  re-entry on a dip left the S&P arm flat 95% of 2009-2026, and writing the
+   *  call the moment the shares arrived struck 100% of calls at the cost basis
+   *  (assignment happens with spot BELOW the strike that bought them, so
+   *  max(spot, basis) collapses to basis and being called away realises zero). */
   function simulateWheel(path, pr, includeCalls) {
     const { xMonths, yMonths, dipPct, sellHaircut, shareSl, callTp,
             sigmaIv, r, q, stockFeePct, optFee, w0 } = pr;
     const n = path.length - 1;
     const dt = 1 / TRADING_DAYS;
-    const window = Math.max(1, Math.round(xMonths * TRADING_DAYS_PER_MONTH));
     const putTenor = Math.max(1, Math.round(xMonths * TRADING_DAYS_PER_MONTH));
     const callTenor = Math.max(1, Math.round(yMonths * TRADING_DAYS_PER_MONTH));
 
     let cash = w0, collateral = 0, shares = 0, basis = 0;
     let putLot = null, callLot = null;
-    let dipArmed = true;
-    let forcePut = true; // day 1, and again the moment shares are given up
+    let recordHigh = path[0];
 
     const equity = new Float64Array(n + 1);
     equity[0] = w0;
     const events = [];
     const stats = { putsSold: 0, putsExpired: 0, assignments: 0,
       callsSold: 0, callsTp: 0, callsExpired: 0, calledAway: 0,
-      callsClosedOnStop: 0, sharesStopped: 0,
+      callsClosedOnStop: 0, sharesStopped: 0, sharesBought: 0,
       putsStillOpen: 0, callsStillOpen: 0 };
+
+    /** Fold a new lot into the share-weighted average cost basis. */
+    const addShares = (qty, price) => {
+      basis = (basis * shares + price * qty) / (shares + qty);
+      shares += qty;
+    };
 
     for (let t = 1; t <= n; t++) {
       const s = path[t];
       const g = Math.exp(r * dt);
       cash = cash * g + collateral * (g - 1);
 
-      let hi = -Infinity;
-      for (let i = Math.max(0, t - window); i <= t; i++) if (path[i] > hi) hi = path[i];
-      const dipLevel = hi * (1 - dipPct);
-      if (s > dipLevel) dipArmed = true;
+      // A *record* high: the running maximum of the whole path so far, not a
+      // rolling window. The only moment a covered call is written.
+      const atRecord = s >= recordHigh;
+      if (atRecord) recordHigh = s;
 
       // -- the put, held to expiry ---------------------------------------
-      if (shares === 0 && putLot !== null && t >= putLot.expiry) {
+      if (putLot !== null && t >= putLot.expiry) {
         const face = putLot.contracts * 100 * putLot.strike;
         collateral -= face;
         if (s < putLot.strike) {
           cash -= face * stockFeePct;
-          shares += putLot.contracts * 100;
-          basis = putLot.strike;
+          addShares(putLot.contracts * 100, putLot.strike);
           stats.assignments += putLot.contracts;
           events.push({ t, kind: "assigned", contracts: putLot.contracts,
             strike: putLot.strike });
@@ -1633,8 +1814,8 @@ window.EP = window.EP || {};
         putLot = null;
       }
 
-      if (shares === 0 && putLot === null
-          && (forcePut || (dipArmed && s <= dipLevel))) {
+      // -- any idle cash sells a put, long or flat ------------------------
+      if (putLot === null) {
         const strike = s;
         const nNew = Math.floor(cash / (100 * strike));
         if (nNew > 0) {
@@ -1646,9 +1827,16 @@ window.EP = window.EP || {};
           putLot = { contracts: nNew, premium, strike, expiry: t + putTenor };
           stats.putsSold += nNew;
           events.push({ t, kind: "sell_put", contracts: nNew, strike });
-          forcePut = false;
-          dipArmed = false;
         }
+      }
+
+      // -- the stub that can never sell a contract buys stock outright ----
+      const odd = Math.floor(cash / (s * (1 + stockFeePct)));
+      if (odd > 0) {
+        cash -= odd * s * (1 + stockFeePct);
+        addShares(odd, s);
+        stats.sharesBought += odd;
+        events.push({ t, kind: "buy_shares", contracts: odd, strike: s });
       }
 
       // -- the share stop, the strategy's only loss cap ------------------
@@ -1659,11 +1847,9 @@ window.EP = window.EP || {};
             ? bsCallPrice(s, callLot.strike, texp, sigmaIv, r, q)
             : Math.max(s - callLot.strike, 0);
           cash -= callLot.contracts * (100 * theo + optFee);
-          // Its own bucket: a call closed because the SHARES stopped out is
-          // neither a take-profit nor an expiry.
           stats.callsClosedOnStop += callLot.contracts;
-          events.push({ t, kind: "close_call_on_stop", contracts: callLot.contracts,
-            strike: callLot.strike });
+          events.push({ t, kind: "close_call_on_stop",
+            contracts: callLot.contracts, strike: callLot.strike });
           callLot = null;
         }
         cash += shares * s * (1 - stockFeePct);
@@ -1671,7 +1857,6 @@ window.EP = window.EP || {};
           strike: basis });
         shares = 0; basis = 0;
         stats.sharesStopped += 1;
-        forcePut = true;
       }
 
       // -- covered calls, only while long --------------------------------
@@ -1688,7 +1873,6 @@ window.EP = window.EP || {};
               stats.calledAway += callLot.contracts;
               events.push({ t, kind: "called_away", contracts: callLot.contracts,
                 strike: callLot.strike });
-              forcePut = true;
               if (shares === 0) basis = 0;
             } else {
               stats.callsExpired += callLot.contracts;
@@ -1705,10 +1889,11 @@ window.EP = window.EP || {};
           }
         }
 
-        if (callLot === null && shares >= 100) {
+        // Only at a record high, and never below the basis. At a record high
+        // the second condition is already implied -- it is kept as a live
+        // assertion of the invariant the whole rule exists to create.
+        if (callLot === null && shares >= 100 && atRecord && s > basis) {
           const nNew = Math.floor(shares / 100);
-          // Never struck below the basis: being called away should not be
-          // able to realise a loss on the shares.
           const strike = Math.max(s, basis);
           const theo = bsCallPrice(s, strike, callTenor / TRADING_DAYS, sigmaIv, r, q);
           const premium = theo * (1 - sellHaircut);
@@ -1727,15 +1912,7 @@ window.EP = window.EP || {};
 
     return { equity, events, stats };
   }
-  /** All four arms on one shared seeded price path -- a paired comparison, so
-   *  nearly all of the path's own randomness cancels out of the differences
-   *  between arms even though three of the four have no distribution of
-   *  their own to compare against.
-   *
-   *  pr.realPath, when present, is a real historical price series (already
-   *  rebased to start at pr.s0 by the scenario's derive()) and is used
-   *  verbatim in place of a simulated GBM path -- mu and the seed stop
-   *  mattering, since the path is no longer drawn from them. */
+
   function simulateWheelFamily(pr) {
     const path = pr.realPath || simulateGbmPath(pr);
     const wheel = simulateWheel(path, pr, true);
@@ -1826,11 +2003,781 @@ window.EP = window.EP || {};
     return { xs, gs };
   }
 
+  // ==========================================================================
+  // Parrondo's paradox -- mirrors lab/analytics.py section 9
+  // ==========================================================================
+  /** Game A: a flat, slightly unfavourable coin. P(win) = 1/2 - eps. */
+  const paWinProbA = (eps) => 0.5 - eps;
+
+  /** Game B: P(win) depends on capital mod 3 -- bad at residue 0, good
+   *  otherwise, both shifted down by eps so neither game gets an unfair edge
+   *  relative to the other. */
+  const paWinProbB = (residue, eps, pBad, pGood) =>
+    (((residue % 3) + 3) % 3 === 0 ? pBad : pGood) - eps;
+
+  /** P(win this round), mixing game B in with probability q each round. */
+  const paEffectiveWinProb = (residue, q, eps, pBad, pGood) =>
+    (1 - q) * paWinProbA(eps) + q * paWinProbB(residue, eps, pBad, pGood);
+
+  /** 3x3 transition matrix over capital mod 3, for the mixed strategy. */
+  function paTransition(q, eps, pBad, pGood) {
+    const P = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    for (let r = 0; r < 3; r++) {
+      const p = paEffectiveWinProb(r, q, eps, pBad, pGood);
+      P[r][(r + 1) % 3] += p;
+      P[r][(r + 2) % 3] += 1 - p; // (r - 1) mod 3
+    }
+    return P;
+  }
+
+  /**
+   * The stationary distribution over capital mod 3. Exact: solves a 3x3
+   * linear system (pi P = pi, sum pi = 1) by Cramer's rule rather than
+   * iterating power steps -- no numpy.linalg here, but a 3x3 solve has a
+   * short enough closed form to just write out.
+   */
+  function paStationary(q, eps, pBad, pGood) {
+    const P = paTransition(q, eps, pBad, pGood);
+    // (P^T - I) pi = 0, replace the (dependent) last row with sum(pi) = 1.
+    const M = [
+      [P[0][0] - 1, P[1][0], P[2][0]],
+      [P[0][1], P[1][1] - 1, P[2][1]],
+      [1, 1, 1],
+    ];
+    const b = [0, 0, 1];
+    const det = (m) =>
+      m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+      m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+      m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    const d = det(M);
+    const withCol = (col) => M.map((row, i) => row.map((v, j) => (j === col ? b[i] : v)));
+    return [0, 1, 2].map((col) => det(withCol(col)) / d);
+  }
+
+  /** E[capital change per round] under the mixed strategy. Exact. */
+  function paDrift(q, eps, pBad, pGood) {
+    const pi = paStationary(q, eps, pBad, pGood);
+    let drift = 0;
+    for (let r = 0; r < 3; r++) {
+      const p = paEffectiveWinProb(r, q, eps, pBad, pGood);
+      drift += pi[r] * (2 * p - 1);
+    }
+    return drift;
+  }
+
+  /** (q values, drift) swept over the mixing probability. Exact. */
+  function paDriftCurve(eps, pBad, pGood, points) {
+    const n = points || 101;
+    const qs = new Array(n), drifts = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const q = i / (n - 1);
+      qs[i] = q;
+      drifts[i] = paDrift(q, eps, pBad, pGood);
+    }
+    return [qs, drifts];
+  }
+
+  function paSummary(pr) {
+    const { q, eps, pBad, pGood } = pr;
+    const driftA = paDrift(0, eps, pBad, pGood);
+    const driftB = paDrift(1, eps, pBad, pGood);
+    const driftMix = paDrift(q, eps, pBad, pGood);
+    const [qs, drifts] = paDriftCurve(eps, pBad, pGood, 101);
+    let best = 0;
+    for (let i = 1; i < drifts.length; i++) if (drifts[i] > drifts[best]) best = i;
+    return {
+      driftA, driftB, driftMix,
+      bestQ: qs[best], bestDrift: drifts[best],
+      paradox: driftA < 0 && driftB < 0 && drifts[best] > 0,
+    };
+  }
+
+  /**
+   * Reference walk: three series sharing draw order every round -- game A
+   * alone, game B alone, and the q-mixed strategy -- mirroring
+   * lab/analytics.py:simulate_parrondo exactly, including its five
+   * unconditional draws per round.
+   */
+  function simulateParrondo(pr) {
+    const { nPaths, rounds, q, eps, pBad, pGood, w0, seed } = pr;
+    const rand = mulberry32(seed);
+    const pathsA = [], pathsB = [], pathsMix = [];
+    for (let i = 0; i < nPaths; i++) {
+      let xa = w0, xb = w0, xm = w0;
+      const pa = [xa], pb = [xb], pm = [xm];
+      for (let t = 0; t < rounds; t++) {
+        const ra = rand(), rb = rand(), rchoice = rand(), raMix = rand(), rbMix = rand();
+        xa += ra < paWinProbA(eps) ? 1 : -1;
+        xb += rb < paWinProbB(xb, eps, pBad, pGood) ? 1 : -1;
+        if (rchoice < q) {
+          xm += rbMix < paWinProbB(xm, eps, pBad, pGood) ? 1 : -1;
+        } else {
+          xm += raMix < paWinProbA(eps) ? 1 : -1;
+        }
+        pa.push(xa); pb.push(xb); pm.push(xm);
+      }
+      pathsA.push(pa); pathsB.push(pb); pathsMix.push(pm);
+    }
+    return { pathsA, pathsB, pathsMix };
+  }
+
+  // ==========================================================================
+  // Base rates -- mirrors lab/analytics.py section 10
+  // ==========================================================================
+  /** P(disease | positive test). Exact, by Bayes' theorem. */
+  function brPosteriorPositive(prior, sens, spec) {
+    const tp = sens * prior, fp = (1 - spec) * (1 - prior);
+    return tp + fp > 0 ? tp / (tp + fp) : 0;
+  }
+
+  /** P(disease | negative test). Exact -- the reassuring number. */
+  function brPosteriorNegative(prior, sens, spec) {
+    const fn = (1 - sens) * prior, tn = spec * (1 - prior);
+    return fn + tn > 0 ? fn / (fn + tn) : 0;
+  }
+
+  /** (TP, FP, FN, TN) among `population` people. Exact. */
+  function brCounts(prior, sens, spec, population) {
+    const n = population;
+    return [
+      n * prior * sens, n * (1 - prior) * (1 - spec),
+      n * prior * (1 - sens), n * (1 - prior) * spec,
+    ];
+  }
+
+  /** (prevalences, posterior P(disease|positive)) log-spaced from lo to hi. */
+  function brPrevalenceCurve(sens, spec, points, lo, hi) {
+    const n = points || 200;
+    const logLo = Math.log10(lo || 1e-4), logHi = Math.log10(hi || 0.5);
+    const xs = new Array(n), ys = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = Math.pow(10, logLo + (logHi - logLo) * i / (n - 1));
+      xs[i] = x;
+      ys[i] = brPosteriorPositive(x, sens, spec);
+    }
+    return [xs, ys];
+  }
+
+  function brSummary(pr) {
+    const { prior, sens, spec, population } = pr;
+    const [tp, fp, fn, tn] = brCounts(prior, sens, spec, population);
+    return {
+      posteriorPos: brPosteriorPositive(prior, sens, spec),
+      posteriorNeg: brPosteriorNegative(prior, sens, spec),
+      tp, fp, fn, tn,
+      positives: tp + fp,
+      precision: tp + fp > 0 ? tp / (tp + fp) : 0,
+    };
+  }
+
+  // ==========================================================================
+  // The birthday problem -- mirrors lab/analytics.py section 11
+  // ==========================================================================
+  /** ln P(no collision), exact via a sum of n log1p terms -- only the ratios
+   *  i/days are ever computed, so `days` can be an astronomically large
+   *  digest space without ever needing to exist as an ordinary number. */
+  function bdLogNoCollision(n, days) {
+    n = Math.round(n);
+    if (n <= 0) return 0;
+    let total = 0;
+    for (let i = 0; i < n; i++) total += Math.log1p(-i / days);
+    return total;
+  }
+
+  /** P(at least one shared birthday among n people, `days` days a year).
+   *  Exact; n > days is the pigeonhole certainty. */
+  function bdCollisionProb(n, days) {
+    if (n > days) return 1;
+    return 1 - Math.exp(bdLogNoCollision(n, days));
+  }
+
+  /** C(n, 2): how many pairs n people make. Exact. */
+  const bdPairs = (n) => (n * (n - 1)) / 2;
+
+  /** (n, P(collision)) for every group size from 1 to maxN. Exact. */
+  function bdCollisionCurve(days, maxN) {
+    const n = Math.round(maxN);
+    const xs = new Array(n), ys = new Array(n);
+    for (let i = 1; i <= n; i++) { xs[i - 1] = i; ys[i - 1] = bdCollisionProb(i, days); }
+    return [xs, ys];
+  }
+
+  /** Smallest n with P(collision) >= 0.5. Exact, scanning up from n=1. */
+  function bdHalfLifeN(days) {
+    let n = 1;
+    const cap = Math.round(days) + 1;
+    while (bdCollisionProb(n, days) < 0.5) {
+      n++;
+      if (n > cap) return n;
+    }
+    return n;
+  }
+
+  /** APPROXIMATION: n for 50% collision odds at a `bits`-bit digest -- see
+   *  lab/analytics.py:bd_hash_n50_approx for the derivation. Exact
+   *  enumeration is infeasible once bits exceeds ~40; this closed form gets
+   *  more accurate, not less, as bits grows. */
+  function bdHashN50Approx(bits) {
+    const days = Math.pow(2, bits);
+    return Math.sqrt(2 * days * Math.log(2));
+  }
+
+  /** (bits, approximate n for 50% collision odds) over a digest length. */
+  function bdHashBitsCurve(minBits, maxBits, points) {
+    const n = points || 57;
+    const xs = new Array(n), ys = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const b = minBits + (maxBits - minBits) * i / (n - 1);
+      xs[i] = b;
+      ys[i] = bdHashN50Approx(b);
+    }
+    return [xs, ys];
+  }
+
+  function bdSummary(pr) {
+    const { n, days, bits } = pr;
+    return {
+      collisionProb: bdCollisionProb(n, days),
+      pairs: bdPairs(n),
+      halfLifeN: bdHalfLifeN(days),
+      hashN50: bdHashN50Approx(bits),
+    };
+  }
+
+  // ==========================================================================
+  // The secretary problem -- mirrors lab/analytics.py section 12
+  // ==========================================================================
+  /** P(the classic secretary strategy picks the single best candidate).
+   *  Exact -- see lab/analytics.py:sec_win_prob for the derivation. */
+  function secWinProb(s, n) {
+    s = Math.round(s); n = Math.round(n);
+    if (n <= 0) return 0;
+    if (s <= 0) return 1 / n;
+    if (s >= n) return 0;
+    let sum = 0;
+    for (let i = s + 1; i <= n; i++) sum += 1 / (i - 1);
+    return (s / n) * sum;
+  }
+
+  /**
+   * (thresholds, win prob) for every skip count from 0 to n-1. Exact and
+   * vectorised the same way as the Python side: a single reversed running
+   * sum of 1/j gives every suffix sum sec_win_prob needs, so the whole curve
+   * is O(n) instead of O(n^2).
+   */
+  function secWinCurve(n) {
+    n = Math.round(n);
+    if (n <= 0) return [[], []];
+    if (n === 1) return [[0], [1]];
+    // suffix[j-1] = sum_{m=j}^{n-1} 1/m: walk j down from n-1, accumulating
+    // AFTER storing so each slot holds the sum from itself to the top.
+    const suffix = new Float64Array(n);
+    let acc = 0;
+    for (let j = n - 1; j >= 1; j--) {
+      acc += 1 / j;
+      suffix[j - 1] = acc;
+    }
+    const xs = new Array(n), ys = new Array(n);
+    xs[0] = 0; ys[0] = 1 / n;
+    for (let s = 1; s < n; s++) {
+      xs[s] = s;
+      ys[s] = (s / n) * suffix[s - 1];
+    }
+    return [xs, ys];
+  }
+
+  /** (best threshold, best win prob). Exact -- argmax over secWinCurve. */
+  function secOptimal(n) {
+    const [xs, ys] = secWinCurve(n);
+    let best = 0;
+    for (let i = 1; i < ys.length; i++) if (ys[i] > ys[best]) best = i;
+    return [xs[best], ys[best]];
+  }
+
+  /** (n, optimal win prob) over a range of n, showing convergence to 1/e. */
+  function secAsymptoticCurve(minN, maxN, points) {
+    const n = points || 100;
+    const seen = new Set();
+    const ns = [];
+    for (let i = 0; i < n; i++) {
+      const v = Math.round(minN + (maxN - minN) * i / Math.max(1, n - 1));
+      if (!seen.has(v)) { seen.add(v); ns.push(v); }
+    }
+    ns.sort((a, b) => a - b);
+    return [ns, ns.map((v) => secOptimal(v)[1])];
+  }
+
+  function secSummary(pr) {
+    const { s, n } = pr;
+    const [bestS, bestP] = secOptimal(n);
+    return {
+      winProb: secWinProb(s, n),
+      bestS, bestProb: bestP,
+      bestFraction: n > 0 ? bestS / n : 0,
+      invE: 1 / Math.E,
+    };
+  }
+
+  // ==========================================================================
+  // The two-envelope paradox -- mirrors lab/analytics.py section 13
+  // ==========================================================================
+  /** P(x is the smaller half | observed x), Exponential(rate) prior. Exact --
+   *  see lab/analytics.py:te_p_smaller for the Jacobian factor of 1/2 this
+   *  needs (X = 2S is a change of variables, not a plain density lookup). */
+  function tePSmaller(x, rate) {
+    if (x <= 0) return 1;
+    const u = Math.exp((rate * x) / 2);
+    return 1 / (1 + 0.5 * u);
+  }
+
+  /** E[gain from swapping | observed x]. Exact -- see
+   *  lab/analytics.py:te_swap_gain for the derivation. */
+  function teSwapGain(x, rate) {
+    if (x <= 0) return 0;
+    const pSmall = tePSmaller(x, rate);
+    return pSmall * x - (1 - pSmall) * (x / 2);
+  }
+
+  /** The amount above which swapping stops being worth it. Exact -- solves
+   *  p_smaller of the crossover = 1/3, which for this prior reduces to
+   *  exp(rate * crossover / 2) = 4. */
+  const teCrossover = (rate) => (4 * Math.log(2)) / rate;
+
+  /** (x values, expected swap gain, P(smaller|x)) swept over the amount
+   *  found. Exact at every point. */
+  function teGainCurve(rate, points, hi) {
+    const n = points || 200;
+    const top = hi || 6 / rate;
+    const xs = new Array(n), gains = new Array(n), probs = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = (top * i) / (n - 1);
+      xs[i] = x;
+      gains[i] = teSwapGain(x, rate);
+      probs[i] = tePSmaller(x, rate);
+    }
+    return [xs, gains, probs];
+  }
+
+  function teSummary(pr) {
+    const { x, rate } = pr;
+    return {
+      pSmaller: tePSmaller(x, rate),
+      swapGain: teSwapGain(x, rate),
+      crossover: teCrossover(rate),
+      meanSmaller: 1 / rate,
+      shouldSwap: teSwapGain(x, rate) > 0,
+    };
+  }
+
+  // ==========================================================================
+  // Optional stopping -- mirrors lab/analytics.py section 14
+  // ==========================================================================
+  /** Two-sided z critical value for a nominal per-look significance level.
+   *  Exact enough for this purpose via the same normPpf the wheel scenario
+   *  uses -- see engine.js's normPpf docstring for its own error bound. */
+  const osZThreshold = (alpha) => normPpf(1 - alpha / 2);
+
+  /**
+   * (look number, cumulative P(declared significant by this look)). Exact
+   * forward DP -- see lab/analytics.py:os_false_positive_curve for the full
+   * derivation. `live` holds P(heads=h AND never yet crossed the boundary)
+   * after each batch; binomWeights(batch, 0.5) is the fresh-batch kernel
+   * convolved in at every look, and whatever now sits outside the moving
+   * boundary is peeled into the cumulative total and zeroed so it cannot
+   * un-happen on a calmer later batch.
+   */
+  function osFalsePositiveCurve(looks, batch, alpha) {
+    looks = Math.round(looks); batch = Math.round(batch);
+    const z = osZThreshold(alpha);
+    const kernel = binomWeights(batch, 0.5);
+    let live = new Float64Array([1]);
+    let cumFp = 0;
+    const xs = new Array(looks), ys = new Array(looks);
+    for (let look = 1; look <= looks; look++) {
+      const next = new Float64Array(live.length + kernel.length - 1);
+      for (let i = 0; i < live.length; i++) {
+        if (live[i] === 0) continue;
+        for (let j = 0; j < kernel.length; j++) next[i + j] += live[i] * kernel[j];
+      }
+      const n = look * batch;
+      const boundary = z * Math.sqrt(n);
+      let newlySig = 0;
+      for (let h = 0; h < next.length; h++) {
+        const s = 2 * h - n;
+        if (Math.abs(s) >= boundary) { newlySig += next[h]; next[h] = 0; }
+      }
+      cumFp += newlySig;
+      live = next;
+      xs[look - 1] = look;
+      ys[look - 1] = cumFp;
+    }
+    return [xs, ys];
+  }
+
+  /** P(declared significant at least once in `looks` looks). Exact. */
+  function osFalsePositiveRate(looks, batch, alpha) {
+    const [, ys] = osFalsePositiveCurve(looks, batch, alpha);
+    return ys.length ? ys[ys.length - 1] : 0;
+  }
+
+  /** The per-look alpha that keeps the cumulative rate at nominal, to first
+   *  order -- a conservative Bonferroni bound, exact as such. */
+  const osBonferroniAlpha = (looks, alpha) => alpha / Math.max(1, Math.round(looks));
+
+  /**
+   * Reference walk: each path is looks*batch fair +-1 steps, sampled at every
+   * look boundary, mirroring lab/analytics.py:simulate_optional_stopping so
+   * the seeded z-statistics agree exactly.
+   */
+  function simulateOptionalStopping(pr) {
+    const { nPaths, looks, batch, alpha, seed } = pr;
+    const z = osZThreshold(alpha);
+    const rand = mulberry32(seed);
+    const n = looks * batch;
+    const allZ = [], firstSig = [];
+    for (let p = 0; p < nPaths; p++) {
+      let s = 0;
+      const zs = [];
+      let sigAt = null;
+      for (let step = 1; step <= n; step++) {
+        s += rand() < 0.5 ? 1 : -1;
+        if (step % batch === 0) {
+          const look = step / batch;
+          zs.push(s / Math.sqrt(step));
+          if (sigAt === null && Math.abs(s) >= z * Math.sqrt(step)) sigAt = look;
+        }
+      }
+      allZ.push(zs);
+      firstSig.push(sigAt);
+    }
+    return { allZ, firstSig };
+  }
+
+  function osSummary(pr) {
+    const { looks, batch, alpha } = pr;
+    const [, ys] = osFalsePositiveCurve(looks, batch, alpha);
+    return {
+      cumFp: ys.length ? ys[ys.length - 1] : 0,
+      nominalAlpha: alpha,
+      bonferroniAlpha: osBonferroniAlpha(looks, alpha),
+      totalN: looks * batch,
+      zCrit: osZThreshold(alpha),
+    };
+  }
+
+  // ==========================================================================
+  // Simpson's paradox -- mirrors lab/analytics.py section 15
+  // ==========================================================================
+  /** [A-easy, A-hard, B-easy, B-hard] success rates. Exact: A carries the
+   *  same true advantage `delta` in both subgroups. */
+  function simpsonsSubgroupRates(pEasy, pHard, delta) {
+    return [pEasy + delta, pHard + delta, pEasy, pHard];
+  }
+
+  /** [pooled A, pooled B]. Exact -- each subgroup pair averaged with that
+   *  treatment's own case mix, which is the step that loses the information. */
+  function simpsonsPooledRates(pEasy, pHard, delta, wA, wB) {
+    const [ae, ah, be, bh] = simpsonsSubgroupRates(pEasy, pHard, delta);
+    return [wA * ae + (1 - wA) * ah, wB * be + (1 - wB) * bh];
+  }
+
+  /** The true effect size at which the pooled comparison flips. Exact:
+   *  (w_b - w_a) * (p_easy - p_hard) -- the allocation gap times the
+   *  difficulty gap, independent of delta itself. */
+  const simpsonsDeltaCritical = (pEasy, pHard, wA, wB) =>
+    (wB - wA) * (pEasy - pHard);
+
+  /** pooled_A - pooled_B. Exact, and equal to delta - deltaCritical. */
+  function simpsonsPooledDiff(pEasy, pHard, delta, wA, wB) {
+    const [pa, pb] = simpsonsPooledRates(pEasy, pHard, delta, wA, wB);
+    return pa - pb;
+  }
+
+  /** True when the subgroup verdict (sign of delta) and the pooled verdict
+   *  (sign of delta - deltaCritical) disagree. Exact. */
+  function simpsonsReverses(pEasy, pHard, delta, wA, wB) {
+    const diff = simpsonsPooledDiff(pEasy, pHard, delta, wA, wB);
+    return (delta > 0 && diff < 0) || (delta < 0 && diff > 0);
+  }
+
+  /** floor(x + 0.5) -- the same half-up convention lab/analytics.py uses, so
+   *  a 50/50 split of an even group size rounds the same way on both sides. */
+  const roundHalfUp = (x) => Math.floor(x + 0.5);
+
+  /**
+   * The 2x2x2 table of whole-case counts behind the rates.
+   *
+   * Every total is a SUM of its own parts, never an independent rounding of
+   * the corresponding product -- `hardA` is `nA - easyA`, `succA` is
+   * `succEasyA + succHardA`. Rounding each cell separately is what makes a
+   * table whose parts sum to one more than its whole.
+   */
+  function simpsonsCounts(pEasy, pHard, delta, wA, wB, nA, nB) {
+    const [ae, ah, be, bh] = simpsonsSubgroupRates(pEasy, pHard, delta);
+    nA = Math.round(nA); nB = Math.round(nB);
+    const clamp = (v, hi) => Math.min(hi, Math.max(0, v));
+
+    const easyA = clamp(roundHalfUp(wA * nA), nA);
+    const hardA = nA - easyA;
+    const easyB = clamp(roundHalfUp(wB * nB), nB);
+    const hardB = nB - easyB;
+
+    const seA = clamp(roundHalfUp(ae * easyA), easyA);
+    const shA = clamp(roundHalfUp(ah * hardA), hardA);
+    const seB = clamp(roundHalfUp(be * easyB), easyB);
+    const shB = clamp(roundHalfUp(bh * hardB), hardB);
+
+    return {
+      easyA, hardA, nA, easyB, hardB, nB,
+      succEasyA: seA, succHardA: shA, succA: seA + shA,
+      succEasyB: seB, succHardB: shB, succB: seB + shB,
+      rateEasyA: easyA ? seA / easyA : 0,
+      rateHardA: hardA ? shA / hardA : 0,
+      rateEasyB: easyB ? seB / easyB : 0,
+      rateHardB: hardB ? shB / hardB : 0,
+      rateA: nA ? (seA + shA) / nA : 0,
+      rateB: nB ? (seB + shB) / nB : 0,
+    };
+  }
+
+  /** [delta values, pooled_A - pooled_B] over the true effect size. Exact --
+   *  a line of slope 1 crossing zero at deltaCritical. */
+  function simpsonsDeltaCurve(pEasy, pHard, wA, wB, points, lo, hi) {
+    const n = points || 101;
+    const crit = simpsonsDeltaCritical(pEasy, pHard, wA, wB);
+    const loV = lo === undefined || lo === null ? 0 : lo;
+    const hiV = hi === undefined || hi === null ? Math.max(2 * crit, 0.1) : hi;
+    const xs = new Array(n), ys = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const d = loV + (hiV - loV) * i / (n - 1);
+      xs[i] = d;
+      ys[i] = simpsonsPooledDiff(pEasy, pHard, d, wA, wB);
+    }
+    return [xs, ys];
+  }
+
+  function simpsonsSummary(pr) {
+    const { pEasy, pHard, delta, wA, wB, nA, nB } = pr;
+    const [ae, ah, be, bh] = simpsonsSubgroupRates(pEasy, pHard, delta);
+    const [pooledA, pooledB] = simpsonsPooledRates(pEasy, pHard, delta, wA, wB);
+    return {
+      rateEasyA: ae, rateHardA: ah, rateEasyB: be, rateHardB: bh,
+      pooledA, pooledB,
+      subgroupDiff: delta,
+      pooledDiff: pooledA - pooledB,
+      deltaCritical: simpsonsDeltaCritical(pEasy, pHard, wA, wB),
+      reverses: simpsonsReverses(pEasy, pHard, delta, wA, wB),
+      allocationGap: wB - wA,
+      difficultyGap: pEasy - pHard,
+      counts: simpsonsCounts(pEasy, pHard, delta, wA, wB, nA, nB),
+    };
+  }
+
+  // ==========================================================================
+  // Bertrand's paradox -- mirrors lab/analytics.py section 16
+  // ==========================================================================
+  // c = L / (2R) is the target length as a fraction of the diameter, and
+  // u = d / R the chord midpoint's scaled distance from the centre. A chord
+  // is longer than L exactly when u < sqrt(1 - c^2), so every method's answer
+  // is its own CDF of u at that one threshold. See the Python section for the
+  // three derivations.
+  const BERTRAND_METHODS = ["endpoints", "radius", "midpoint"];
+
+  /** sqrt(1 - c^2): the largest u at which a chord still clears the target
+   *  length. Exact. */
+  function bertrandThreshold(c) {
+    const cc = Math.min(Math.max(c, 0), 1);
+    return Math.sqrt(Math.max(0, 1 - cc * cc));
+  }
+
+  /** 2R sqrt(1 - u^2): the length of a chord with midpoint at u = d/R. */
+  const bertrandChordLength = (u, radius) =>
+    2 * radius * Math.sqrt(Math.max(0, 1 - u * u));
+
+  /** P(u <= t), random endpoints. Exact: (2/pi) arcsin t. */
+  const bertrandCdfEndpoints = (t) =>
+    (2 / Math.PI) * Math.asin(Math.min(Math.max(t, 0), 1));
+
+  /** P(u <= t), random radius. Exact: t. */
+  const bertrandCdfRadius = (t) => Math.min(Math.max(t, 0), 1);
+
+  /** P(u <= t), random midpoint. Exact: t^2, the area ratio. */
+  function bertrandCdfMidpoint(t) {
+    const tt = Math.min(Math.max(t, 0), 1);
+    return tt * tt;
+  }
+
+  /** P(u <= t) under `method`. Exact. */
+  function bertrandMidpointCdf(method, t) {
+    if (method === "endpoints") return bertrandCdfEndpoints(t);
+    if (method === "radius") return bertrandCdfRadius(t);
+    if (method === "midpoint") return bertrandCdfMidpoint(t);
+    throw new Error("unknown method: " + method);
+  }
+
+  /** Both endpoints uniform on the circumference. Exact:
+   *  1 - (2/pi) arcsin c. Equals 1/3 at c = sqrt(3)/2. */
+  const bertrandProbEndpoints = (c) =>
+    1 - (2 / Math.PI) * Math.asin(Math.min(Math.max(c, 0), 1));
+
+  /** Midpoint uniform along a uniformly chosen radius. Exact: sqrt(1 - c^2).
+   *  Equals 1/2 at c = sqrt(3)/2. */
+  function bertrandProbRadius(c) {
+    const cc = Math.min(Math.max(c, 0), 1);
+    return Math.sqrt(Math.max(0, 1 - cc * cc));
+  }
+
+  /** Midpoint uniform over the disc. Exact: 1 - c^2. Equals 1/4 at
+   *  c = sqrt(3)/2. */
+  function bertrandProbMidpoint(c) {
+    const cc = Math.min(Math.max(c, 0), 1);
+    return 1 - cc * cc;
+  }
+
+  /** P(chord longer than 2Rc) under `method`. Exact. */
+  function bertrandProb(method, c) {
+    if (method === "endpoints") return bertrandProbEndpoints(c);
+    if (method === "radius") return bertrandProbRadius(c);
+    if (method === "midpoint") return bertrandProbMidpoint(c);
+    throw new Error("unknown method: " + method);
+  }
+
+  /** E[chord length] under `method`. Exact: 4R/pi, pi R / 2, 4R/3 -- the
+   *  three rules disagree about the average chord as well as the tail. */
+  function bertrandMeanLength(method, radius) {
+    if (method === "endpoints") return 4 * radius / Math.PI;
+    if (method === "radius") return Math.PI * radius / 2;
+    if (method === "midpoint") return 4 * radius / 3;
+    throw new Error("unknown method: " + method);
+  }
+
+  /** [ts, endpoints CDF, radius CDF, midpoint CDF] over u in [0,1]. Exact. */
+  function bertrandCdfCurve(points) {
+    const n = points || 101;
+    const ts = new Array(n), e = new Array(n), r = new Array(n), m = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1);
+      ts[i] = t;
+      e[i] = bertrandCdfEndpoints(t);
+      r[i] = bertrandCdfRadius(t);
+      m[i] = bertrandCdfMidpoint(t);
+    }
+    return [ts, e, r, m];
+  }
+
+  /** [cs, P_endpoints, P_radius, P_midpoint] swept over the threshold ratio.
+   *  Exact. The radius rule is the largest answer throughout (0,1), but the
+   *  other two cross at exactly c = 1/sqrt(2), where both equal 1/2, so there
+   *  is no fixed ranking of the three -- see lab/analytics.py section 16. */
+  function bertrandCCurve(points) {
+    const n = points || 101;
+    const cs = new Array(n), e = new Array(n), r = new Array(n), m = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const c = i / (n - 1);
+      cs[i] = c;
+      e[i] = bertrandProbEndpoints(c);
+      r[i] = bertrandProbRadius(c);
+      m[i] = bertrandProbMidpoint(c);
+    }
+    return [cs, e, r, m];
+  }
+
+  /**
+   * Seeded chords under one sampling rule. Mirrors
+   * lab/analytics.py:bertrand_sample, including the draw order -- exactly two
+   * uniforms per chord:
+   *
+   *   endpoints  u1 -> first endpoint's angle,  u2 -> second endpoint's angle
+   *   radius     u1 -> the radius's direction,  u2 -> distance along it
+   *   midpoint   u1 -> squared radial position, u2 -> the midpoint's angle
+   *
+   * `midpoint` takes sqrt(u1) -- the disc-uniform inverse CDF. Drawing the
+   * distance uniformly instead is precisely the `radius` rule, which is the
+   * paradox in one line of code.
+   */
+  function bertrandSample(method, n, radius, c, seed) {
+    const rand = mulberry32(seed);
+    const thresh = bertrandThreshold(c);
+    const out = new Array(Math.round(n));
+    for (let i = 0; i < out.length; i++) {
+      const u1 = rand(), u2 = rand();
+      let x1, y1, x2, y2, mx, my, u;
+      if (method === "endpoints") {
+        const a1 = 2 * Math.PI * u1, a2 = 2 * Math.PI * u2;
+        x1 = radius * Math.cos(a1); y1 = radius * Math.sin(a1);
+        x2 = radius * Math.cos(a2); y2 = radius * Math.sin(a2);
+        mx = 0.5 * (x1 + x2); my = 0.5 * (y1 + y2);
+        u = Math.hypot(mx, my) / radius;
+      } else {
+        let phi;
+        if (method === "radius") { phi = 2 * Math.PI * u1; u = u2; }
+        else if (method === "midpoint") { u = Math.sqrt(u1); phi = 2 * Math.PI * u2; }
+        else throw new Error("unknown method: " + method);
+        mx = radius * u * Math.cos(phi);
+        my = radius * u * Math.sin(phi);
+        // The chord through this midpoint is perpendicular to the radius.
+        const half = radius * Math.sqrt(Math.max(0, 1 - u * u));
+        const dx = -Math.sin(phi), dy = Math.cos(phi);
+        x1 = mx + half * dx; y1 = my + half * dy;
+        x2 = mx - half * dx; y2 = my - half * dy;
+      }
+      out[i] = {
+        x1, y1, x2, y2, mx, my, u,
+        length: bertrandChordLength(u, radius),
+        long: u < thresh,
+      };
+    }
+    return out;
+  }
+
+  /** One seeded sample per method, each from its own fresh stream at `seed`,
+   *  so changing one method's size leaves the other two clouds untouched. */
+  function bertrandSampleAll(pr) {
+    const { n, radius, c, seed } = pr;
+    const out = {};
+    for (const m of BERTRAND_METHODS) out[m] = bertrandSample(m, n, radius, c, seed);
+    return out;
+  }
+
+  /** The seeded sample's own fraction of long chords. Simulated, not exact. */
+  function bertrandEmpirical(method, n, radius, c, seed) {
+    const chords = bertrandSample(method, n, radius, c, seed);
+    if (!chords.length) return 0;
+    let k = 0;
+    for (const ch of chords) if (ch.long) k++;
+    return k / chords.length;
+  }
+
+  function bertrandSummary(pr) {
+    const { c, radius, n, seed } = pr;
+    const pE = bertrandProbEndpoints(c);
+    const pR = bertrandProbRadius(c);
+    const pM = bertrandProbMidpoint(c);
+    return {
+      c,
+      length: 2 * radius * c,
+      threshold: bertrandThreshold(c),
+      pEndpoints: pE, pRadius: pR, pMidpoint: pM,
+      spread: Math.max(pE, pR, pM) - Math.min(pE, pR, pM),
+      meanLenEndpoints: bertrandMeanLength("endpoints", radius),
+      meanLenRadius: bertrandMeanLength("radius", radius),
+      meanLenMidpoint: bertrandMeanLength("midpoint", radius),
+      empEndpoints: bertrandEmpirical("endpoints", n, radius, c, seed),
+      empRadius: bertrandEmpirical("radius", n, radius, c, seed),
+      empMidpoint: bertrandEmpirical("midpoint", n, radius, c, seed),
+      classicC: Math.sqrt(3) / 2,
+      isClassic: Math.abs(c - Math.sqrt(3) / 2) < 1e-12,
+    };
+  }
+
   Object.assign(EP, {
     mulberry32,
     binomPmf, binomCdf, binomPpf, binomWeights,
     multipliers, ensembleGrowth, timeGrowth, expectedFinal,
     medianFinal, quantileFinal, probBelow, kellyFraction, sigmaLog, summary,
+    arithmeticMeanMultiplier, geometricMeanMultiplier, volatilityDrag,
+    medianHalfLife, breakEvenHeads, kellyGrowth, zeroGrowthFraction,
+    doublingTime,
     simulatePaths, pathStats, walkStats, logHistogram, kellySweep,
     SAMPLE_PATHS,
     // gambler's ruin
@@ -1840,6 +2787,7 @@ window.EP = window.EP || {};
     // St Petersburg
     spExpected, spQuantile, spMedian, spSurvival, spTierContribution,
     spCapAmount, spCappedExpected, spTypicalMean, spSummary,
+    spLogUtility, spCertaintyEquivalent,
     simulateStPetersburg, logSpacedIndices,
     // prisoner's dilemma
     STRATEGIES, STRATEGY_LABELS, STRATEGY_NOTES, pdPayoffs, pdIsDilemma,
@@ -1850,6 +2798,7 @@ window.EP = window.EP || {};
     // Shannon's demon
     sdMoves, sdStockGrowth, sdStockDrift, sdCycleGrowth, sdHoldGrowth,
     sdHarvest, sdIntervalCurve, sdBestInterval, sdSummary, simulateRebalance,
+    sdHarvestContinuous, sdOptimalWeight,
     // insurance and risk pooling
     insUninsuredGrowth, insInsuredGrowth, insBuyerMaxPremium, insSellerGrowth,
     insSellerMinPremium, insBuyerValue, insSellerValue, insPoolGrowth,
@@ -1859,5 +2808,32 @@ window.EP = window.EP || {};
     holdGrowthRate, holdSummary, makeNormalGenerator, simulateGbmPath,
     simulateDipStrategy, simulateWheel, simulateWheelFamily, cagr,
     wheelSummary, wheelIvSweep,
+    // Parrondo's paradox
+    paWinProbA, paWinProbB, paEffectiveWinProb, paTransition, paStationary,
+    paDrift, paDriftCurve, paSummary, simulateParrondo,
+    // base rates
+    brPosteriorPositive, brPosteriorNegative, brCounts, brPrevalenceCurve,
+    brSummary,
+    // the birthday problem
+    bdLogNoCollision, bdCollisionProb, bdPairs, bdCollisionCurve, bdHalfLifeN,
+    bdHashN50Approx, bdHashBitsCurve, bdSummary,
+    // the secretary problem
+    secWinProb, secWinCurve, secOptimal, secAsymptoticCurve, secSummary,
+    // the two-envelope paradox
+    tePSmaller, teSwapGain, teCrossover, teGainCurve, teSummary,
+    // optional stopping
+    osZThreshold, osFalsePositiveCurve, osFalsePositiveRate, osBonferroniAlpha,
+    simulateOptionalStopping, osSummary,
+    // Simpson's paradox
+    simpsonsSubgroupRates, simpsonsPooledRates, simpsonsDeltaCritical,
+    simpsonsPooledDiff, simpsonsReverses, simpsonsCounts, simpsonsDeltaCurve,
+    simpsonsSummary,
+    // Bertrand's paradox
+    BERTRAND_METHODS, bertrandThreshold, bertrandChordLength,
+    bertrandCdfEndpoints, bertrandCdfRadius, bertrandCdfMidpoint,
+    bertrandMidpointCdf, bertrandProbEndpoints, bertrandProbRadius,
+    bertrandProbMidpoint, bertrandProb, bertrandMeanLength, bertrandCdfCurve,
+    bertrandCCurve, bertrandSample, bertrandSampleAll, bertrandEmpirical,
+    bertrandSummary,
   });
 })(window.EP);

@@ -3,7 +3,7 @@
 This module is the source of truth. The browser engine (js/engine.js) must
 reproduce these numbers; lab/verify.py asserts that it does.
 
-Seven games live here, in this order:
+Sixteen games live here, in this order:
 
 1. **The multiplicative coin toss** (and Kelly sizing). Start with W0. Each
    round, bet a fraction f of current wealth on a coin that comes up heads with
@@ -50,10 +50,51 @@ Seven games live here, in this order:
    Section 8 states each of those exactly and simulates everything else,
    flagged as such in every docstring that isn't.
 
-Sections 6 and 7 are sums over a binomial distribution, so they are written
-against numpy arrays rather than Python loops: one `binom.pmf` call over a
-vector of outcomes instead of a term-at-a-time accumulation. The JS mirror
-cannot do that, and gets a weight recurrence instead -- see js/engine.js.
+9. **Parrondo's paradox.** Two losing games mixed into a winning one. The
+   stationary distribution of a 3-state Markov chain (capital mod 3) is a
+   linear-algebra problem, not a simulation.
+
+10. **Base rates and the 95% test.** Bayes' theorem applied to a screening
+    test, shown both as probabilities and as counts in a population -- the
+    "natural frequency" form that fixes the intuition the probability form
+    breaks.
+
+11. **The birthday problem.** Collision probability among n items drawn from d
+    categories, exact by a log-space product. Extended, as a stated
+    approximation past the point exact enumeration is tractable, to
+    cryptographic hash lengths.
+
+12. **The secretary problem.** Optimal stopping over a random permutation --
+    skip the first s candidates, then take the next one better than all of
+    them. Exact, and vectorised over the skip count with one reversed
+    cumulative sum rather than a term-at-a-time re-summation per threshold.
+
+13. **The two-envelope paradox.** The "always swap" argument needs an
+    improper (non-normalisable) prior to survive; handing the smaller amount
+    a real one -- here, an exponential -- turns "always swap" into "swap
+    below a threshold, keep above it," with an exact crossover point.
+
+14. **Optional stopping.** Repeated significance testing as gambler's ruin: a
+    driftless random walk against a boundary that moves outward with it.
+    Exact by a forward DP over the walk's live distribution, convolving in
+    one fresh batch of steps at a time -- the same binomial-weight idea
+    sections 6 and 7 use, run forward instead of summed once.
+
+15. **Simpson's paradox.** Two treatments across an easy and a hard subgroup.
+    The pooled comparison reverses the subgroup one exactly when the true
+    effect is smaller than the allocation gap times the difficulty gap, and
+    that condition is an identity rather than a numerical accident.
+
+16. **Bertrand's paradox.** Three sampling rules for "a random chord", three
+    exact and different answers to the same question, all three of which are
+    just one CDF of the chord midpoint's distance from the centre evaluated
+    at the same threshold.
+
+Sections 6, 7 and 14 are sums over a binomial distribution, so they are
+written against numpy arrays rather than Python loops: one `binom.pmf` call
+(or, for 14, one convolution) over a vector of outcomes instead of a
+term-at-a-time accumulation. The JS mirror cannot do that, and gets a weight
+recurrence instead -- see js/engine.js.
 """
 
 import math
@@ -87,6 +128,98 @@ def time_growth(p=0.5, up=1.5, down=0.6, f=1.0):
     if mu <= 0 or md <= 0:
         return -math.inf
     return p * math.log(mu) + (1 - p) * math.log(md)
+
+
+def arithmetic_mean_multiplier(p=0.5, up=1.5, down=0.6, f=1.0):
+    """E[m] = p*m_up + (1-p)*m_down. Exact.
+
+    The ensemble multiplier: average one round over infinitely many players and
+    this is the factor the *average* wealth grows by. Identical to
+    1 + ensemble_growth(); stated as a multiplier because the scenario's whole
+    point is the gap between two multipliers, not two rates.
+    """
+    mu, md = multipliers(up, down, f)
+    return p * mu + (1 - p) * md
+
+
+def geometric_mean_multiplier(p=0.5, up=1.5, down=0.6, f=1.0):
+    """G = m_up^p * m_down^(1-p). Exact.
+
+    The multiplier the typical path actually compounds at: after T rounds a
+    player with the expected number of heads holds w0 * G^T, and
+    ln G = time_growth() exactly. Returns 0.0 when either multiplier is
+    non-positive -- a single such outcome takes the path to zero and the
+    geometric mean of a set containing zero is zero, which matches
+    time_growth()'s -inf.
+    """
+    mu, md = multipliers(up, down, f)
+    if mu <= 0 or md <= 0:
+        return 0.0
+    return (mu ** p) * (md ** (1 - p))
+
+
+def volatility_drag(p=0.5, up=1.5, down=0.6, f=1.0):
+    """E[m] - G: the AM-GM gap between the ensemble and the typical multiplier.
+
+    Exact, and >= 0 for every input by the AM-GM inequality, with equality if
+    and only if m_up == m_down (that is, up == down, or f == 0). This single
+    number is the whole disagreement the ergodicity scenario is about.
+    """
+    return (arithmetic_mean_multiplier(p, up, down, f)
+            - geometric_mean_multiplier(p, up, down, f))
+
+
+def median_half_life(p=0.5, up=1.5, down=0.6, f=1.0):
+    """Rounds for the typical (geometric-mean) path to halve: ln(2)/|ln G|.
+
+    Exact for the geometric-mean trajectory w0 * G^T, which is the sense in
+    which "the median wealth halves" is usually meant here -- the *exact*
+    binomial median (median_final) sits on a lattice and therefore steps rather
+    than decays smoothly, so it has no continuous half-life.
+
+    Sign convention: the return value is a positive number of rounds when the
+    typical path is *decaying* (G < 1). When G >= 1 the typical path is flat or
+    growing and there is no halving, so this returns +inf rather than a negative
+    number -- a negative "half-life" would read as a doubling time and it is
+    not one. See doubling_time() for the growing case.
+    """
+    g = geometric_mean_multiplier(p, up, down, f)
+    if g <= 0.0:
+        return 0.0   # instant ruin: an outcome takes wealth to zero in one round
+    if g >= 1.0:
+        return math.inf
+    return math.log(2.0) / abs(math.log(g))
+
+
+def break_even_heads(rounds=100, p=0.5, up=1.5, down=0.6, f=1.0):
+    """Heads needed over `rounds` to finish at or above the starting stake.
+
+    W_T = w0 * m_up^k * m_down^(T-k) >= w0
+        <=>  k*ln(m_up) + (T-k)*ln(m_down) >= 0
+        <=>  k >= T * ln(1/m_down) / ln(m_up/m_down)          (for m_up > m_down)
+
+    Returned as an exact real threshold, deliberately *not* rounded: the point
+    of the number is to sit next to rounds*p (see summary()'s `expected_heads`)
+    and be compared with it, and rounding it first hides gaps smaller than one
+    head. A player needs ceil() of this many actual heads.
+
+    Degenerate cases, all handled without dividing by zero:
+      * f == 0, or up == down  ->  m_up == m_down, wealth is deterministic.
+        Returns 0.0 if that constant multiplier is >= 1 (every k breaks even)
+        and +inf if it is < 1 (no k does).
+      * m_down <= 0 (a loss wipes you out): only an all-heads run survives, so
+        this returns `rounds` when m_up >= 1 and +inf when it does not.
+    """
+    T = float(rounds)
+    mu, md = multipliers(up, down, f)
+    if md <= 0:
+        return T if mu >= 1.0 else math.inf
+    if mu <= 0:
+        return math.inf
+    lu, ld = math.log(mu), math.log(md)
+    if lu == ld:
+        return 0.0 if ld >= 0.0 else math.inf
+    return T * (-ld) / (lu - ld)
 
 
 def expected_final(w0=100.0, rounds=100, p=0.5, up=1.5, down=0.6, f=1.0):
@@ -143,12 +276,98 @@ def kelly_fraction(p=0.5, up=1.5, down=0.6):
 
     Clamped to [0, 1/b): above 1/b a single loss wipes you out. Returns 0 when
     the edge is negative -- the correct Kelly answer is "don't play".
+
+    Both degenerate coins are reachable from the page's own sliders (`up`
+    bottoms out at 1.00 and `down` tops out at 1.00), and the closed form
+    divides by a*b, so each needs its own answer rather than a NaN:
+
+    - a = 0 (no upside): nothing to win, so stake nothing. f* = 0.
+    - b = 0 (no downside): nothing can ever wipe you out, so Kelly is
+      unbounded and the only thing binding is the page's own f <= 1. This is
+      a free roll, NOT an edgeless coin -- returning NaN here previously sent
+      the Kelly scenario down its "no edge, don't play" branch on a bet that
+      cannot lose.
     """
     a, b, q = up - 1.0, 1.0 - down, 1.0 - p
-    if a <= 0 or b <= 0:
-        return float("nan")
+    if a <= 0:
+        return 0.0
+    if b <= 0:
+        return 1.0 if p > 0.0 else 0.0
     f = (p * a - q * b) / (a * b)
     return max(0.0, min(f, (1.0 / b) - 1e-12))
+
+
+# `growth_at_fraction(f, p, up, down)` is not defined separately: it is exactly
+# time_growth(p, up, down, f), which already exists. The three functions below
+# are the quantities *around* that curve -- its maximum, its second zero, and
+# the time it implies.
+
+
+def kelly_growth(p=0.5, up=1.5, down=0.6):
+    """The time-average growth rate achieved at f*: max_f time_growth. Exact.
+
+    Composition of two exact closed forms -- kelly_fraction is the analytic
+    argmax, and time_growth is the analytic objective -- so no search is
+    involved. Zero for a non-positive edge, since f* is then 0 and standing
+    aside neither grows nor shrinks the bankroll.
+    """
+    return time_growth(p, up, down, kelly_fraction(p, up, down))
+
+
+def zero_growth_fraction(p=0.5, up=1.5, down=0.6, tol=1e-13, iters=200):
+    """The positive f > f* at which time_growth returns to zero.
+
+    Past this stake, betting more makes you *poorer* than not playing at all,
+    even though the game has a positive edge. It is the second root of
+
+        g(f) = p ln(1 + a f) + (1 - p) ln(1 - b f),   a = up - 1, b = 1 - down
+
+    g(0) = 0, g rises to its maximum at f*, then falls to -inf as f -> 1/b.
+
+    EXACT ONLY AT p = 1/2. There the equation collapses to (1+af)(1-bf) = 1,
+    i.e. f(a - b - a b f) = 0, giving f0 = (a - b)/(a b) = 2 f* exactly. For any
+    other p the equation is (1+af)^p (1-bf)^(1-p) = 1, a transcendental relation
+    with no elementary solution, so this function is a NUMERICAL ROOT FIND for
+    p != 1/2: bisection on the bracket [f*, 1/b), 200 halvings, stopping once
+    the bracket is narrower than `tol` (1e-13 by default). js/engine.js runs the
+    identical loop in the identical order so the two agree to the last bit.
+
+    Returns 0.0 when the edge is non-positive: g(f) < 0 for every f > 0 there,
+    so the only fraction with zero growth is zero itself.
+    """
+    a, b = up - 1.0, 1.0 - down
+    if a <= 0 or b <= 0:
+        return float("nan")
+    f_star = kelly_fraction(p, up, down)
+    if f_star <= 0.0:
+        return 0.0
+    if abs(p - 0.5) < 1e-15:
+        return (a - b) / (a * b)          # exact: the (1+af)(1-bf) = 1 root
+    lo, hi = f_star, (1.0 / b) * (1.0 - 1e-12)
+    if lo >= hi or time_growth(p, up, down, hi) > 0.0:
+        return hi                          # f* is already pinned to the barrier
+    for _ in range(int(iters)):
+        if hi - lo <= tol:
+            break
+        mid = 0.5 * (lo + hi)
+        if time_growth(p, up, down, mid) > 0.0:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def doubling_time(p=0.5, up=1.5, down=0.6, f=1.0):
+    """Rounds for the typical path to double: ln(2)/E[ln m]. Exact.
+
+    +inf when the time-average growth is zero or negative -- the typical path
+    never doubles, and a negative number here would read as a half-life. See
+    median_half_life() for that case.
+    """
+    g = time_growth(p, up, down, f)
+    if not math.isfinite(g) or g <= 0.0:
+        return math.inf
+    return math.log(2.0) / g
 
 
 def sigma_log(p=0.5, up=1.5, down=0.6, f=1.0):
@@ -192,6 +411,19 @@ def summary(w0=100.0, rounds=100, p=0.5, up=1.5, down=0.6, f=1.0):
         "q95": quantile_final(0.95, w0, rounds, p, up, down, f),
         "kelly_f": kelly_fraction(p, up, down),
         "sigma_log": sigma_log(p, up, down, f),
+        # The two multipliers whose disagreement is the whole scenario, and the
+        # AM-GM gap between them.
+        "arithmetic_multiplier": arithmetic_mean_multiplier(p, up, down, f),
+        "geometric_multiplier": geometric_mean_multiplier(p, up, down, f),
+        "volatility_drag": volatility_drag(p, up, down, f),
+        "median_half_life": median_half_life(p, up, down, f),
+        # `break_even_heads` next to `expected_heads` is the "you need 55 and
+        # expect 50" comparison; break_even_heads is deliberately unrounded.
+        "break_even_heads": break_even_heads(rounds, p, up, down, f),
+        "expected_heads": rounds * p,
+        "kelly_growth": kelly_growth(p, up, down),
+        "zero_growth_f": zero_growth_fraction(p, up, down),
+        "doubling_time": doubling_time(p, up, down, f),
     }
 
 
@@ -517,6 +749,49 @@ def sp_capped_expected(p=0.5, m=2.0, tiers=31):
     return (1.0 - p) * geo + (p ** L) * (m ** (L - 1))
 
 
+def sp_log_utility(p=0.5, m=2.0):
+    """E[ln X], Daniel Bernoulli's 1738 resolution. Exact, in closed form.
+
+    X = m^(N-1) with N geometric on {1, 2, ...}, P(N = n) = p^(n-1) (1-p), so
+
+        E[ln X] = ln(m) * E[N - 1]
+                = ln(m) * (1-p) * Sum_{n>=1} (n-1) p^(n-1)
+                = ln(m) * (1-p) * p/(1-p)^2
+                = ln(m) * p / (1 - p)
+
+    using Sum_{j>=0} j x^j = x/(1-x)^2 at x = p. Derived, not summed
+    numerically. The key point: this converges for *every* p < 1 and every
+    finite m, including the classic p = 1/2, m = 2 game whose E[X] is infinite.
+    Log utility is what makes an infinite-expectation gamble finite-valued.
+
+    +inf when p >= 1 (the coin never fails) and 0 when m <= 1 with p = 0.
+    """
+    if m <= 0.0:
+        return -math.inf
+    if p >= 1.0:
+        return math.inf if m > 1.0 else (-math.inf if m < 1.0 else 0.0)
+    if p <= 0.0:
+        return 0.0
+    return math.log(m) * p / (1.0 - p)
+
+
+def sp_certainty_equivalent(p=0.5, m=2.0):
+    """exp(E[ln X]) = m^(p/(1-p)): the sure amount a log player would swap for.
+
+    Exact -- just the exponential of sp_log_utility's closed form.
+
+    A note on the famous number: this module's payout convention is m^(N-1),
+    so the classic p = 1/2, m = 2 game pays $1, $2, $4, ... and its certainty
+    equivalent is exactly 2^1 = $2.00. The "about $4" figure usually quoted
+    for Bernoulli's resolution belongs to the *other* common statement of the
+    game, which pays 2^N ($2, $4, $8, ...) -- twice this payout at every tier,
+    hence exactly twice the certainty equivalent. Same maths, different
+    indexing; lab/verify.py checks this against a Monte Carlo of the game as
+    this module actually defines it.
+    """
+    return math.exp(sp_log_utility(p, m))
+
+
 def sp_typical_mean(plays=20000, p=0.5, m=2.0):
     """APPROXIMATION -- not a closed form for anything exact.
 
@@ -548,6 +823,9 @@ def sp_summary(p=0.5, m=2.0, tiers=31, plays=20000, **_):
         "sd": sd,
         "sd_divergent": not math.isfinite(sd),
         "m2p": m * m * p,
+        # Bernoulli's own 1738 answer: E[ln X] converges where E[X] does not.
+        "log_utility": sp_log_utility(p, m),
+        "certainty_equivalent": sp_certainty_equivalent(p, m),
     }
 
 
@@ -1037,6 +1315,43 @@ def sd_best_interval(rounds=200, p=0.5, vol=0.3, w=0.5, cost=0.0):
     return xs[best], gs[best]
 
 
+def sd_harvest_continuous(vol=0.3, w=0.5):
+    """APPROXIMATION -- the continuous-time rebalancing premium, w(1-w)sigma^2/2.
+
+    NOT exact for the game this page simulates. The identity is the Ito result
+    for a continuously rebalanced two-asset portfolio of a driftless
+    geometric Brownian motion and cash: the rebalanced portfolio's log-growth
+    exceeds the weighted average of the components' log-growths by
+    w(1-w)sigma^2/2. The page's stock instead takes discrete jumps of
+    +-ln(1+vol) at p = 1/2, so sigma is taken as the per-period log move
+    sigma = ln(1 + vol) and the formula is a small-move expansion: the two
+    agree to O(sigma^2) and separate at O(sigma^4).
+
+    The exact discrete answer for this game is sd_cycle_growth(1, 0.5, vol, w,
+    0). lab/verify.py prints the size of the gap across several volatilities
+    rather than asserting the two are equal, because they are not.
+    """
+    sigma = math.log1p(max(1e-9, float(vol)))
+    return w * (1.0 - w) * sigma * sigma / 2.0
+
+
+def sd_optimal_weight(p=0.5, vol=0.3):
+    """The stock weight maximising growth. Exact at interval = 1.
+
+    Rebalancing every period makes the portfolio's per-period log growth
+    p ln(1 - w + w*up) + (1-p) ln(1 - w + w*down), which is term-for-term the
+    multiplicative coin's time_growth with f = w -- so the maximising weight is
+    literally kelly_fraction(p, up, down) and the closed form in section 1
+    applies unchanged. For the symmetric trendless coin (p = 1/2,
+    down = 1/up) it evaluates to exactly 1/2, Shannon's rule.
+
+    For interval > 1 this is an approximation: the optimum then drifts with the
+    cycle length and would have to be found by sweeping sd_cycle_growth over w.
+    """
+    up, down = sd_moves(vol)
+    return kelly_fraction(p, up, down)
+
+
 def sd_summary(rounds=200, p=0.5, vol=0.3, w=0.5, interval=1, cost=0.0, **_):
     """Everything the Shannon's demon scenario's tiles and table need."""
     up, down = sd_moves(vol)
@@ -1057,6 +1372,10 @@ def sd_summary(rounds=200, p=0.5, vol=0.3, w=0.5, interval=1, cost=0.0, **_):
         # for a symmetric trendless stock it is exactly 1/2 -- which is the rule
         # Shannon is said to have put on the board.
         "kelly_w": kelly_fraction(p, up, down),
+        # APPROXIMATION -- the continuous-time identity, not the discrete game.
+        "harvest_continuous": sd_harvest_continuous(vol, w),
+        # Exact at interval = 1; see sd_optimal_weight.
+        "optimal_weight": sd_optimal_weight(p, vol),
     }
 
 
@@ -1217,9 +1536,18 @@ def ins_seller_value(seller_wealth=1000000.0, premium=2000.0, loss=30000.0,
                      hazard=0.05, **_):
     """The seller's gain in the same growth-equivalent dollars per period.
 
-    Tends to the accounting profit P - pi*L from above as the seller's wealth
+    Tends to the accounting profit P - pi*L from *below* as the seller's wealth
     grows, so a very large insurer is exactly the expected-value maximiser that
-    textbook insurance assumes.
+    textbook insurance assumes. Below, not above: expanding V*ln(1 + x/V) to
+    second order leaves a correction of
+
+        -[ pi (P - L)^2 + (1 - pi) P^2 ] / (2V)
+
+    which is a sum of squares over 2V and so is never positive. Concretely, at
+    the scenario's defaults (P = 2000, L = 30000, pi = 0.05, accounting profit
+    $500) this returns $238.7 at V = $100k, $478.1 at $1M, $497.8 at $10M and
+    $499.998 at $10B -- approaching $500 from underneath the whole way. Risk
+    only ever costs the seller something; it never pays a bonus.
     """
     return seller_wealth * ins_seller_growth(seller_wealth, premium, loss, hazard)
 
@@ -1554,49 +1882,61 @@ def simulate_wheel(path, x_months=6.0, y_months=3.0, dip_pct=0.05,
     """The wheel (or, with include_calls=False, the puts-only arm that isolates
     what the covered calls are worth) on an already-generated price path.
 
-    A strict single-position cycle -- at most one option position is open at
-    any time, and the account is either flat-with-a-short-put or long-stock,
-    never both:
+    The rule set is tuned to **maximise time holding the stock**, because that
+    is where the return actually comes from -- premium is the smaller half of
+    the story and idle cash earns only the risk-free rate:
 
-      1. Day 1, sell cash-secured puts with the whole account.
-      2. The put is **held to expiry; there is no stop on it.** In the money
-         at expiry -> assigned, and the strike becomes the cost basis. Out of
-         the money -> the premium is kept and the next put is sold on the next
-         dip.
-      3. Once long, sell covered calls of the chosen tenor, struck at
-         max(spot, basis) so that being called away can never realise a loss
-         on the shares themselves.
-      4. Call in the money at expiry -> called away at the strike, the shares
-         are sold, and the put leg resumes immediately (no dip required).
-         Otherwise the call is bought back at `call_tp` profit or left to
-         expire, and another is sold.
-      5. If the shares fall `share_sl` below the cost basis, any open call is
-         bought back, the shares are sold, and the put leg resumes.
+      1. **Any idle cash sells a cash-secured put**, whether or not the account
+         already holds shares. The moment there is enough free cash for one
+         contract it is put to work.
+      2. **Cash too small for a contract buys stock outright.** A cash-secured
+         put needs 100 * strike of collateral; the remainder can never sell one
+         and would otherwise sit earning `r` forever, so it buys whatever whole
+         number of shares it can. This self-limits -- after the purchase, free
+         cash is below one share, and it only buys again once premium and
+         interest have accumulated past that.
+      3. The put is **held to expiry; there is no stop on it.** In the money at
+         expiry -> assigned, and the strike folds into a share-weighted average
+         cost basis. Out of the money -> the premium is kept, and the freed
+         collateral immediately sells the next put.
+      4. Covered calls are written **only at a record high** -- a new maximum
+         of the whole price history to date, not a rolling-window high -- and
+         only above the cost basis. Everywhere else the shares are simply held.
+      5. Call in the money at expiry -> called away at the strike; the cash
+         goes straight back into puts. Otherwise the call is bought back at
+         `call_tp` profit or left to expire.
+      6. If the shares fall `share_sl` below the weighted basis, any open call
+         is bought back and the shares are sold.
 
-    Why the put carries no stop, when the shares do
-    -----------------------------------------------
-    The two are not symmetric. The put's premium is collected up front and
-    kept whatever happens, so the put leg has already been paid; the only
-    "loss" a stop could cut is the paper cost of buying it back. Worse, a stop
-    on the put's marked value is in direct conflict with the strategy's
-    purpose, because a put on its way to assignment must first balloon in
-    value. Measured over the S&P's 2009-2026 history, a -30% stop produced
-    **zero** assignments in seventeen years, and even -50% and -100% stops
-    produced zero: the arm could never acquire the stock it existed to
-    acquire, and sat in cash earning premium while the index went up
-    eightfold. A stop only stops blocking assignment somewhere past -200%, by
-    which point it is not a stop.
+    Why the puts never wait, and the calls almost always do
+    ------------------------------------------------------
+    Two earlier rule sets each destroyed most of the return, and both are worth
+    keeping on the record because they look reasonable on paper:
 
-    The shares are different. A drawdown there is a real, open-ended mark
-    against capital with no premium already banked against it, so that is
-    where the loss cap belongs -- and it is a risk buy-and-hold runs too,
-    which keeps the comparison fair.
+    - **Gating put re-entry on a dip.** Waiting in cash for a 5% dip before
+      selling the next put left the S&P arm flat for 95% of 2009-2026. The put
+      is the instrument that pays you to wait; waiting in cash *before* selling
+      one is strictly worse.
+    - **Writing the covered call as soon as the shares arrive.** Assignment
+      happens precisely when the put finished in the money, i.e. with spot
+      BELOW the strike that bought the shares, so `max(spot, basis)` collapses
+      to `basis`: every call is struck at cost and being called away realises
+      exactly zero on the shares. Measured on the S&P that rule struck 100% of
+      its calls at the basis and held stock 4.6% of the time.
+
+    Requiring a record high inverts the second one. A record high is, by
+    construction, above every price the stock has ever traded at, so it is
+    above any strike that ever bought shares -- the call is always struck at a
+    profit, and the shares are held through every recovery that does not reach
+    a new peak.
 
     Bookkeeping notes:
     - `cash` is free money; `collateral` is cash reserved against the open put
       and is held at *face value*, with the interest it earns credited to
       `cash`. So `collateral == contracts * 100 * strike` exactly whenever a
       put is open and 0 otherwise, which verify.py asserts.
+    - `basis` is the share-weighted average of every price that bought shares,
+      whether by assignment or by an outright odd-lot purchase.
     - The equity curve marks options to zero between transactions -- it is the
       realized cash-plus-collateral-plus-shares value, not a continuous
       mark-to-market of the open short option. The take-profit and share-stop
@@ -1604,47 +1944,51 @@ def simulate_wheel(path, x_months=6.0, y_months=3.0, dip_pct=0.05,
 
     Not a closed form: entry timing, the assignment cycle and the share stop
     are all path-dependent. real_world_itm_prob above is the exact quantity
-    the assignment rate is checked against; with no stop in the way the only
-    remaining gap is the dip-entry selection effect.
+    the assignment rate is checked against.
     """
     n = len(path) - 1
     dt = 1.0 / TRADING_DAYS
-    window = max(1, round(x_months * TRADING_DAYS_PER_MONTH))
     put_tenor = max(1, round(x_months * TRADING_DAYS_PER_MONTH))
     call_tenor = max(1, round(y_months * TRADING_DAYS_PER_MONTH))
 
     cash, collateral, shares, basis = w0, 0.0, 0, 0.0
     put_lot = call_lot = None
-    dip_armed = True
-    force_put = True   # day 1, and again the moment shares are given up
+    record_high = path[0]
 
     equity = [w0]
     events = []
     stats = {"puts_sold": 0, "puts_expired": 0, "assignments": 0,
              "calls_sold": 0, "calls_tp": 0, "calls_expired": 0,
              "called_away": 0, "calls_closed_on_stop": 0, "shares_stopped": 0,
-             "puts_still_open": 0, "calls_still_open": 0}
+             "shares_bought": 0, "puts_still_open": 0, "calls_still_open": 0}
+
+    def add_shares(qty, price):
+        """Fold a new lot into the share-weighted average cost basis."""
+        nonlocal shares, basis
+        basis = (basis * shares + price * qty) / (shares + qty)
+        shares += qty
 
     for t in range(1, n + 1):
         s = path[t]
         g = math.exp(r * dt)
         cash = cash * g + collateral * (g - 1.0)
 
-        hi = max(path[max(0, t - window):t + 1])
-        dip_level = hi * (1.0 - dip_pct)
-        if s > dip_level:
-            dip_armed = True
+        # A *record* high: the running maximum of the whole path so far, not a
+        # rolling window. This is the only moment a covered call is written,
+        # and it is what guarantees the strike sits above every past purchase.
+        at_record = s >= record_high
+        if at_record:
+            record_high = s
 
         # -- the put, held to expiry ---------------------------------------
-        if shares == 0 and put_lot is not None and t >= put_lot["expiry"]:
+        if put_lot is not None and t >= put_lot["expiry"]:
             face = put_lot["contracts"] * 100.0 * put_lot["strike"]
             collateral -= face
             if s < put_lot["strike"]:
                 # The reserved collateral IS the purchase price; only the
                 # transaction cost leaves the account.
                 cash -= face * stock_fee_pct
-                shares += put_lot["contracts"] * 100
-                basis = put_lot["strike"]
+                add_shares(put_lot["contracts"] * 100, put_lot["strike"])
                 stats["assignments"] += put_lot["contracts"]
                 events.append({"t": t, "kind": "assigned",
                                "contracts": put_lot["contracts"],
@@ -1657,8 +2001,8 @@ def simulate_wheel(path, x_months=6.0, y_months=3.0, dip_pct=0.05,
                                "strike": put_lot["strike"]})
             put_lot = None
 
-        if (shares == 0 and put_lot is None
-                and (force_put or (dip_armed and s <= dip_level))):
+        # -- any idle cash sells a put, long or flat ------------------------
+        if put_lot is None:
             strike = s
             n_new = int(cash // (100.0 * strike))
             if n_new > 0:
@@ -1673,8 +2017,16 @@ def simulate_wheel(path, x_months=6.0, y_months=3.0, dip_pct=0.05,
                 stats["puts_sold"] += n_new
                 events.append({"t": t, "kind": "sell_put",
                                "contracts": n_new, "strike": strike})
-                force_put = False
-                dip_armed = False
+
+        # -- the stub that can never sell a contract buys stock outright ----
+        odd = int(cash // (s * (1.0 + stock_fee_pct)))
+        if odd > 0:
+            cost = odd * s * (1.0 + stock_fee_pct)
+            cash -= cost
+            add_shares(odd, s)
+            stats["shares_bought"] += odd
+            events.append({"t": t, "kind": "buy_shares",
+                           "contracts": odd, "strike": s})
 
         # -- the share stop, the strategy's only loss cap ------------------
         if shares > 0 and s < basis * (1.0 - share_sl):
@@ -1696,7 +2048,6 @@ def simulate_wheel(path, x_months=6.0, y_months=3.0, dip_pct=0.05,
                            "contracts": shares // 100, "strike": basis})
             shares, basis = 0, 0.0
             stats["shares_stopped"] += 1
-            force_put = True
 
         # -- covered calls, only while long --------------------------------
         if shares > 0 and include_calls:
@@ -1713,7 +2064,6 @@ def simulate_wheel(path, x_months=6.0, y_months=3.0, dip_pct=0.05,
                         events.append({"t": t, "kind": "called_away",
                                        "contracts": call_lot["contracts"],
                                        "strike": call_lot["strike"]})
-                        force_put = True
                         if shares == 0:
                             basis = 0.0
                     else:
@@ -1730,10 +2080,11 @@ def simulate_wheel(path, x_months=6.0, y_months=3.0, dip_pct=0.05,
                                    "strike": call_lot["strike"]})
                     call_lot = None
 
-            if call_lot is None and shares >= 100:
+            # Only at a record high, and never below the basis. At a record
+            # high the second condition is already implied -- it is kept as a
+            # live assertion of the invariant the whole rule exists to create.
+            if call_lot is None and shares >= 100 and at_record and s > basis:
                 n_new = shares // 100
-                # Never struck below the basis: being called away should not
-                # be able to realise a loss on the shares.
                 strike = max(s, basis)
                 theo = bs_call_price(s, strike, call_tenor / TRADING_DAYS,
                                      sigma_iv, r, q)
@@ -1756,6 +2107,8 @@ def simulate_wheel(path, x_months=6.0, y_months=3.0, dip_pct=0.05,
         stats["calls_still_open"] = call_lot["contracts"]
 
     return {"equity": equity, "events": events, "stats": stats}
+
+
 def simulate_wheel_family(w0=100000.0, s0=100.0, mu=0.08, sigma_rv=0.20,
                           sigma_iv=0.24, r=0.03, q=0.0, years=5.0,
                           x_months=6.0, y_months=3.0, dip_pct=0.05,
@@ -1878,6 +2231,1022 @@ def wheel_iv_sweep(w0=100000.0, s0=100.0, mu=0.08, sigma_rv=0.20, r=0.03,
     return xs, gs
 
 
+# =============================================================================
+# 9. Parrondo's paradox -- two losing games, mixed into a winning one
+# =============================================================================
+# Capital moves by exactly one dollar each round (additive, like gambler's
+# ruin), never absorbed. Game A is a coin with a flat, slightly unfavourable
+# win probability. Game B's win probability depends on capital modulo 3: bad
+# at residue 0, good otherwise. Both games lose on their own -- the point is
+# what happens when the two are mixed.
+#
+# The chain of residues (capital mod 3) under any fixed mixing rule is a
+# 3-state ergodic Markov chain, so its stationary distribution -- and the
+# long-run drift it implies -- is a linear-algebra problem, not a simulation.
+
+
+def pa_win_prob_a(eps=0.005):
+    """Game A: a flat, slightly unfavourable coin. P(win) = 1/2 - eps."""
+    return 0.5 - eps
+
+
+def pa_win_prob_b(residue, eps=0.005, p_bad=0.1, p_good=0.75):
+    """Game B: P(win) depends on capital mod 3 -- bad at residue 0, good
+    otherwise. Both p_bad and p_good are shifted down by eps, same as game A,
+    so neither game is handed an unfair edge relative to the other."""
+    return (p_bad if residue % 3 == 0 else p_good) - eps
+
+
+def pa_effective_win_prob(residue, q=0.5, eps=0.005, p_bad=0.1, p_good=0.75):
+    """P(win this round), mixing game B in with probability q each round.
+
+    q=0 is game A alone, q=1 is game B alone; independent per-round mixing
+    (not a fixed alternating pattern) is what the classic demonstration uses.
+    """
+    return ((1.0 - q) * pa_win_prob_a(eps)
+            + q * pa_win_prob_b(residue, eps, p_bad, p_good))
+
+
+def pa_transition(q=0.5, eps=0.005, p_bad=0.1, p_good=0.75):
+    """3x3 transition matrix over capital mod 3, for the mixed strategy.
+
+    A win moves residue r -> r+1 (mod 3); a loss moves r -> r-1 (mod 3). Two
+    step lengths (returning to the same residue in 2 rounds or in 3) share no
+    common factor greater than 1, so the chain is aperiodic as well as
+    irreducible -- a unique stationary distribution exists whenever every win
+    probability is strictly interior to (0, 1).
+    """
+    P = np.zeros((3, 3))
+    for r in range(3):
+        p = pa_effective_win_prob(r, q, eps, p_bad, p_good)
+        P[r, (r + 1) % 3] += p
+        P[r, (r - 1) % 3] += 1.0 - p
+    return P
+
+
+def pa_stationary(q=0.5, eps=0.005, p_bad=0.1, p_good=0.75):
+    """The stationary distribution over capital mod 3. Exact: solves
+    pi P = pi, sum(pi) = 1 as a linear system -- a stationary distribution is
+    the null space of (P^T - I) intersected with the simplex, which linear
+    algebra finds directly rather than by iterating power steps or sampling.
+    """
+    P = pa_transition(q, eps, p_bad, p_good)
+    A = np.vstack([P.T - np.eye(3), np.ones(3)])
+    b = np.array([0.0, 0.0, 0.0, 1.0])
+    pi, *_ = np.linalg.lstsq(A, b, rcond=None)
+    return pi
+
+
+def pa_drift(q=0.5, eps=0.005, p_bad=0.1, p_good=0.75):
+    """E[capital change per round] under the mixed strategy. Exact.
+
+    The stationary distribution weights how often each residue is visited;
+    the drift is the stationary average of each residue's own (2p-1).
+    """
+    pi = pa_stationary(q, eps, p_bad, p_good)
+    drift = 0.0
+    for r in range(3):
+        p = pa_effective_win_prob(r, q, eps, p_bad, p_good)
+        drift += pi[r] * (2.0 * p - 1.0)
+    return float(drift)
+
+
+def pa_drift_curve(eps=0.005, p_bad=0.1, p_good=0.75, points=101):
+    """(q values, drift) swept over the mixing probability. Exact -- every
+    point is one stationary-distribution solve, not a simulated average."""
+    qs = [i / (points - 1) for i in range(points)]
+    drifts = [pa_drift(q, eps, p_bad, p_good) for q in qs]
+    return qs, drifts
+
+
+def pa_summary(q=0.5, eps=0.005, p_bad=0.1, p_good=0.75, **_):
+    """Everything the Parrondo scenario's tiles and table need."""
+    drift_a = pa_drift(0.0, eps, p_bad, p_good)
+    drift_b = pa_drift(1.0, eps, p_bad, p_good)
+    drift_mix = pa_drift(q, eps, p_bad, p_good)
+    qs, drifts = pa_drift_curve(eps, p_bad, p_good, points=101)
+    best_i = max(range(len(drifts)), key=lambda i: drifts[i])
+    return {
+        "drift_a": drift_a,
+        "drift_b": drift_b,
+        "drift_mix": drift_mix,
+        "best_q": qs[best_i],
+        "best_drift": drifts[best_i],
+        "paradox": drift_a < 0.0 and drift_b < 0.0 and drifts[best_i] > 0.0,
+    }
+
+
+def simulate_parrondo(n_paths=6, rounds=2000, q=0.5, eps=0.005, p_bad=0.1,
+                      p_good=0.75, w0=0, seed=7):
+    """Reference walk: three series sharing draw order every round -- game A
+    alone, game B alone, and the q-mixed strategy -- so the three stay aligned
+    round for round however q is dialled.
+
+    Draws five numbers a round regardless of which games actually consume
+    them (one each for A, B, the mix's coin-choice, and the mix's two
+    possible coins), the same unconditional-draw discipline simulate_monty
+    uses -- a conditional draw would make the stream depend on the outcome,
+    and the seeded paths could then only match js/engine.js by branching
+    identically at every step.
+    """
+    rand = mulberry32(seed)
+    paths_a, paths_b, paths_mix = [], [], []
+    for _ in range(n_paths):
+        xa = xb = xm = w0
+        pa_path, pb_path, pm_path = [xa], [xb], [xm]
+        for _ in range(rounds):
+            ra, rb, rchoice, ra_mix, rb_mix = rand(), rand(), rand(), rand(), rand()
+            xa += 1 if ra < pa_win_prob_a(eps) else -1
+            xb += 1 if rb < pa_win_prob_b(xb, eps, p_bad, p_good) else -1
+            if rchoice < q:
+                xm += 1 if rb_mix < pa_win_prob_b(xm, eps, p_bad, p_good) else -1
+            else:
+                xm += 1 if ra_mix < pa_win_prob_a(eps) else -1
+            pa_path.append(xa); pb_path.append(xb); pm_path.append(xm)
+        paths_a.append(pa_path); paths_b.append(pb_path); paths_mix.append(pm_path)
+    return paths_a, paths_b, paths_mix
+
+
+# =============================================================================
+# 10. Base rates -- Bayes' theorem, and the natural-frequency form that fixes it
+# =============================================================================
+# A test with sensitivity `sens` (P(positive | disease)) and specificity
+# `spec` (P(negative | healthy)) is applied to a population with prevalence
+# `prior`. Everything here is Bayes' theorem; the population-count numbers are
+# the same theorem multiplied through by a headcount, which is the
+# intervention this scenario exists to demonstrate.
+
+
+def br_posterior_positive(prior=0.01, sens=0.95, spec=0.95, **_):
+    """P(disease | positive test). Exact, by Bayes' theorem."""
+    tp = sens * prior
+    fp = (1.0 - spec) * (1.0 - prior)
+    return tp / (tp + fp) if (tp + fp) > 0.0 else 0.0
+
+
+def br_posterior_negative(prior=0.01, sens=0.95, spec=0.95, **_):
+    """P(disease | negative test). Exact -- the reassuring number nobody asks
+    for, which is worth showing next to the alarming one."""
+    fn = (1.0 - sens) * prior
+    tn = spec * (1.0 - prior)
+    return fn / (fn + tn) if (fn + tn) > 0.0 else 0.0
+
+
+def br_counts(prior=0.01, sens=0.95, spec=0.95, population=1000, **_):
+    """(TP, FP, FN, TN) among `population` people. Exact -- Bayes' theorem
+    multiplied through by a population size instead of left as a ratio, which
+    is the natural-frequency form the 1978 Harvard study found people actually
+    reason correctly with.
+    """
+    n = float(population)
+    tp = n * prior * sens
+    fn = n * prior * (1.0 - sens)
+    fp = n * (1.0 - prior) * (1.0 - spec)
+    tn = n * (1.0 - prior) * spec
+    return tp, fp, fn, tn
+
+
+def br_prevalence_curve(sens=0.95, spec=0.95, points=200, lo=1e-4, hi=0.5):
+    """(prevalences, posterior P(disease|positive)) swept log-spaced from `lo`
+    to `hi`. Exact -- every point is one evaluation of Bayes' theorem; the
+    sweep exists only to show how much of the answer the prior is carrying.
+    """
+    log_lo, log_hi = math.log10(lo), math.log10(hi)
+    xs = [10.0 ** (log_lo + (log_hi - log_lo) * i / (points - 1))
+          for i in range(points)]
+    ys = [br_posterior_positive(x, sens, spec) for x in xs]
+    return xs, ys
+
+
+def br_summary(prior=0.01, sens=0.95, spec=0.95, population=1000, **_):
+    """Everything the base-rates scenario's tiles and table need."""
+    tp, fp, fn, tn = br_counts(prior, sens, spec, population)
+    return {
+        "posterior_pos": br_posterior_positive(prior, sens, spec),
+        "posterior_neg": br_posterior_negative(prior, sens, spec),
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "positives": tp + fp,
+        "precision": tp / (tp + fp) if (tp + fp) > 0.0 else 0.0,
+    }
+
+
+# =============================================================================
+# 11. The birthday problem -- collisions, pairs, and the security version
+# =============================================================================
+# P(no collision among n items drawn from d equally likely categories) is a
+# product of n terms, computed in log space so it stays exact and finite even
+# when d is a cryptographic digest space (d = 2^b for a b-bit hash) far too
+# large to ever appear as an ordinary Python number.
+
+
+def bd_log_no_collision(n=23, days=365.0):
+    """ln P(no collision), exact via a sum of n log1p terms, vectorised: only
+    the ratios i/days are ever computed, and every one of them stays near
+    zero however astronomically large `days` is.
+    """
+    n = int(n)
+    if n <= 0:
+        return 0.0
+    i = np.arange(n)
+    return float(np.log1p(-i / days).sum())
+
+
+def bd_collision_prob(n=23, days=365.0, **_):
+    """P(at least one shared birthday among n people, `days` days a year).
+    Exact. n > days forces a collision (the pigeonhole case), which the
+    log-space product would otherwise hit log(0) trying to reach.
+    """
+    if n > days:
+        return 1.0
+    return 1.0 - math.exp(bd_log_no_collision(n, days))
+
+
+def bd_pairs(n=23):
+    """C(n, 2): how many pairs n people make. Exact, and the reason the curve
+    above is not linear -- comparisons grow quadratically while people grow
+    linearly."""
+    return n * (n - 1) / 2.0
+
+
+def bd_collision_curve(days=365.0, max_n=100):
+    """(n, P(collision)) for every group size from 1 to max_n. Exact."""
+    xs = list(range(1, int(max_n) + 1))
+    return xs, [bd_collision_prob(n, days) for n in xs]
+
+
+def bd_half_life_n(days=365.0):
+    """Smallest n with P(collision) >= 0.5. Exact -- found by scanning up
+    from n=1 rather than the sqrt(2 d ln 2) approximation, because the exact
+    integer answer (23, for d=365) is the number the story is actually about.
+    Only reachable at a `days` small enough for exact enumeration to be fast,
+    which the page's control range respects; see bd_hash_n50_approx for the
+    regime where it is not.
+    """
+    n = 1
+    cap = int(days) + 1
+    while bd_collision_prob(n, days) < 0.5:
+        n += 1
+        if n > cap:
+            return n
+    return n
+
+
+def bd_hash_n50_approx(bits):
+    """APPROXIMATION: n for 50% collision odds at a `bits`-bit digest.
+
+    n(n-1) ~ 2 * days * ln(2) for n much smaller than days, because every term
+    log1p(-i/days) in bd_log_no_collision is then close to -i/days, and the
+    sum telescopes to -n(n-1)/(2*days); solving that quadratic for n gives the
+    closed form below. Exact enumeration is infeasible here -- the answer
+    itself is routinely in the billions once bits exceeds ~40 -- and the
+    approximation gets *more* accurate as bits grows, the opposite of the
+    usual scale/accuracy trade-off. Checked against exact enumeration at small
+    bit counts in lab/verify.py.
+    """
+    days = 2.0 ** bits
+    return math.sqrt(2.0 * days * math.log(2.0))
+
+
+def bd_hash_bits_curve(min_bits=8, max_bits=64, points=57):
+    """(bits, approximate n for 50% collision odds) over a digest length.
+    See bd_hash_n50_approx -- this whole curve is the closed-form
+    approximation, not exact enumeration."""
+    bits_list = [min_bits + (max_bits - min_bits) * i / (points - 1)
+                 for i in range(points)]
+    return bits_list, [bd_hash_n50_approx(b) for b in bits_list]
+
+
+def bd_summary(n=23, days=365.0, bits=8, **_):
+    """Everything the birthday scenario's tiles and table need."""
+    return {
+        "collision_prob": bd_collision_prob(n, days),
+        "pairs": bd_pairs(n),
+        "half_life_n": bd_half_life_n(days),
+        "hash_n50": bd_hash_n50_approx(bits),
+    }
+
+
+# =============================================================================
+# 12. The secretary problem -- optimal stopping over a random permutation
+# =============================================================================
+# n candidates in a uniformly random order; reject the first s outright, then
+# take the first one after that better than everyone seen so far. P(that
+# candidate is the single best) has a well known closed form, sum-based
+# rather than permutation-enumerated -- n! permutations would be infeasible
+# past n ~ 12.
+
+
+def sec_win_prob(s=0, n=100, **_):
+    """P(the classic secretary strategy picks the single best candidate).
+    Exact.
+
+        s = 0:  1/n           (always take the first candidate)
+        s > 0:  (s/n) * sum_{i=s+1}^{n} 1/(i-1)
+
+    The best candidate sits at some position i with probability 1/n; the
+    strategy wins exactly when i > s (it was not skipped) and the best of the
+    first i-1 candidates fell within the skipped s -- probability s/(i-1),
+    which is where the sum comes from.
+    """
+    s, n = int(s), int(n)
+    if n <= 0:
+        return 0.0
+    if s <= 0:
+        return 1.0 / n
+    if s >= n:
+        return 0.0
+    return (s / n) * sum(1.0 / (i - 1) for i in range(s + 1, n + 1))
+
+
+def sec_win_curve(n=100, **_):
+    """(thresholds, win prob) for every skip count from 0 to n-1. Exact and
+    vectorised: writing i = j+1, sec_win_prob(s) needs sum_{j=s}^{n-1} 1/j,
+    and every one of those suffix sums comes out of a single reversed
+    cumulative sum rather than n separate re-summations -- O(n) instead of
+    O(n^2) for the whole curve, which is what keeps sec_asymptotic_curve
+    responsive out to n in the hundreds.
+    """
+    n = int(n)
+    if n <= 0:
+        return [], []
+    if n == 1:
+        return [0], [1.0]
+    j = np.arange(1, n)                        # j = 1 .. n-1
+    suffix = np.cumsum((1.0 / j)[::-1])[::-1]   # suffix[k] = sum_{j=k+1}^{n-1} 1/j
+    xs = list(range(n))
+    ys = [1.0 / n] + [(s / n) * suffix[s - 1] for s in range(1, n)]
+    return xs, ys
+
+
+def sec_optimal(n=100, **_):
+    """(best threshold, best win prob). Exact -- an argmax over the curve
+    above, which is itself O(n) thanks to sec_win_curve's vectorisation."""
+    xs, ys = sec_win_curve(n)
+    best = max(range(len(ys)), key=lambda i: ys[i])
+    return xs[best], ys[best]
+
+
+def sec_asymptotic_curve(min_n=5, max_n=500, points=100):
+    """(n, optimal win prob) over a range of n, showing convergence to 1/e.
+    Exact at every point -- the 1/e limit is a fact ABOUT this curve, not an
+    approximation used to draw it.
+    """
+    ns = sorted(set(int(round(min_n + (max_n - min_n) * i / max(1, points - 1)))
+                    for i in range(points)))
+    return ns, [sec_optimal(n)[1] for n in ns]
+
+
+def sec_summary(s=37, n=100, **_):
+    """Everything the secretary scenario's tiles and table need."""
+    best_s, best_p = sec_optimal(n)
+    return {
+        "win_prob": sec_win_prob(s, n),
+        "best_s": best_s,
+        "best_prob": best_p,
+        "best_fraction": best_s / n if n > 0 else 0.0,
+        "inv_e": 1.0 / math.e,
+    }
+
+
+# =============================================================================
+# 13. The two-envelope paradox -- a proper prior fixes what an improper one breaks
+# =============================================================================
+# The smaller amount S is drawn from Exponential(rate). The envelope you open
+# holds X = S or X = 2S, each with probability 1/2. Given X = x, Bayes' rule
+# over the two hypotheses ("x is the smaller half" vs "x is the larger half")
+# gives an exact expected gain from swapping -- positive for small x, negative
+# for large x, and exactly zero unconditionally (swapping always is a
+# symmetric relabelling before you look at anything). The paradox's "the same
+# argument applies at every x" claim is what breaks: the conditional argument
+# is not the same argument at every x once a real prior is in the room.
+
+
+def te_p_smaller(x, rate=0.01, **_):
+    """P(x is the smaller half | observed x), under an Exponential(rate)
+    prior on the smaller amount. Exact -- Bayes' rule between two hypotheses,
+    weighted by their likelihoods as densities of the OBSERVED variable X:
+
+        H_small (X = S):      likelihood f_S(x)              = rate e^{-rate x}
+        H_large (X = 2S):     likelihood f_S(x/2) * |dS/dX|   = rate e^{-rate x/2} / 2
+
+    The 1/2 is the Jacobian of S = X/2, and it is not optional: dropping it
+    (i.e. treating "the density of 2S at x" as if it were just "the density of
+    S at x/2") silently double-counts the larger-half hypothesis's mass and
+    was caught only by a Monte Carlo check on this exact quantity -- the
+    algebra downstream (te_swap_gain, te_crossover) looked internally
+    consistent either way, because every one of its own identities (the sign
+    flip, P(smaller) = 1/3 at the crossover) holds regardless of which
+    constant sits here.
+    """
+    if x <= 0.0:
+        return 1.0
+    u = math.exp(rate * x / 2.0)
+    return 1.0 / (1.0 + 0.5 * u)
+
+
+def te_swap_gain(x, rate=0.01, **_):
+    """E[gain from swapping | observed x]. Exact.
+
+        swap to 2x with P(smaller|x): a gain of +x
+        swap to x/2 with P(larger|x): a loss of -x/2
+
+    Positive near x=0 (you are very likely holding the smaller half), crosses
+    zero at x* = (4 ln 2)/rate (see te_crossover), and tends to -x/2 for large
+    x (you are almost certainly holding the larger half already).
+    """
+    if x <= 0.0:
+        return 0.0
+    p_small = te_p_smaller(x, rate)
+    return p_small * x - (1.0 - p_small) * (x / 2.0)
+
+
+def te_crossover(rate=0.01, **_):
+    """The amount x* above which swapping stops being worth it. Exact: solves
+    te_swap_gain(x*) = 0, which reduces to p_smaller(x*) = 1/3 regardless of
+    the prior (gain = p*x - (1-p)*(x/2) = 0 iff p = 1/3), then to
+    exp(rate*x*/2) = 4 for the exponential prior's particular p_smaller.
+    """
+    return (4.0 * math.log(2.0)) / rate
+
+
+def te_gain_curve(rate=0.01, points=200, hi=None):
+    """(x values, expected swap gain, P(smaller|x)) swept over the amount
+    found. Exact at every point. `hi` defaults to comfortably past the
+    crossover so the sign change sits inside the axis."""
+    top = hi if hi is not None else 6.0 / rate
+    xs = [top * i / (points - 1) for i in range(points)]
+    gains = [te_swap_gain(x, rate) for x in xs]
+    probs = [te_p_smaller(x, rate) for x in xs]
+    return xs, gains, probs
+
+
+def te_summary(x=100.0, rate=0.01, **_):
+    """Everything the two-envelope scenario's tiles and table need."""
+    return {
+        "p_smaller": te_p_smaller(x, rate),
+        "swap_gain": te_swap_gain(x, rate),
+        "crossover": te_crossover(rate),
+        "mean_smaller": 1.0 / rate,
+        "should_swap": te_swap_gain(x, rate) > 0.0,
+    }
+
+
+# =============================================================================
+# 14. Optional stopping -- repeated significance testing as gambler's ruin
+# =============================================================================
+# A null-effect experiment accumulates data in `looks` batches of `batch`
+# observations each, re-testing after every batch. Each observation is
+# modelled as a fair +-1 step (driftless, since the null is true); after k
+# batches the walk has taken k*batch steps, and a look is "significant" the
+# moment the walk's value exceeds the two-sided z-threshold scaled to that
+# many steps, |S| >= z_crit * sqrt(k*batch). The threshold moves outward like
+# sqrt(n) while an undecided walk's typical spread also grows like sqrt(n) --
+# neither wins outright, which is exactly why the false-positive rate climbs
+# with every additional look instead of staying flat at the nominal alpha.
+#
+# Computed by forward DP over the distribution of "still not significant"
+# paths: os_false_positive_curve tracks the live probability mass across
+# batches, convolving in one fresh Binomial(batch, 1/2) increment per look --
+# the same binomial-weight idea Shannon's demon and the insurance pool use,
+# run forward across looks instead of summed once over a single horizon.
+
+
+def os_z_threshold(alpha=0.05):
+    """Two-sided z critical value for a nominal per-look significance level.
+    Exact, via the normal quantile function."""
+    return float(norm.ppf(1.0 - alpha / 2.0))
+
+
+def os_false_positive_curve(looks=40, batch=20, alpha=0.05, **_):
+    """(look number, cumulative P(declared significant by this look)). Exact
+    forward DP, not simulated.
+
+    `live` holds P(heads count = h AND never yet crossed the boundary) after
+    each batch, indexed by h. Each step convolves the still-live distribution
+    with a fresh Binomial(batch, 1/2) increment (an independent new batch of
+    data), then whichever part of the result now sits outside the boundary
+    |2h - n| >= z*sqrt(n) is peeled off into the cumulative total and zeroed
+    out of `live` -- it does not get to un-happen on a later, calmer batch.
+    """
+    looks, batch = int(looks), int(batch)
+    z = os_z_threshold(alpha)
+    kernel = binom.pmf(np.arange(batch + 1), batch, 0.5)
+    live = np.array([1.0])   # P(heads=0, not yet significant), n=0 so far
+    cum_fp = 0.0
+    xs, ys = [], []
+    for look in range(1, looks + 1):
+        live = np.convolve(live, kernel)
+        n = look * batch
+        h = np.arange(len(live))
+        s = 2.0 * h - n
+        boundary = z * math.sqrt(n)
+        crossed = np.abs(s) >= boundary
+        cum_fp += float(live[crossed].sum())
+        live = np.where(crossed, 0.0, live)
+        xs.append(look)
+        ys.append(cum_fp)
+    return xs, ys
+
+
+def os_false_positive_rate(looks=40, batch=20, alpha=0.05, **_):
+    """P(declared significant at least once in `looks` looks). Exact -- the
+    last point of os_false_positive_curve."""
+    _, ys = os_false_positive_curve(looks, batch, alpha)
+    return ys[-1] if ys else 0.0
+
+
+def os_bonferroni_alpha(looks=40, alpha=0.05, **_):
+    """The per-look significance level that keeps the *cumulative* rate at
+    the nominal alpha, to first order -- a Bonferroni correction. A
+    conservative bound (the looks are not independent events, so the true
+    required alpha is a little larger than this), simple and exact as such.
+    """
+    return alpha / max(1, int(looks))
+
+
+def simulate_optional_stopping(n_paths=6, looks=40, batch=20, alpha=0.05,
+                               seed=7):
+    """Reference walk: each path is `looks * batch` fair +-1 steps, sampled at
+    every look boundary so js/engine.js can reproduce it flip for flip.
+    Returns (z-statistic at each look, per path; the look that first crossed
+    the boundary, or None).
+    """
+    z = os_z_threshold(alpha)
+    rand = mulberry32(seed)
+    n = int(looks) * int(batch)
+    all_z, first_sig = [], []
+    for _ in range(n_paths):
+        s = 0
+        zs = []
+        sig_at = None
+        for step in range(1, n + 1):
+            s += 1 if rand() < 0.5 else -1
+            if step % batch == 0:
+                look = step // batch
+                zs.append(s / math.sqrt(step))
+                if sig_at is None and abs(s) >= z * math.sqrt(step):
+                    sig_at = look
+        all_z.append(zs)
+        first_sig.append(sig_at)
+    return all_z, first_sig
+
+
+def os_summary(looks=40, batch=20, alpha=0.05, **_):
+    """Everything the optional-stopping scenario's tiles and table need."""
+    xs, ys = os_false_positive_curve(looks, batch, alpha)
+    return {
+        "cum_fp": ys[-1] if ys else 0.0,
+        "nominal_alpha": alpha,
+        "bonferroni_alpha": os_bonferroni_alpha(looks, alpha),
+        "total_n": int(looks) * int(batch),
+        "z_crit": os_z_threshold(alpha),
+    }
+
+
+# =============================================================================
+# 15. Simpson's paradox -- a trend in every subgroup, reversed in the pool
+# =============================================================================
+# Two treatments, A and B, applied across two subgroups of cases: "easy" (base
+# success rate p_easy) and "hard" (base rate p_hard < p_easy). Treatment A is
+# genuinely better by `delta` in BOTH subgroups:
+#
+#     rate_A(easy) = p_easy + delta      rate_B(easy) = p_easy
+#     rate_A(hard) = p_hard + delta      rate_B(hard) = p_hard
+#
+# The only other dial is *who gets which treatment*: a fraction w_a of A's
+# cases are easy ones, and w_b of B's. Pooling collapses each treatment's two
+# subgroup rates into one weighted average, and those two averages use
+# different weights, which is the whole mechanism:
+#
+#     pooled_A = w_a (p_easy + delta) + (1 - w_a)(p_hard + delta)
+#              = p_hard + delta + w_a (p_easy - p_hard)
+#     pooled_B = p_hard         + w_b (p_easy - p_hard)
+#
+#     pooled_A - pooled_B = delta - (w_b - w_a)(p_easy - p_hard)
+#
+# So the pooled comparison flips sign exactly when the true effect is smaller
+# than the allocation gap times the difficulty gap:
+#
+#     delta_critical = (w_b - w_a) * (p_easy - p_hard)
+#
+# with reversal for 0 < delta < delta_critical (and, symmetrically, for
+# delta_critical < delta < 0). Nothing here is approximate: the reversal
+# condition is an identity in the four rate/weight parameters, and the counts
+# below are the same identity multiplied through by group sizes.
+#
+# Note the caller's responsibility: the model does not clamp, so p_easy +
+# delta must stay <= 1 (and p_hard + delta >= 0) for the rates to be
+# probabilities. Clamping would break the identity above rather than fix it.
+
+
+def simpsons_subgroup_rates(p_easy=0.9, p_hard=0.4, delta=0.05, **_):
+    """(A-easy, A-hard, B-easy, B-hard) success rates. Exact by construction:
+    A carries the same true advantage `delta` in both subgroups, so A is
+    better in every subgroup whenever delta > 0."""
+    return p_easy + delta, p_hard + delta, p_easy, p_hard
+
+
+def simpsons_pooled_rates(p_easy=0.9, p_hard=0.4, delta=0.05, w_a=0.2, w_b=0.8,
+                          **_):
+    """(pooled A, pooled B) success rates. Exact -- each is the subgroup rates
+    averaged with that treatment's own case mix, which is the step that loses
+    the information the subgroup view keeps."""
+    a_easy, a_hard, b_easy, b_hard = simpsons_subgroup_rates(p_easy, p_hard, delta)
+    return (w_a * a_easy + (1.0 - w_a) * a_hard,
+            w_b * b_easy + (1.0 - w_b) * b_hard)
+
+
+def simpsons_delta_critical(p_easy=0.9, p_hard=0.4, w_a=0.2, w_b=0.8, **_):
+    """The true effect size at which the pooled comparison flips. Exact:
+
+        delta_critical = (w_b - w_a) * (p_easy - p_hard)
+
+    the allocation gap times the difficulty gap. Independent of delta itself
+    -- it is the whole confounding budget available to the case mix, and any
+    true effect smaller than it gets swamped."""
+    return (w_b - w_a) * (p_easy - p_hard)
+
+
+def simpsons_pooled_diff(p_easy=0.9, p_hard=0.4, delta=0.05, w_a=0.2, w_b=0.8,
+                         **_):
+    """pooled_A - pooled_B. Exact, and algebraically equal to
+    delta - delta_critical -- the derivation's punchline in one line."""
+    pooled_a, pooled_b = simpsons_pooled_rates(p_easy, p_hard, delta, w_a, w_b)
+    return pooled_a - pooled_b
+
+
+def simpsons_reverses(p_easy=0.9, p_hard=0.4, delta=0.05, w_a=0.2, w_b=0.8,
+                      **_):
+    """True when the subgroup verdict and the pooled verdict disagree. Exact:
+    the subgroup verdict has the sign of `delta` (A wins both subgroups iff
+    delta > 0) and the pooled verdict has the sign of delta - delta_critical,
+    so a reversal is exactly a sign disagreement between the two."""
+    diff = simpsons_pooled_diff(p_easy, p_hard, delta, w_a, w_b)
+    return (delta > 0.0 and diff < 0.0) or (delta < 0.0 and diff > 0.0)
+
+
+def _round_half_up(x):
+    """floor(x + 0.5), not round(x): Python's round() is banker's rounding and
+    JavaScript's Math.round is not, and a 2x2 table of counts lands on exact
+    .5 ties for perfectly ordinary inputs (a 50-case group split 50/50). Same
+    treatment `bets()` already needs for the same reason."""
+    return int(math.floor(x + 0.5))
+
+
+def simpsons_counts(p_easy=0.9, p_hard=0.4, delta=0.05, w_a=0.2, w_b=0.8,
+                    n_a=200, n_b=200, **_):
+    """The 2x2x2 table of whole-case counts behind the rates.
+
+    Returns a dict with, for each treatment, the easy/hard case counts, the
+    successes in each, and the totals.
+
+    Every total here is a SUM of its own parts, never an independent rounding
+    of the corresponding product: `hard_a` is `n_a - easy_a` rather than
+    round((1-w_a)*n_a), and `succ_a` is `succ_easy_a + succ_hard_a` rather
+    than round(pooled_a * n_a). Rounding each cell on its own is what makes a
+    displayed table whose parts sum to one more than its whole -- the four
+    cells and the two margins here are consistent by construction, at the
+    cost of the count-derived rates differing from the exact rates by up to
+    half a case.
+    """
+    a_easy, a_hard, b_easy, b_hard = simpsons_subgroup_rates(p_easy, p_hard, delta)
+    n_a, n_b = int(n_a), int(n_b)
+
+    easy_a = min(n_a, max(0, _round_half_up(w_a * n_a)))
+    hard_a = n_a - easy_a
+    easy_b = min(n_b, max(0, _round_half_up(w_b * n_b)))
+    hard_b = n_b - easy_b
+
+    se_a = min(easy_a, max(0, _round_half_up(a_easy * easy_a)))
+    sh_a = min(hard_a, max(0, _round_half_up(a_hard * hard_a)))
+    se_b = min(easy_b, max(0, _round_half_up(b_easy * easy_b)))
+    sh_b = min(hard_b, max(0, _round_half_up(b_hard * hard_b)))
+
+    return {
+        "easy_a": easy_a, "hard_a": hard_a, "n_a": n_a,
+        "easy_b": easy_b, "hard_b": hard_b, "n_b": n_b,
+        "succ_easy_a": se_a, "succ_hard_a": sh_a, "succ_a": se_a + sh_a,
+        "succ_easy_b": se_b, "succ_hard_b": sh_b, "succ_b": se_b + sh_b,
+        "rate_easy_a": se_a / easy_a if easy_a else 0.0,
+        "rate_hard_a": sh_a / hard_a if hard_a else 0.0,
+        "rate_easy_b": se_b / easy_b if easy_b else 0.0,
+        "rate_hard_b": sh_b / hard_b if hard_b else 0.0,
+        "rate_a": (se_a + sh_a) / n_a if n_a else 0.0,
+        "rate_b": (se_b + sh_b) / n_b if n_b else 0.0,
+    }
+
+
+def simpsons_delta_curve(p_easy=0.9, p_hard=0.4, w_a=0.2, w_b=0.8, points=101,
+                         lo=0.0, hi=None, **_):
+    """(delta values, pooled_A - pooled_B) swept over the true effect size.
+    Exact at every point -- a straight line of slope 1 crossing zero at
+    delta_critical, which is the cleanest possible statement of the
+    condition. `hi` defaults to twice the critical value so the crossing sits
+    in the middle of the axis."""
+    crit = simpsons_delta_critical(p_easy, p_hard, w_a, w_b)
+    top = hi if hi is not None else max(2.0 * crit, 0.1)
+    xs = [lo + (top - lo) * i / (points - 1) for i in range(points)]
+    ys = [simpsons_pooled_diff(p_easy, p_hard, d, w_a, w_b) for d in xs]
+    return xs, ys
+
+
+def simpsons_summary(p_easy=0.9, p_hard=0.4, delta=0.05, w_a=0.2, w_b=0.8,
+                     n_a=200, n_b=200, **_):
+    """Everything the Simpson's-paradox scenario's tiles and table need."""
+    a_easy, a_hard, b_easy, b_hard = simpsons_subgroup_rates(p_easy, p_hard, delta)
+    pooled_a, pooled_b = simpsons_pooled_rates(p_easy, p_hard, delta, w_a, w_b)
+    crit = simpsons_delta_critical(p_easy, p_hard, w_a, w_b)
+    counts = simpsons_counts(p_easy, p_hard, delta, w_a, w_b, n_a, n_b)
+    return {
+        "rate_easy_a": a_easy, "rate_hard_a": a_hard,
+        "rate_easy_b": b_easy, "rate_hard_b": b_hard,
+        "pooled_a": pooled_a, "pooled_b": pooled_b,
+        "subgroup_diff": delta,
+        "pooled_diff": pooled_a - pooled_b,
+        "delta_critical": crit,
+        "reverses": simpsons_reverses(p_easy, p_hard, delta, w_a, w_b),
+        "allocation_gap": w_b - w_a,
+        "difficulty_gap": p_easy - p_hard,
+        "counts": counts,
+    }
+
+
+# =============================================================================
+# 16. Bertrand's paradox -- three "random" chords, three different answers
+# =============================================================================
+# "Draw a random chord of a circle of radius R; what is P(length > L)?" The
+# question has no answer until "random" is pinned to a sampling rule, and the
+# three classical rules give three different ones. Everything is written in
+# terms of the threshold ratio
+#
+#     c = L / (2R)  in (0, 1)
+#
+# (the target length as a fraction of the diameter) and the midpoint's scaled
+# distance from the centre, u = d / R. A chord at distance d has length
+# 2*sqrt(R^2 - d^2), so
+#
+#     length > L  <=>  R^2 - d^2 > R^2 c^2  <=>  u < sqrt(1 - c^2)
+#
+# and every method's answer is just its own CDF of u evaluated at that
+# threshold. The three rules induce three different distributions on u:
+#
+# 1. Random endpoints. Fix one endpoint by rotational symmetry and let the
+#    other be uniform on the circumference; with theta the central angle the
+#    chord is 2R sin(theta/2), so its midpoint sits at u = |cos(theta/2)| with
+#    theta/2 uniform on [0, pi). Hence F(t) = (2/pi) arcsin t, and
+#        P = F(sqrt(1-c^2)) = (2/pi) arcsin(sqrt(1-c^2)) = 1 - (2/pi) arcsin c.
+#
+# 2. Random radius. Pick a radius uniformly, then the midpoint uniformly along
+#    it: u ~ Uniform(0,1), F(t) = t, and P = sqrt(1 - c^2).
+#
+# 3. Random midpoint. The midpoint is uniform over the disc, so P(u <= t) is
+#    the area ratio t^2: F(t) = t^2, and P = 1 - c^2.
+#
+# At c = sqrt(3)/2 -- the side of the inscribed equilateral triangle -- these
+# are exactly 1/3, 1/2 and 1/4, which is the classical statement of the
+# paradox and the identity lab/verify.py asserts.
+#
+# The mean chord lengths are exact too, and disagree in the same way:
+# 4R/pi, pi*R/2 and 4R/3.
+#
+# One thing that is easy to assume and is false: the three answers do NOT
+# keep a fixed order. The random-radius rule is the largest throughout (0,1),
+# but the midpoint and endpoints rules cross at exactly c = 1/sqrt(2) (where
+# both equal 1/2) -- 1 - c^2 wins below it, 1 - (2/pi) arcsin c wins above.
+# The classical c = sqrt(3)/2 sits above the crossing, which is why the
+# textbook triple reads 1/3, 1/2, 1/4 rather than the other way round. An
+# earlier version of lab/verify.py asserted a universal ordering and was
+# right only for c > 1/sqrt(2).
+
+BERTRAND_METHODS = ("endpoints", "radius", "midpoint")
+
+
+def bertrand_threshold(c=0.8660254037844386, **_):
+    """sqrt(1 - c^2): the largest scaled midpoint distance u = d/R at which a
+    chord still clears the target length. Exact."""
+    c = min(max(c, 0.0), 1.0)
+    return math.sqrt(max(0.0, 1.0 - c * c))
+
+
+def bertrand_chord_length(u, radius=1.0):
+    """The length of a chord whose midpoint sits at scaled distance u = d/R.
+    Exact: 2R sqrt(1 - u^2)."""
+    return 2.0 * radius * math.sqrt(max(0.0, 1.0 - u * u))
+
+
+def bertrand_cdf_endpoints(t):
+    """P(u <= t) under the random-endpoints rule. Exact: (2/pi) arcsin t,
+    from u = |cos(theta/2)| with theta/2 uniform on [0, pi)."""
+    t = min(max(t, 0.0), 1.0)
+    return (2.0 / math.pi) * math.asin(t)
+
+
+def bertrand_cdf_radius(t):
+    """P(u <= t) under the random-radius rule. Exact: t, because the midpoint
+    is uniform along the radius."""
+    return min(max(t, 0.0), 1.0)
+
+
+def bertrand_cdf_midpoint(t):
+    """P(u <= t) under the random-midpoint rule. Exact: t^2, the area ratio of
+    two concentric discs."""
+    t = min(max(t, 0.0), 1.0)
+    return t * t
+
+
+def bertrand_midpoint_cdf(method, t):
+    """P(u <= t) under `method`. Exact; dispatches to the three above."""
+    if method == "endpoints":
+        return bertrand_cdf_endpoints(t)
+    if method == "radius":
+        return bertrand_cdf_radius(t)
+    if method == "midpoint":
+        return bertrand_cdf_midpoint(t)
+    raise ValueError(f"unknown method: {method}")
+
+
+def bertrand_prob_endpoints(c=0.8660254037844386, **_):
+    """P(chord longer than 2Rc), both endpoints uniform on the circumference.
+    Exact: 1 - (2/pi) arcsin c. Equals 1/3 at c = sqrt(3)/2."""
+    c = min(max(c, 0.0), 1.0)
+    return 1.0 - (2.0 / math.pi) * math.asin(c)
+
+
+def bertrand_prob_radius(c=0.8660254037844386, **_):
+    """P(chord longer than 2Rc), midpoint uniform along a uniform radius.
+    Exact: sqrt(1 - c^2). Equals 1/2 at c = sqrt(3)/2."""
+    c = min(max(c, 0.0), 1.0)
+    return math.sqrt(max(0.0, 1.0 - c * c))
+
+
+def bertrand_prob_midpoint(c=0.8660254037844386, **_):
+    """P(chord longer than 2Rc), midpoint uniform over the disc. Exact:
+    1 - c^2. Equals 1/4 at c = sqrt(3)/2."""
+    c = min(max(c, 0.0), 1.0)
+    return 1.0 - c * c
+
+
+def bertrand_prob(method, c=0.8660254037844386):
+    """P(chord longer than 2Rc) under `method`. Exact. Identically equal to
+    1 - F_method(threshold complement); written directly here, and checked
+    against `bertrand_midpoint_cdf(method, bertrand_threshold(c))` in
+    lab/verify.py so the two statements cannot drift apart."""
+    if method == "endpoints":
+        return bertrand_prob_endpoints(c)
+    if method == "radius":
+        return bertrand_prob_radius(c)
+    if method == "midpoint":
+        return bertrand_prob_midpoint(c)
+    raise ValueError(f"unknown method: {method}")
+
+
+def bertrand_mean_length(method, radius=1.0):
+    """E[chord length] under `method`. Exact, by integrating 2R sqrt(1-u^2)
+    against each rule's density of u:
+
+        endpoints  u = |cos(phi)|, phi ~ U[0,pi):  (2R/pi) * int_0^pi sin = 4R/pi
+        radius     u ~ U(0,1):                     2R * int_0^1 sqrt(1-u^2) = pi R / 2
+        midpoint   density 2u on (0,1):            2R * 2/3               = 4R / 3
+
+    So the three rules disagree about the average chord as well as about the
+    tail: 1.273R, 1.571R, 1.333R.
+    """
+    if method == "endpoints":
+        return 4.0 * radius / math.pi
+    if method == "radius":
+        return math.pi * radius / 2.0
+    if method == "midpoint":
+        return 4.0 * radius / 3.0
+    raise ValueError(f"unknown method: {method}")
+
+
+def bertrand_cdf_curve(points=101, **_):
+    """(t values, endpoints CDF, radius CDF, midpoint CDF) over u in [0,1].
+    Exact -- the three midpoint-distance distributions on one axis, which is
+    the picture that explains why the answers differ."""
+    ts = [i / (points - 1) for i in range(points)]
+    return (ts,
+            [bertrand_cdf_endpoints(t) for t in ts],
+            [bertrand_cdf_radius(t) for t in ts],
+            [bertrand_cdf_midpoint(t) for t in ts])
+
+
+def bertrand_c_curve(points=101, **_):
+    """(c values, P_endpoints, P_radius, P_midpoint) swept over the threshold
+    ratio. Exact at every point.
+
+    The random-radius rule is the largest answer everywhere in (0,1), but the
+    other two genuinely cross: 1 - c^2 beats 1 - (2/pi) arcsin c for small c
+    and loses for large c, swapping where c^2 = (2/pi) arcsin c -- which is
+    exactly c = 1/sqrt(2), where both equal 1/2. So there is no fixed
+    ranking of the three rules, and the
+    classical c = sqrt(3)/2 sits above that crossing -- which is why the
+    textbook statement reads 1/3 > 1/4 rather than the other way round.
+    lab/verify.py asserts both halves of this."""
+    cs = [i / (points - 1) for i in range(points)]
+    return (cs,
+            [bertrand_prob_endpoints(c) for c in cs],
+            [bertrand_prob_radius(c) for c in cs],
+            [bertrand_prob_midpoint(c) for c in cs])
+
+
+def bertrand_sample(method, n=200, radius=1.0, c=0.8660254037844386, seed=7):
+    """Seeded chords under one sampling rule, using the shared mulberry32
+    stream so js/engine.js reproduces them draw for draw.
+
+    Exactly TWO uniforms are consumed per chord in every method, in this
+    order, which is the part of the PRNG contract that matters here:
+
+        endpoints  u1 -> first endpoint's angle,  u2 -> second endpoint's angle
+        radius     u1 -> the radius's direction,  u2 -> distance along it
+        midpoint   u1 -> squared radial position, u2 -> the midpoint's angle
+
+    (`midpoint` takes sqrt(u1) for the radius: the disc-uniform inverse CDF.
+    Drawing the distance uniformly instead is precisely the `radius` rule,
+    which is the paradox in one line of code.)
+
+    Returns a list of dicts: chord endpoints (x1,y1)-(x2,y2), the midpoint
+    (mx,my), its scaled distance u = d/R, the chord length, and whether it
+    clears the threshold.
+    """
+    rand = mulberry32(seed)
+    thresh = bertrand_threshold(c)
+    out = []
+    for _ in range(int(n)):
+        u1, u2 = rand(), rand()
+        if method == "endpoints":
+            a1 = 2.0 * math.pi * u1
+            a2 = 2.0 * math.pi * u2
+            x1, y1 = radius * math.cos(a1), radius * math.sin(a1)
+            x2, y2 = radius * math.cos(a2), radius * math.sin(a2)
+            mx, my = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+            u = math.hypot(mx, my) / radius
+        else:
+            if method == "radius":
+                phi = 2.0 * math.pi * u1
+                u = u2
+            elif method == "midpoint":
+                u = math.sqrt(u1)
+                phi = 2.0 * math.pi * u2
+            else:
+                raise ValueError(f"unknown method: {method}")
+            mx, my = radius * u * math.cos(phi), radius * u * math.sin(phi)
+            # The chord through this midpoint is perpendicular to the radius.
+            half = radius * math.sqrt(max(0.0, 1.0 - u * u))
+            dx, dy = -math.sin(phi), math.cos(phi)
+            x1, y1 = mx + half * dx, my + half * dy
+            x2, y2 = mx - half * dx, my - half * dy
+        out.append({
+            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+            "mx": mx, "my": my, "u": u,
+            "length": bertrand_chord_length(u, radius),
+            "long": u < thresh,
+        })
+    return out
+
+
+def bertrand_sample_all(n=200, radius=1.0, c=0.8660254037844386, seed=7, **_):
+    """One seeded sample per method, each from its own fresh mulberry32
+    stream at `seed`. Deliberately not one shared stream: the three clouds
+    are meant to be compared as three independent draws of the same size, and
+    restarting the stream keeps each method's chords unchanged when another
+    method's sample size changes."""
+    return {m: bertrand_sample(m, n, radius, c, seed) for m in BERTRAND_METHODS}
+
+
+def bertrand_empirical(method, n=200, radius=1.0, c=0.8660254037844386, seed=7):
+    """The seeded sample's own fraction of long chords. Simulated, not exact
+    -- this is the number a page can print beside the closed form to show the
+    sample agreeing with it."""
+    chords = bertrand_sample(method, n, radius, c, seed)
+    return sum(1 for ch in chords if ch["long"]) / len(chords) if chords else 0.0
+
+
+def bertrand_summary(c=0.8660254037844386, radius=1.0, n=200, seed=7, **_):
+    """Everything the Bertrand scenario's tiles and table need. Every `p_*`
+    and `mean_len_*` is closed form; the `emp_*` values are the seeded
+    sample's own fractions, for a page that wants to show the cloud agreeing
+    with the formula."""
+    p_e = bertrand_prob_endpoints(c)
+    p_r = bertrand_prob_radius(c)
+    p_m = bertrand_prob_midpoint(c)
+    return {
+        "c": c,
+        "length": 2.0 * radius * c,
+        "threshold": bertrand_threshold(c),
+        "p_endpoints": p_e, "p_radius": p_r, "p_midpoint": p_m,
+        "spread": max(p_e, p_r, p_m) - min(p_e, p_r, p_m),
+        "mean_len_endpoints": bertrand_mean_length("endpoints", radius),
+        "mean_len_radius": bertrand_mean_length("radius", radius),
+        "mean_len_midpoint": bertrand_mean_length("midpoint", radius),
+        "emp_endpoints": bertrand_empirical("endpoints", n, radius, c, seed),
+        "emp_radius": bertrand_empirical("radius", n, radius, c, seed),
+        "emp_midpoint": bertrand_empirical("midpoint", n, radius, c, seed),
+        "classic_c": math.sqrt(3.0) / 2.0,
+        "is_classic": abs(c - math.sqrt(3.0) / 2.0) < 1e-12,
+    }
+
+
 if __name__ == "__main__":
     for label, f in (("stake everything (f=1.0)", 1.0), ("Kelly-sized", None)):
         ff = kelly_fraction() if f is None else f
@@ -1944,3 +3313,67 @@ if __name__ == "__main__":
           f"vs uninsured {ins['uninsured_growth']*100:+.4f} %/period")
     print(f"  pool of 50 growth       {ins['pool_growth']*100:+.4f} %/period")
     print(f"  infinite pool growth    {ins['pool_limit']*100:+.4f} %/period")
+
+    pa = pa_summary(q=0.5, eps=0.005)
+    print("\nParrondo's paradox  eps=0.005, random 50/50 mix")
+    print(f"  game A alone drift      {pa['drift_a']*100:+.4f} $/round")
+    print(f"  game B alone drift      {pa['drift_b']*100:+.4f} $/round")
+    print(f"  50/50 mix drift         {pa['drift_mix']*100:+.4f} $/round")
+    print(f"  best mix                q={pa['best_q']:.2f} -> "
+          f"{pa['best_drift']*100:+.4f} $/round")
+    print(f"  paradox confirmed:      {pa['paradox']}")
+
+    br = br_summary(prior=0.01, sens=0.95, spec=0.95, population=1000)
+    print("\nBase rates  95% test, 1% prevalence, 1000 people")
+    print(f"  P(disease | positive)   {br['posterior_pos']*100:.2f} %")
+    print(f"  P(disease | negative)   {br['posterior_neg']*100:.4f} %")
+    print(f"  TP={br['tp']:.1f}  FP={br['fp']:.1f}  FN={br['fn']:.1f}  TN={br['tn']:.1f}")
+
+    bd = bd_summary(n=23, days=365.0, bits=8)
+    print("\nBirthday problem  23 people, 365 days")
+    print(f"  P(collision)            {bd['collision_prob']*100:.2f} %")
+    print(f"  pairs                   {bd['pairs']:.0f}")
+    print(f"  50% odds at n =         {bd['half_life_n']}")
+    print(f"  8-bit hash, n for 50%   {bd['hash_n50']:.2f} (approx)")
+
+    sec = sec_summary(s=37, n=100)
+    print("\nSecretary problem  100 candidates")
+    print(f"  skip 37: P(win)         {sec['win_prob']*100:.2f} %")
+    print(f"  optimal skip            {sec['best_s']} "
+          f"({sec['best_fraction']*100:.1f} % of n)")
+    print(f"  optimal P(win)          {sec['best_prob']*100:.2f} %  "
+          f"(1/e = {sec['inv_e']*100:.2f} %)")
+
+    te = te_summary(x=100.0, rate=0.01)
+    print("\nTwo-envelope paradox  exponential prior, mean $100")
+    print(f"  P(x=$100 is the smaller half)  {te['p_smaller']*100:.2f} %")
+    print(f"  E[gain from swapping]          ${te['swap_gain']:.2f}")
+    print(f"  crossover amount                ${te['crossover']:.2f}")
+
+    os_ = os_summary(looks=40, batch=20, alpha=0.05)
+    print("\nOptional stopping  40 looks, batches of 20, nominal alpha=5%")
+    print(f"  cumulative false-positive rate  {os_['cum_fp']*100:.2f} %")
+    print(f"  Bonferroni-corrected alpha      {os_['bonferroni_alpha']*100:.4f} %")
+    print(f"  total sample size               {os_['total_n']}")
+
+    sp2 = simpsons_summary()
+    c2 = sp2["counts"]
+    print("\nSimpson's paradox  easy 90%, hard 40%, A better by 5pp")
+    print(f"  easy cases:  A {sp2['rate_easy_a']*100:.1f} %  vs B {sp2['rate_easy_b']*100:.1f} %")
+    print(f"  hard cases:  A {sp2['rate_hard_a']*100:.1f} %  vs B {sp2['rate_hard_b']*100:.1f} %")
+    print(f"  pooled:      A {sp2['pooled_a']*100:.1f} %  vs B {sp2['pooled_b']*100:.1f} %")
+    print(f"  delta_critical {sp2['delta_critical']*100:.1f} pp -> reverses: {sp2['reverses']}")
+    print(f"  counts  A {c2['succ_a']}/{c2['n_a']}  = {c2['succ_easy_a']}/{c2['easy_a']}"
+          f" + {c2['succ_hard_a']}/{c2['hard_a']}")
+    print(f"  counts  B {c2['succ_b']}/{c2['n_b']}  = {c2['succ_easy_b']}/{c2['easy_b']}"
+          f" + {c2['succ_hard_b']}/{c2['hard_b']}")
+
+    bt = bertrand_summary()
+    print("\nBertrand's paradox  c = sqrt(3)/2 (the inscribed triangle's side)")
+    print(f"  random endpoints  {bt['p_endpoints']*100:.2f} %  (sample "
+          f"{bt['emp_endpoints']*100:.1f} %)")
+    print(f"  random radius     {bt['p_radius']*100:.2f} %  (sample "
+          f"{bt['emp_radius']*100:.1f} %)")
+    print(f"  random midpoint   {bt['p_midpoint']*100:.2f} %  (sample "
+          f"{bt['emp_midpoint']*100:.1f} %)")
+    print(f"  spread            {bt['spread']*100:.2f} pp for one question")

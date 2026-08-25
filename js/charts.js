@@ -889,6 +889,32 @@ window.EP = window.EP || {};
     };
   }
 
+  /** Percentage label for a whole decade, down to hundredths of a percent. */
+  function decadeLabelPct(d) {
+    const v = Math.pow(10, d);
+    return v >= 0.01 ? `${(v * 100).toLocaleString("en-US", { maximumFractionDigits: 0 })}%`
+      : `${(v * 100).toPrecision(1)}%`;
+  }
+
+  /**
+   * Decade ticks for a log axis over PROBABILITIES (0 < p < 1), percentage
+   * labelled. `plainDecadeTicks` above floors its input at 1 -- built for
+   * count axes like "games played" -- so it silently collapses any all-
+   * fractional range like a prevalence sweep down to a [1, 10] window with
+   * nothing plotted in it. This is that same convention for values that are
+   * never >= 1.
+   */
+  function probDecadeTicks(lo, hi) {
+    const dLo = Math.floor(Math.log10(Math.max(lo, 1e-6)));
+    const dHi = Math.ceil(Math.log10(Math.max(hi, lo * 10)));
+    const tickvals = [], ticktext = [];
+    for (let d = dLo; d <= dHi; d++) {
+      tickvals.push(Math.pow(10, d));
+      ticktext.push(decadeLabelPct(d));
+    }
+    return { tickmode: "array", tickvals, ticktext, range: [dLo, dHi] };
+  }
+
   // ==========================================================================
   // Iterated prisoner's dilemma
   // ==========================================================================
@@ -1654,6 +1680,936 @@ window.EP = window.EP || {};
     return Plotly.react(el, data, layout, CONFIG);
   }
 
+  // ==========================================================================
+  // Parrondo's paradox
+  // ==========================================================================
+  /**
+   * Drift against the mixing probability -- the diverging pair, since zero is
+   * the meaningful reference: above it the mix is a winning game, below it a
+   * losing one. Markers name the two pure games (both losing) and the reader's
+   * own mix, so the "both endpoints down, the middle up" shape reads at a
+   * glance rather than needing the tiles to explain it.
+   */
+  function paDrift(el, d, pr) {
+    const t = theme();
+    const { qs, drifts } = d.driftCurve;
+
+    const posY = drifts.map((v) => (v < 0 ? null : v));
+    const negY = drifts.map((v) => (v > 0 ? null : v));
+
+    const data = [
+      { x: qs, y: negY, type: "scatter", mode: "lines",
+        line: { color: t.neg, width: 2 }, fill: "tozeroy",
+        fillcolor: hexA(t.neg, 0.1), name: "Losing",
+        hovertemplate: "<b>%{y:+.4f}</b> $/round<extra></extra>" },
+      { x: qs, y: posY, type: "scatter", mode: "lines",
+        line: { color: t.s1, width: 2 }, fill: "tozeroy",
+        fillcolor: hexA(t.s1, 0.1), name: "Winning",
+        hovertemplate: "<b>%{y:+.4f}</b> $/round<extra></extra>" },
+      { x: [0], y: [d.stats.driftA], type: "scatter", mode: "markers",
+        marker: { color: t.deemph, size: 8, line: { color: t.surface, width: 2 } },
+        name: "Game A alone", hovertemplate: "<b>A alone: %{y:+.4f}</b><extra></extra>" },
+      { x: [1], y: [d.stats.driftB], type: "scatter", mode: "markers",
+        marker: { color: t.deemph, size: 8, line: { color: t.surface, width: 2 } },
+        name: "Game B alone", hovertemplate: "<b>B alone: %{y:+.4f}</b><extra></extra>" },
+      { x: [pr.q], y: [d.stats.driftMix], type: "scatter", mode: "markers",
+        marker: { color: d.stats.driftMix >= 0 ? t.s1 : t.neg, size: 9,
+                  line: { color: t.surface, width: 2 } },
+        name: "Your mix", hovertemplate: "<b>your mix: %{y:+.4f}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "P(play game B this round)",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".0%",
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "Drift ($/round)", font: { color: t.textSecondary, size: 12 } },
+        zeroline: true, zerolinecolor: t.axis, zerolinewidth: 1,
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", x0: pr.q, x1: pr.q, yref: "paper", y0: 0, y1: 1,
+        line: { color: t.muted, width: 1 }, layer: "below",
+      }],
+      annotations: [{
+        x: d.stats.bestQ, y: d.stats.bestDrift, text: `best: q=${EP.fmt.pct(d.stats.bestQ)}`,
+        showarrow: false, xanchor: "left", yanchor: "bottom", xshift: 8, yshift: 4,
+        font: { family: FONT, size: 11, color: t.textPrimary },
+        bgcolor: t.surface, borderpad: 3,
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /**
+   * Three capital walks on the one shared seeded path -- game A alone, game B
+   * alone, and the mix -- linear axis, since this is an additive walk like
+   * gambler's ruin rather than a multiplicative one.
+   */
+  function paPaths(el, d, pr) {
+    const t = theme();
+    const { pathsA, pathsB, pathsMix } = d.sim;
+    const xs = indices(pathsA[0].length);
+
+    const data = [
+      lineTrace(xs, pathsA[0], {
+        line: { color: t.deemph, width: 2 }, name: "Game A alone",
+        hovertemplate: "<b>%{y:+.0f}</b>  game A<extra></extra>",
+      }),
+      lineTrace(xs, pathsB[0], {
+        line: { color: t.s2, width: 2 }, name: "Game B alone",
+        hovertemplate: "<b>%{y:+.0f}</b>  game B<extra></extra>",
+      }),
+      lineTrace(xs, pathsMix[0], {
+        line: { color: t.s1, width: 2 }, name: `Mixed (q=${EP.fmt.pct(pr.q)})`,
+        hovertemplate: "<b>%{y:+.0f}</b>  mixed<extra></extra>",
+      }),
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Round", font: { color: t.textSecondary, size: 12 } },
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "Capital ($)", font: { color: t.textSecondary, size: 12 } },
+        zeroline: true, zerolinecolor: t.axis, zerolinewidth: 1,
+      }),
+      hovermode: "x unified",
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  // ==========================================================================
+  // Base rates
+  // ==========================================================================
+  /** P(disease|positive) against prevalence, log-x -- the missing quantity
+   *  that decides the whole answer, swept on its own axis. */
+  function brPrevalence(el, d, pr) {
+    const t = theme();
+    const { xs, ys } = d.prevalenceCurve;
+
+    const data = [
+      lineTrace(xs, ys, {
+        line: { color: t.s1, width: 2 }, name: "P(disease | positive)",
+        hovertemplate: "<b>%{y:.1%}</b><extra></extra>",
+      }),
+      { x: [pr.prior], y: [d.stats.posteriorPos], type: "scatter", mode: "markers",
+        marker: { color: t.s1, size: 9, line: { color: t.surface, width: 2 } },
+        name: "Your prevalence",
+        hovertemplate: "<b>you: %{y:.1%}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, Object.assign({
+        type: "log",
+        title: { text: "Prevalence (log scale)", font: { color: t.textSecondary, size: 12 } },
+      }, probDecadeTicks(xs[0], xs[xs.length - 1]))),
+      yaxis: axis(t, {
+        title: { text: "P(disease | positive test)",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".0%", range: [0, 1.02],
+      }),
+      hovermode: "x unified",
+      annotations: [{
+        x: Math.log10(pr.prior), y: d.stats.posteriorPos,
+        text: `you: ${EP.fmt.pct(d.stats.posteriorPos)}`,
+        showarrow: false, xanchor: "left", yanchor: "bottom", xshift: 8, yshift: 4,
+        font: { family: FONT, size: 11, color: t.textPrimary },
+        bgcolor: t.surface, borderpad: 3,
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /**
+   * The population grid, drawn directly: two stacked bars, "tested positive"
+   * and "tested negative", each split into its true/false parts. This is
+   * Bayes' theorem as counts instead of a ratio -- the natural-frequency form
+   * the story is about.
+   */
+  function brGrid(el, d) {
+    const t = theme();
+    const { tp, fp, fn, tn } = d.stats;
+
+    const data = [
+      { y: ["Tested positive", "Tested negative"], x: [tp, fn], type: "bar",
+        orientation: "h", name: "Actually sick",
+        marker: { color: t.s1 },
+        hovertemplate: "<b>%{x:,.0f}</b> actually sick<extra></extra>" },
+      { y: ["Tested positive", "Tested negative"], x: [fp, tn], type: "bar",
+        orientation: "h", name: "Actually healthy",
+        marker: { color: t.deemph },
+        hovertemplate: "<b>%{x:,.0f}</b> actually healthy<extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      barmode: "stack",
+      bargap: 0.35,
+      margin: { l: 128, r: 24, t: 16, b: 52 },
+      xaxis: axis(t, {
+        title: { text: "People", font: { color: t.textSecondary, size: 12 } },
+        rangemode: "tozero",
+      }),
+      yaxis: axis(t, { showgrid: false, ticks: "" }),
+      hovermode: "closest",
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  // ==========================================================================
+  // The birthday problem
+  // ==========================================================================
+  /** P(collision) against group size, with the 50% line and the reader's own
+   *  n marked -- the curve the "23 people" headline number comes off of. */
+  function bdCollision(el, d, pr) {
+    const t = theme();
+    const { xs, ys } = d.collisionCurve;
+
+    const data = [
+      lineTrace(xs, ys, {
+        line: { color: t.s1, width: 2 }, name: "P(collision)",
+        hovertemplate: "<b>%{y:.1%}</b> at n=%{x}<extra></extra>",
+      }),
+      { x: [pr.n], y: [d.stats.collisionProb], type: "scatter", mode: "markers",
+        marker: { color: t.s1, size: 9, line: { color: t.surface, width: 2 } },
+        name: "Your group",
+        hovertemplate: "<b>you: %{y:.1%}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Group size", font: { color: t.textSecondary, size: 12 } },
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "Chance of a shared birthday",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".0%", range: [0, 1.02],
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", xref: "paper", x0: 0, x1: 1, yref: "y", y0: 0.5, y1: 0.5,
+        line: { color: t.deemph, width: 1, dash: "dot" }, layer: "below",
+      }],
+      annotations: [{
+        x: 1, y: 0.5, xref: "paper", text: "50%", showarrow: false,
+        xanchor: "right", yanchor: "bottom", yshift: 2,
+        font: { family: FONT, size: 11, color: t.muted },
+        bgcolor: t.surface, borderpad: 2,
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /** The hash-collision extension: bits vs the (approximate) items needed for
+   *  50% collision odds, log-y since it spans many orders of magnitude. */
+  function bdHash(el, d, pr) {
+    const t = theme();
+    const { xs, ys } = d.hashBitsCurve;
+
+    const data = [
+      lineTrace(xs, ys, {
+        line: { color: t.s1, width: 2 }, name: "n for 50% odds (approx)",
+        hovertemplate: "<b>%{y:.3e}</b> items<extra></extra>",
+      }),
+      { x: [pr.bits], y: [d.stats.hashN50], type: "scatter", mode: "markers",
+        marker: { color: t.s1, size: 9, line: { color: t.surface, width: 2 } },
+        name: "Your digest length",
+        hovertemplate: "<b>%{y:.3e}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Digest length (bits)", font: { color: t.textSecondary, size: 12 } },
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, Object.assign({
+        type: "log",
+        title: { text: "Items needed (log scale)", font: { color: t.textSecondary, size: 12 } },
+      }, plainDecadeTicks(Math.max(1, Math.min(...ys)), Math.max(...ys)))),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", x0: pr.bits, x1: pr.bits, yref: "paper", y0: 0, y1: 1,
+        line: { color: t.muted, width: 1 }, layer: "below",
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  // ==========================================================================
+  // The secretary problem
+  // ==========================================================================
+  /** P(win) against the skip threshold, with the optimum and the reader's own
+   *  threshold marked -- deliberately flat near the top, which is half the
+   *  point: the exact threshold barely matters near the optimum. */
+  function secThreshold(el, d, pr) {
+    const t = theme();
+    const { xs, ys } = d.winCurve;
+
+    const data = [
+      lineTrace(xs, ys, {
+        line: { color: t.s1, width: 2 }, name: "P(win)",
+        hovertemplate: "<b>%{y:.1%}</b> at skip=%{x}<extra></extra>",
+      }),
+      { x: [d.stats.bestS], y: [d.stats.bestProb], type: "scatter", mode: "markers",
+        marker: { color: t.s1, size: 9, line: { color: t.surface, width: 2 } },
+        name: "Optimal skip",
+        hovertemplate: "<b>optimum: %{y:.1%}</b><extra></extra>" },
+      { x: [pr.s], y: [d.stats.winProb], type: "scatter", mode: "markers",
+        marker: { color: t.s2, size: 9, line: { color: t.surface, width: 2 } },
+        name: "Your skip",
+        hovertemplate: "<b>you: %{y:.1%}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Candidates skipped before deciding",
+                 font: { color: t.textSecondary, size: 12 } },
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "Chance of choosing the best candidate",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".0%", rangemode: "tozero",
+      }),
+      hovermode: "x unified",
+      annotations: [{
+        x: d.stats.bestS, y: d.stats.bestProb, text: `best: skip ${d.stats.bestS}`,
+        showarrow: false, xanchor: "left", yanchor: "bottom", xshift: 8, yshift: 4,
+        font: { family: FONT, size: 11, color: t.textPrimary },
+        bgcolor: t.surface, borderpad: 3,
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /** Optimal P(win) against n, converging to 1/e -- log-x since the
+   *  convergence is a per-decade story. */
+  function secAsymptotic(el, d, pr) {
+    const t = theme();
+    const { ns, ys } = d.asymptotic;
+    const invE = 1 / Math.E;
+
+    const data = [
+      lineTrace(ns, ys, {
+        line: { color: t.s1, width: 2 }, name: "Optimal P(win)",
+        hovertemplate: "<b>%{y:.2%}</b> at n=%{x}<extra></extra>",
+      }),
+      { x: [pr.n], y: [d.stats.bestProb], type: "scatter", mode: "markers",
+        marker: { color: t.s1, size: 9, line: { color: t.surface, width: 2 } },
+        name: "Your n",
+        hovertemplate: "<b>you: %{y:.2%}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, Object.assign(
+        plainDecadeTicks(ns[0], ns[ns.length - 1]),
+        {
+          type: "log",
+          title: { text: "Number of candidates (log scale)",
+                   font: { color: t.textSecondary, size: 12 } },
+          // Tick decades read better rounded, but the range itself is tight
+          // to the actual data -- plainDecadeTicks floors its low end to the
+          // decade below (n=5 rounds down to a tick at 1), which would
+          // otherwise leave a quarter of the axis blank before the line ever
+          // starts.
+          range: [Math.log10(ns[0]), Math.log10(ns[ns.length - 1])],
+        },
+      )),
+      yaxis: axis(t, {
+        title: { text: "Optimal chance of winning",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".1%",
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", xref: "paper", x0: 0, x1: 1, yref: "y", y0: invE, y1: invE,
+        line: { color: t.deemph, width: 1, dash: "dot" }, layer: "below",
+      }],
+      annotations: [{
+        x: 1, y: invE, xref: "paper", text: `1/e = ${EP.fmt.pct(invE)}`,
+        showarrow: false, xanchor: "right", yanchor: "bottom", yshift: 2,
+        font: { family: FONT, size: 11, color: t.muted },
+        bgcolor: t.surface, borderpad: 2,
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  // ==========================================================================
+  // The two-envelope paradox
+  // ==========================================================================
+  /** Expected gain from swapping against the amount found -- the diverging
+   *  pair again, positive below the crossover and negative above it. */
+  function teGain(el, d, pr) {
+    const t = theme();
+    const { xs, gains } = d.gainCurve;
+
+    const posY = gains.map((v) => (v < 0 ? null : v));
+    const negY = gains.map((v) => (v > 0 ? null : v));
+
+    const data = [
+      { x: xs, y: negY, type: "scatter", mode: "lines",
+        line: { color: t.neg, width: 2 }, fill: "tozeroy",
+        fillcolor: hexA(t.neg, 0.1), name: "Swapping loses on average",
+        hovertemplate: "<b>%{y:$,.2f}</b> expected<extra></extra>" },
+      { x: xs, y: posY, type: "scatter", mode: "lines",
+        line: { color: t.s1, width: 2 }, fill: "tozeroy",
+        fillcolor: hexA(t.s1, 0.1), name: "Swapping gains on average",
+        hovertemplate: "<b>%{y:$,.2f}</b> expected<extra></extra>" },
+      { x: [pr.x], y: [d.stats.swapGain], type: "scatter", mode: "markers",
+        marker: { color: d.stats.swapGain >= 0 ? t.s1 : t.neg, size: 9,
+                  line: { color: t.surface, width: 2 } },
+        name: "What you found",
+        hovertemplate: "<b>%{y:$,.2f}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Amount found in your envelope",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickprefix: "$", tickformat: ",.0f",
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "Expected gain from swapping",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickprefix: "$", tickformat: ",.0f",
+        zeroline: true, zerolinecolor: t.axis, zerolinewidth: 1,
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", x0: d.stats.crossover, x1: d.stats.crossover,
+        yref: "paper", y0: 0, y1: 1,
+        line: { color: t.muted, width: 1, dash: "dot" }, layer: "below",
+      }],
+      annotations: [{
+        x: d.stats.crossover, y: 1, yref: "paper",
+        text: `crossover ${EP.fmt.money(d.stats.crossover)}`,
+        showarrow: false, xanchor: "left", yanchor: "top", xshift: 6, yshift: -4,
+        font: { family: FONT, size: 11, color: t.textSecondary },
+        bgcolor: t.surface, borderpad: 3,
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /** P(you're holding the smaller half) against the amount found, declining
+   *  from 50% toward 0% -- why the sign flips on the gain chart above. */
+  function teProb(el, d, pr) {
+    const t = theme();
+    const { xs, probs } = d.gainCurve;
+
+    const data = [
+      lineTrace(xs, probs, {
+        line: { color: t.s1, width: 2 }, name: "P(smaller half)",
+        hovertemplate: "<b>%{y:.1%}</b><extra></extra>",
+      }),
+      { x: [pr.x], y: [d.stats.pSmaller], type: "scatter", mode: "markers",
+        marker: { color: t.s1, size: 9, line: { color: t.surface, width: 2 } },
+        name: "What you found",
+        hovertemplate: "<b>you: %{y:.1%}</b><extra></extra>" },
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Amount found in your envelope",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickprefix: "$", tickformat: ",.0f",
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "P(you're holding the smaller half)",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".0%", range: [0, 1.02],
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", xref: "paper", x0: 0, x1: 1, yref: "y", y0: 0.5, y1: 0.5,
+        line: { color: t.deemph, width: 1, dash: "dot" }, layer: "below",
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  // ==========================================================================
+  // Optional stopping
+  // ==========================================================================
+  /** Cumulative false-positive rate against the number of looks, with the
+   *  nominal alpha marked -- the Armitage effect, drawn directly. */
+  function osCurve(el, d, pr) {
+    const t = theme();
+    const { xs, ys } = d.fpCurve;
+
+    const data = [
+      lineTrace(xs, ys, {
+        line: { color: t.neg, width: 2 }, fill: "tozeroy", fillcolor: hexA(t.neg, 0.08),
+        name: "Cumulative false-positive rate",
+        hovertemplate: "<b>%{y:.1%}</b> by look %{x}<extra></extra>",
+      }),
+    ];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Look number", font: { color: t.textSecondary, size: 12 } },
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "P(declared significant by now)",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".0%", rangemode: "tozero",
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", xref: "paper", x0: 0, x1: 1, yref: "y",
+        y0: pr.alpha, y1: pr.alpha,
+        line: { color: t.axis, width: 1, dash: "dot" }, layer: "below",
+      }],
+      annotations: [{
+        x: 1, y: pr.alpha, xref: "paper", text: `nominal ${EP.fmt.pct(pr.alpha)}`,
+        showarrow: false, xanchor: "right", yanchor: "bottom", yshift: 2,
+        font: { family: FONT, size: 11, color: t.muted },
+        bgcolor: t.surface, borderpad: 2,
+      }],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /** A handful of seeded z-statistic paths against the moving significance
+   *  boundary -- gambler's ruin's absorbing walls, redrawn as curves that
+   *  move outward with sqrt(n) instead of sitting flat. */
+  function osPaths(el, d, pr) {
+    const t = theme();
+    const { allZ } = d.sim;
+    const looks = pr.looks;
+    const xs = indices(looks + 1);
+    const z = EP.osZThreshold(pr.alpha);
+
+    const boundary = new Array(looks + 1), negBoundary = new Array(looks + 1);
+    boundary[0] = null; negBoundary[0] = null;
+    for (let k = 1; k <= looks; k++) {
+      boundary[k] = z;
+      negBoundary[k] = -z;
+    }
+
+    const sample = allZ.slice(0, Math.min(allZ.length, 8)).map((zs) => [0, ...zs]);
+    const data = [cloudTrace(sample, xs, t.cloud)];
+    data.push(lineTrace(xs, boundary, {
+      line: { color: t.neg, width: 1, dash: "dot" }, name: "Significance boundary",
+      hoverinfo: "skip",
+    }));
+    data.push(lineTrace(xs, negBoundary, {
+      line: { color: t.neg, width: 1, dash: "dot" }, hoverinfo: "skip", showlegend: false,
+    }));
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Look number", font: { color: t.textSecondary, size: 12 } },
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "z-statistic", font: { color: t.textSecondary, size: 12 } },
+        zeroline: true, zerolinecolor: t.axis, zerolinewidth: 1,
+      }),
+      hovermode: "x unified",
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  // ==========================================================================
+  // Simpson's paradox
+  // ==========================================================================
+  /**
+   * Success rate per treatment, in each subgroup and pooled -- grouped bars.
+   *
+   * The whole point is a comparison that survives twice and dies once, so the
+   * two subgroup pairs and the pooled pair must read as different *kinds* of
+   * thing rather than as three interchangeable categories. The pooled pair
+   * therefore sits behind its own wash with a divider in front of it: it is
+   * not a third subgroup, it is the same cases counted again with the
+   * subgroup information thrown away.
+   *
+   * Every bar carries its own number. The aqua/low-contrast relief rule in
+   * CLAUDE.md would require that on its own, but here it is load-bearing for
+   * a second reason: the pooled flip can be a couple of percentage points,
+   * which is a bar-height difference no reader should have to eyeball.
+   */
+  function simpsonBars(el, d) {
+    const t = theme();
+    const b = d.bars;
+    const groups = b.groups;
+    const last = groups.length - 1;
+
+    // Ratios stay ratios in the data; the axis does the percent formatting.
+    const bar = (ys, color, name) => ({
+      x: groups, y: ys, type: "bar", name,
+      marker: { color },
+      text: ys.map((v) => EP.fmt.pct(v)),
+      textposition: "outside",
+      textfont: { family: FONT, size: 11, color: t.textPrimary },
+      cliponaxis: false,
+      hovertemplate: `<b>%{y:.1%}</b> ${name}, %{x}<extra></extra>`,
+    });
+
+    const data = [
+      bar(b.a, t.s1, "Treatment A"),
+      bar(b.b, t.s2, "Treatment B"),
+    ];
+
+    let hi = 0;
+    for (const v of b.a.concat(b.b)) if (v > hi) hi = v;
+
+    const pooledA = b.a[last], pooledB = b.b[last];
+    const leader = pooledA >= pooledB ? "A" : "B";
+
+    const shapes = [
+      // The pooled pair's own ground, so it does not read as subgroup three.
+      { type: "rect", xref: "x", x0: last - 0.5, x1: last + 0.5,
+        yref: "paper", y0: 0, y1: 1,
+        fillcolor: hexA(t.deemph, 0.1), line: { width: 0 }, layer: "below" },
+      // ...and a hard divider in front of it.
+      { type: "line", xref: "x", x0: last - 0.5, x1: last - 0.5,
+        yref: "paper", y0: 0, y1: 1,
+        line: { color: t.axis, width: 1 }, layer: "below" },
+    ];
+
+    const annotations = [{
+      x: groups[last], y: 1, xref: "x", yref: "paper",
+      text: b.reverses
+        ? `order flips — ${leader} is ahead once the subgroups are merged`
+        : `order holds — ${leader} is ahead here too`,
+      showarrow: false, xanchor: "right", yanchor: "top", yshift: -4,
+      font: { family: FONT, size: 11, color: t.textPrimary },
+      bgcolor: t.surface, borderpad: 4,
+    }, {
+      x: groups[0], y: 1, xref: "x", yref: "paper",
+      text: "A ahead in every subgroup",
+      showarrow: false, xanchor: "left", yanchor: "top", yshift: -4,
+      font: { family: FONT, size: 11, color: t.textSecondary },
+      bgcolor: t.surface, borderpad: 4,
+    }];
+
+    const layout = baseLayout(t, {
+      barmode: "group",
+      // 2px of surface between the two bars of a pair, more between pairs.
+      bargap: 0.34,
+      bargroupgap: 0.1,
+      xaxis: axis(t, {
+        title: { text: "Case mix", font: { color: t.textSecondary, size: 12 } },
+        showgrid: false,
+      }),
+      yaxis: axis(t, {
+        title: { text: "Success rate", font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".0%", dtick: 0.2, range: [0, hi + 0.18],
+      }),
+      hovermode: "closest",
+      shapes,
+      annotations,
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /**
+   * The exact reversal boundary: the true treatment effect that a given
+   * allocation gap can just barely swamp.
+   *
+   * One curve, and the region under it shaded, because under it is where the
+   * paradox lives -- an effect smaller than the confounding budget does not
+   * survive pooling. The reader's own (gap, effect) is a marked point, the
+   * same "you are here" convention `ruin-curve` and `sec-threshold` use.
+   */
+  function simpsonBoundary(el, d) {
+    const t = theme();
+    const bd = d.boundary;
+    const { gaps, deltaCrit } = bd;
+    const here = bd.reverses ? t.neg : t.s1;
+
+    const data = [
+      { x: gaps, y: deltaCrit, type: "scatter", mode: "lines",
+        line: { color: t.neg, width: 2 },
+        fill: "tozeroy", fillcolor: hexA(t.neg, 0.1),
+        name: "Reversal boundary",
+        hovertemplate:
+          "<b>%{y:.1%}</b> effect needed at a %{x:.0%} allocation gap<extra></extra>" },
+      { x: [bd.gapNow], y: [bd.deltaNow], type: "scatter", mode: "markers",
+        marker: { color: here, size: 9, line: { color: t.surface, width: 2 } },
+        name: "You",
+        hovertemplate: "<b>you: %{y:.1%} effect at a %{x:.0%} gap</b><extra></extra>" },
+    ];
+
+    let critHi = 0;
+    for (const v of deltaCrit) if (v > critHi) critHi = v;
+    const yHi = Math.max(critHi, bd.deltaNow, 1e-3) * 1.2;
+    const yLo = Math.min(0, bd.deltaNow * 1.2);
+    const midGap = gaps[Math.floor(gaps.length / 2)];
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Allocation gap between the two treatments",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".0%",
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "True treatment effect (A − B, same in both subgroups)",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".0%", range: [yLo, yHi],
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", x0: bd.gapNow, x1: bd.gapNow, yref: "paper", y0: 0, y1: 1,
+        line: { color: t.muted, width: 1 }, layer: "below",
+      }],
+      annotations: [
+        { x: midGap, y: 0, yref: "y",
+          text: "below the line — pooling reverses the trend",
+          showarrow: false, xanchor: "center", yanchor: "bottom", yshift: 4,
+          font: { family: FONT, size: 11, color: t.textPrimary },
+          bgcolor: t.surface, borderpad: 3 },
+        { x: 0, y: 1, xref: "paper", yref: "paper",
+          text: "above the line — the effect survives pooling",
+          showarrow: false, xanchor: "left", yanchor: "top",
+          font: { family: FONT, size: 11, color: t.textSecondary },
+          bgcolor: t.surface, borderpad: 3 },
+        { x: bd.gapNow, y: bd.deltaNow,
+          text: `you: ${EP.fmt.pct(bd.deltaNow)} effect`,
+          showarrow: false, xanchor: "left", yanchor: "bottom",
+          xshift: 8, yshift: 4,
+          font: { family: FONT, size: 11, color: t.textPrimary },
+          bgcolor: t.surface, borderpad: 3 },
+      ],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  // ==========================================================================
+  // Bertrand's paradox
+  // ==========================================================================
+  /** Fixed colour per sampling rule, so a rule keeps its identity across the
+   *  curve chart and anything else that names all three at once. */
+  const BERTRAND_SERIES = [
+    { key: "endpoints", colorKey: "s1", label: "Random endpoints" },
+    { key: "radius", colorKey: "s2", label: "Random radius" },
+    { key: "midpoint", colorKey: "s3", label: "Random midpoint" },
+  ];
+
+  /**
+   * P(chord longer than the threshold) against the threshold, one line per
+   * definition of "random".
+   *
+   * The payoff chart: three exact answers to one question, differing
+   * everywhere except at the two degenerate ends. The reader's own threshold
+   * is a vertical guide with a marker where it meets each curve, so the three
+   * numbers can be read off the picture rather than only off the tiles.
+   */
+  function bertrandCurves(el, d) {
+    const t = theme();
+    const c = d.curves;
+
+    const data = [];
+    for (const s of BERTRAND_SERIES) {
+      data.push(lineTrace(c.cs, c[s.key], {
+        line: { color: t[s.colorKey], width: 2 }, name: s.label,
+        hovertemplate: `<b>%{y:.1%}</b> ${s.label}<extra></extra>`,
+      }));
+    }
+    for (const s of BERTRAND_SERIES) {
+      data.push({
+        x: [c.cNow], y: [c.pNow[s.key]], type: "scatter", mode: "markers",
+        marker: { color: t[s.colorKey], size: 9,
+                  line: { color: t.surface, width: 2 } },
+        name: `${s.label} at your threshold`,
+        hovertemplate: `<b>${s.label}: %{y:.1%}</b><extra></extra>`,
+      });
+    }
+
+    // Direct labels: three numbers is the entire finding, so they go on the
+    // chart rather than only in the legend. They sit left of the guide line
+    // because the interesting threshold (the inscribed triangle's side) is
+    // close to the right-hand edge.
+    const annotations = BERTRAND_SERIES.map((s) => ({
+      x: c.cNow, y: c.pNow[s.key],
+      text: `${s.label} ${EP.fmt.pct(c.pNow[s.key])}`,
+      showarrow: false, xanchor: "right", yanchor: "bottom",
+      xshift: -8, yshift: 4,
+      font: { family: FONT, size: 11, color: t.textPrimary },
+      bgcolor: t.surface, borderpad: 3,
+    }));
+
+    const layout = baseLayout(t, {
+      xaxis: axis(t, {
+        title: { text: "Threshold: chord length ÷ diameter",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".1f", dtick: 0.1, range: [0, 1],
+        showspikes: true, spikemode: "across", spikethickness: 1,
+        spikecolor: t.axis, spikedash: "solid",
+      }),
+      yaxis: axis(t, {
+        title: { text: "P(a random chord is longer than that)",
+                 font: { color: t.textSecondary, size: 12 } },
+        tickformat: ".0%", range: [0, 1.02],
+      }),
+      hovermode: "x unified",
+      shapes: [{
+        type: "line", x0: c.cNow, x1: c.cNow, yref: "paper", y0: 0, y1: 1,
+        line: { color: t.muted, width: 1 }, layer: "below",
+      }],
+      annotations,
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
+  /** Points on a circle of radius r, closed, for drawing it as a trace. */
+  function circlePoints(r, n) {
+    const x = new Array(n + 1), y = new Array(n + 1);
+    for (let i = 0; i <= n; i++) {
+      const a = (2 * Math.PI * i) / n;
+      x[i] = r * Math.cos(a);
+      y[i] = r * Math.sin(a);
+    }
+    return { x, y };
+  }
+
+  /**
+   * Every chord of one class (long or short) as ONE trace, with null
+   * separators between segments -- the same trick `cloudTrace` uses on the
+   * trajectory charts, and for the same reason: a few hundred two-point
+   * traces is a few hundred lots of per-trace overhead for one visual object,
+   * and the redraw crawls.
+   */
+  function chordTrace(c, keepLong, color, name) {
+    const x = [], y = [];
+    for (let i = 0; i < c.x0.length; i++) {
+      if (!!c.long[i] !== keepLong) continue;
+      x.push(c.x0[i], c.x1[i], null);
+      y.push(c.y0[i], c.y1[i], null);
+    }
+    return {
+      x, y, type: "scatter", mode: "lines",
+      line: { color: hexA(color, 0.45), width: 1 },
+      name, hoverinfo: "skip", showlegend: false,
+    };
+  }
+
+  /**
+   * The sampled chords themselves, as a diagram rather than a plot.
+   *
+   * Two things are load-bearing here. First, the axes are locked to equal
+   * aspect (`scaleanchor`/`scaleratio`): a circle drawn as an ellipse would
+   * make every "is this uniform?" judgement the chart invites into a lie.
+   * Second, the ticks and grid are off entirely -- the coordinates carry no
+   * meaning, only the shape of the cloud does, so axis chrome here is pure
+   * noise dressed up as precision.
+   *
+   * The midpoint cloud is the real lesson: the same circle, the same
+   * question, and three visibly different distributions of where the chords'
+   * middles land. So the midpoints are drawn as full-strength dots over
+   * washed-out chord strokes, not the other way round.
+   */
+  function bertrandChords(el, d) {
+    const t = theme();
+    const c = d.chords;
+    const n = c.x0.length;
+
+    let nLong = 0;
+    for (let i = 0; i < n; i++) if (c.long[i]) nLong++;
+
+    // A chord clears the threshold exactly when its midpoint is closer to the
+    // centre than sqrt(1 - c^2) -- so the cloud is separable by eye, and this
+    // circle is the line it is separable along.
+    const uThresh = Math.sqrt(Math.max(0, 1 - c.cNow * c.cNow));
+    const outer = circlePoints(1, 180);
+    const inner = circlePoints(uThresh, 180);
+
+    const mids = (keepLong, color, name) => {
+      const x = [], y = [], cd = [];
+      for (let i = 0; i < n; i++) {
+        if (!!c.long[i] !== keepLong) continue;
+        x.push(c.mx[i]); y.push(c.my[i]);
+        cd.push(Math.hypot(c.mx[i], c.my[i]));
+      }
+      return {
+        x, y, type: "scatter", mode: "markers",
+        marker: { color, size: 6, line: { color: t.surface, width: 1 } },
+        name, showlegend: false, customdata: cd,
+        hovertemplate:
+          `<b>${name}</b><br>midpoint %{customdata:.3f} from the centre<extra></extra>`,
+      };
+    };
+
+    const data = [
+      { x: outer.x, y: outer.y, type: "scatter", mode: "lines",
+        line: { color: t.axis, width: 1 },
+        hoverinfo: "skip", showlegend: false },
+      { x: inner.x, y: inner.y, type: "scatter", mode: "lines",
+        line: { color: t.deemph, width: 1, dash: "dot" },
+        hoverinfo: "skip", showlegend: false },
+      chordTrace(c, false, t.s2, "Shorter chord"),
+      chordTrace(c, true, t.s1, "Longer chord"),
+      mids(false, t.s2, "Short chord"),
+      mids(true, t.s1, "Long chord"),
+    ];
+
+    // Equal aspect and no chrome. `constrain: "domain"` keeps the locked
+    // aspect from stretching the plotting area past the card instead of
+    // letting the shorter axis give up its spare room.
+    const blank = {
+      showgrid: false, zeroline: false, showline: false,
+      showticklabels: false, ticks: "",
+      range: [-1.08, 1.08], constrain: "domain",
+    };
+
+    const layout = baseLayout(t, {
+      margin: { l: 16, r: 16, t: 16, b: 16 },
+      xaxis: Object.assign({}, blank),
+      yaxis: Object.assign({}, blank, { scaleanchor: "x", scaleratio: 1 }),
+      hovermode: "closest",
+      annotations: [
+        { x: 0, y: 1, xref: "paper", yref: "paper", text: c.label,
+          showarrow: false, xanchor: "left", yanchor: "top",
+          font: { family: FONT, size: 12, color: t.textPrimary },
+          bgcolor: t.surface, borderpad: 3 },
+        { x: 0, y: 0, xref: "paper", yref: "paper",
+          text: `${EP.fmt.count(nLong)} of ${EP.fmt.count(n)} chords ` +
+                `(${EP.fmt.pct(n ? nLong / n : 0)}) clear the threshold`,
+          showarrow: false, xanchor: "left", yanchor: "bottom",
+          font: { family: FONT, size: 11, color: t.textSecondary },
+          bgcolor: t.surface, borderpad: 3 },
+      ],
+    });
+
+    return Plotly.react(el, data, layout, CONFIG);
+  }
+
   Object.assign(EP, {
     // SAMPLE_PATHS is engine.js's -- charts.js only reads it.
     trajectory, histogram, sweep, theme, FLOOR, RUIN_PATHS,
@@ -1661,5 +2617,9 @@ window.EP = window.EP || {};
     pdScores, pdHeatmap, pdShares, strategyColors,
     wheelPaths, wheelBars, wheelSweep,
     mhKnow, mhDoors, sdPaths, sdSweep, insBand, insPool,
+    paDrift, paPaths, brPrevalence, brGrid, bdCollision, bdHash,
+    secThreshold, secAsymptotic, teGain, teProb, osCurve, osPaths,
+    simpsonBars, simpsonBoundary, bertrandCurves, bertrandChords,
+    BERTRAND_SERIES,
   });
 })(window.EP);
