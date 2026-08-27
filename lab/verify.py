@@ -875,184 +875,6 @@ def mc_real_world_itm(s, k, t, sigma, mu, q, call, n=2_000_000, seed=98):
     return float(hit.mean())
 
 
-def verify_wheel():
-    print("\nThe wheel strategy: Black-Scholes and real-world probabilities vs Monte Carlo")
-    cases = [
-        (100.0, 95.0, 0.5, 0.24, 0.03, 0.0),
-        (100.0, 100.0, 0.25, 0.20, 0.02, 0.01),
-        (50.0, 55.0, 1.0, 0.35, 0.04, 0.0),
-    ]
-    for s, k, t, sigma, r, q in cases:
-        for call in (True, False):
-            kind = "call" if call else "put"
-            price = (A.bs_call_price(s, k, t, sigma, r, q) if call
-                     else A.bs_put_price(s, k, t, sigma, r, q))
-            mc = mc_bs_price(s, k, t, sigma, r, q, call)
-            check(f"BS {kind} price s={s} k={k} t={t}", price, mc, tol=0.02, rel=True)
-            prob = A.real_world_itm_prob(s, k, t, sigma, mu=0.08, q=q, call=call)
-            mc_p = mc_real_world_itm(s, k, t, sigma, 0.08, q, call)
-            check(f"real-world ITM prob {kind} s={s} k={k} t={t}", prob, mc_p, tol=5e-3)
-
-    print("\n  put-call parity holds exactly, from the shared d1/d2")
-    for s, k, t, sigma, r, q in cases:
-        c = A.bs_call_price(s, k, t, sigma, r, q)
-        p = A.bs_put_price(s, k, t, sigma, r, q)
-        check(f"parity s={s} k={k} t={t}", c - p,
-              s * math.exp(-q * t) - k * math.exp(-r * t))
-
-    print("\n  buy-and-hold's closed form vs Monte Carlo terminal wealth")
-    for w0, mu, sigma, q, years in [(100000.0, 0.08, 0.20, 0.0, 5.0),
-                                    (50000.0, 0.05, 0.35, 0.02, 3.0)]:
-        h = A.hold_summary(w0, mu, sigma, q, years)
-        rng = np.random.default_rng(97)
-        z = rng.standard_normal(1_000_000)
-        st = w0 * np.exp((mu - q - 0.5 * sigma * sigma) * years
-                        + sigma * math.sqrt(years) * z)
-        check(f"E[W_T] w0={w0}", h["expected_final"], float(st.mean()),
-              tol=0.01, rel=True)
-        check(f"median W_T w0={w0}", h["median_final"], float(np.median(st)),
-              tol=0.01, rel=True)
-        check(f"P(below start) w0={w0}", h["p_below_start"],
-              float((st < w0).mean()), tol=5e-3)
-
-    print("\n  Box-Muller normal draws: mean 0, variance 1 over a long run")
-    randn = A.make_normal_generator(seed=42)
-    draws = np.array([randn() for _ in range(200_000)])
-    check("E[Z]", float(draws.mean()), 0.0, tol=0.02)
-    check("Var[Z]", float(draws.var()), 1.0, tol=0.02, rel=True)
-
-    print("\n  with the call take-profit disabled, calls resolve only at expiry")
-    fam = A.simulate_wheel_family(seed=7, call_tp=50.0)
-    s_ = fam["wheel"]["stats"]
-    ok = (s_["calls_tp"] == 0
-          and s_["puts_sold"] == s_["assignments"] + s_["puts_expired"]
-             + s_["puts_still_open"]
-          and s_["calls_sold"] == s_["called_away"] + s_["calls_expired"]
-             + s_["calls_closed_on_stop"] + s_["calls_still_open"])
-    if not ok:
-        FAILURES.append(("take-profit disabled -> only expiry outcomes", s_,
-                        "no early closes"))
-    print(f"  [{'ok  ' if ok else 'FAIL'}] puts {s_['puts_sold']} = "
-          f"{s_['assignments']} assigned + {s_['puts_expired']} expired; "
-          f"calls {s_['calls_sold']} = {s_['called_away']} called away + "
-          f"{s_['calls_expired']} expired -- no early close on either side")
-
-    print("\n  the acquisition leg must actually acquire")
-    # Regression guard for a defect that has now bitten twice. A stop on the
-    # put's own marked value cannot coexist with assignment, because a put on
-    # its way to being assigned must first balloon in value and trip the stop.
-    # Measured over the S&P's 2009-2026 history, -30%, -50% and -100% stops
-    # each produced ZERO assignments in seventeen years -- the arm sat in cash
-    # while the index went up eightfold. If this count ever returns to zero,
-    # the wheel has silently stopped being the wheel.
-    assigned_any = sum(A.simulate_wheel_family(seed=s)["wheel"]["stats"]["assignments"]
-                       for s in range(1, 9))
-    ok = assigned_any > 0
-    if not ok:
-        FAILURES.append(("wheel acquires shares over 8 seeds", assigned_any, "> 0"))
-    print(f"  [{'ok  ' if ok else 'FAIL'}] {assigned_any} contracts assigned "
-          f"across 8 seeds")
-
-    print("\n  the income leg must leave the shares room to appreciate")
-    # The mirror-image defect of the one above, and it bit just as hard. If a
-    # covered call is written the instant the shares arrive, `max(spot, basis)`
-    # is `basis` -- assignment happens precisely when spot is BELOW the strike
-    # that bought them -- so every call is struck at cost and being called away
-    # realises exactly zero on the shares. Measured on the S&P over 2009-2026
-    # that rule struck 100% of its calls at the basis and, with the account
-    # flat 95% of the time, turned an 8.35x index into +8.8%/yr. Writing only
-    # when price is back near its rolling high is what fixes it, so: some
-    # meaningful share of calls must be struck strictly ABOVE the basis.
-    above, total = 0, 0
-    for seed in range(1, 9):
-        w = A.simulate_wheel(A.simulate_gbm_path(seed=seed))
-        basis = None
-        for e in w["events"]:
-            if e["kind"] == "assigned":
-                basis = e["strike"]
-            elif e["kind"] == "sell_call" and basis is not None:
-                total += 1
-                if e["strike"] > basis * (1 + 1e-12):
-                    above += 1
-    frac = above / total if total else 0.0
-    ok = total > 0 and frac >= 0.25
-    if not ok:
-        FAILURES.append(("calls struck above cost basis", f"{above}/{total}",
-                         ">= 25%"))
-    print(f"  [{'ok  ' if ok else 'FAIL'}] {above}/{total} calls struck above "
-          f"the basis ({frac * 100:.0f}%) across 8 seeds")
-
-    print("\n  the account is not left sitting in cash")
-    # The put leg re-sells the same day a put resolves, so an account that is
-    # neither long nor short a put should be a rounding error, not a regime.
-    # Gating put re-entry on a dip (an earlier rule) left the S&P arm flat for
-    # 95% of seventeen years, earning the cash rate through an eightfold rally.
-    for seed in (1, 4, 7):
-        path = A.simulate_gbm_path(seed=seed)
-        w = A.simulate_wheel(path)
-        n = len(path) - 1
-        put_open = long_now = False
-        idle = 0
-        by_t = {}
-        for e in w["events"]:
-            by_t.setdefault(e["t"], []).append(e["kind"])
-        for t in range(1, n + 1):
-            for k in by_t.get(t, ()):
-                if k == "sell_put":
-                    put_open = True
-                elif k == "put_expired":
-                    put_open = False
-                elif k == "assigned":
-                    put_open, long_now = False, True
-                elif k in ("called_away", "stop_shares"):
-                    long_now = False
-            if not put_open and not long_now:
-                idle += 1
-        ok = idle / n < 0.05
-        if not ok:
-            FAILURES.append((f"wheel idle fraction (seed={seed})",
-                             f"{idle / n:.1%}", "< 5%"))
-        print(f"  [{'ok  ' if ok else 'FAIL'}] seed {seed}: idle "
-              f"{idle / n * 100:.1f}% of days")
-
-    print("\n  one position at a time: never short a put while holding shares")
-    for seed in (1, 4, 7):
-        path = A.simulate_gbm_path(seed=seed)
-        w = A.simulate_wheel(path)
-        # Replay the event tape: a sell_put may only follow a flat account.
-        long_now, bad = False, 0
-        for e in w["events"]:
-            if e["kind"] == "assigned":
-                long_now = True
-            elif e["kind"] in ("called_away", "stop_shares"):
-                long_now = False
-            elif e["kind"] == "sell_put" and long_now:
-                bad += 1
-        ok = bad == 0
-        if not ok:
-            FAILURES.append((f"single position (seed={seed})", bad, 0))
-        print(f"  [{'ok  ' if ok else 'FAIL'}] seed {seed}: {bad} puts sold "
-              f"while long")
-
-    print("\n  lot bookkeeping balances across a batch of seeds")
-    for seed in range(1, 9):
-        fam = A.simulate_wheel_family(seed=seed)
-        s_ = fam["wheel"]["stats"]
-        puts_ok = (s_["puts_sold"] == s_["assignments"] + s_["puts_expired"]
-                  + s_["puts_still_open"])
-        calls_ok = (s_["calls_sold"] == s_["called_away"]
-                   + s_["calls_expired"] + s_["calls_tp"]
-                   + s_["calls_closed_on_stop"] + s_["calls_still_open"])
-        equity_ok = min(fam["wheel"]["equity"]) > -1e-6
-        ok = puts_ok and calls_ok and equity_ok
-        if not ok:
-            FAILURES.append((f"wheel bookkeeping balances (seed={seed})", s_,
-                            "sold = every closed-lot category, summed"))
-        print(f"  [{'ok  ' if ok else 'FAIL'}] seed {seed}: puts balance "
-              f"{puts_ok}, calls balance {calls_ok}, equity never negative "
-              f"{equity_ok}")
-
-
 def verify_insurance():
     print("\nInsurance and risk pooling: closed forms vs Monte Carlo")
     print("\n  buyer's max premium is where insured growth = uninsured growth")
@@ -1917,36 +1739,6 @@ OS_GOLDEN = [
     dict(looks=20, batch=10, alpha=0.10),
 ]
 
-WHEEL_BS_GOLDEN = [
-    dict(s=100.0, k=95.0, t=0.5, sigma=0.24, r=0.03, q=0.0, mu=0.08),
-    dict(s=100.0, k=100.0, t=0.25, sigma=0.20, r=0.02, q=0.01, mu=0.05),
-    dict(s=50.0, k=55.0, t=1.0, sigma=0.35, r=0.04, q=0.0, mu=0.10),
-]
-
-HOLD_GOLDEN = [
-    dict(w0=100000.0, mu=0.08, sigma=0.20, q=0.0, years=5.0),
-    dict(w0=50000.0, mu=0.05, sigma=0.35, q=0.02, years=3.0),
-]
-
-# Small enough that a 1-year path still produces at least one full put-to-
-# assignment cycle at seed=7 (checked against the same trigger days the
-# manual investigation during development found: sell at t=89, assign at
-# t=215), while staying light enough for tests.html to check bit for bit.
-WHEEL_SIM_CFG = dict(w0=20000.0, s0=100.0, mu=0.08, sigma_rv=0.20, sigma_iv=0.24,
-                     r=0.03, q=0.0, years=1.0, x_months=6.0, y_months=3.0,
-                     dip_pct=0.05, sell_haircut=0.10, share_sl=0.20,
-                     call_tp=0.70,
-                     stock_fee_pct=0.005, opt_fee=0.65, seed=7)
-
-# Deliberately tiny -- this is only checking that engine.js's sweep loop
-# agrees with analytics.py's, not producing a chart-quality curve.
-WHEEL_SWEEP_CFG = dict(w0=20000.0, s0=100.0, mu=0.08, sigma_rv=0.20, r=0.03,
-                       q=0.0, years=1.0, x_months=6.0, y_months=3.0,
-                       dip_pct=0.05, sell_haircut=0.10, share_sl=0.20,
-                       call_tp=0.70, stock_fee_pct=0.005,
-                       opt_fee=0.65, points=4, n_seeds=3, spread_lo=-0.05,
-                       spread_hi=0.10, base_seed=500)
-
 
 def emit_golden():
     print("\nEmitting js/golden.js")
@@ -2360,84 +2152,6 @@ def emit_golden():
             "samples": samples,
         })
 
-    # -- the wheel strategy ---------------------------------------------------
-    wheel_bs = []
-    for c in WHEEL_BS_GOLDEN:
-        d1, d2 = A.bs_d1_d2(c["s"], c["k"], c["t"], c["sigma"], c["r"], c["q"])
-        wheel_bs.append({
-            "params": c,
-            "expect": {
-                "d1": d1, "d2": d2,
-                "callPrice": A.bs_call_price(c["s"], c["k"], c["t"], c["sigma"],
-                                             c["r"], c["q"]),
-                "putPrice": A.bs_put_price(c["s"], c["k"], c["t"], c["sigma"],
-                                           c["r"], c["q"]),
-                "realWorldCallProb": A.real_world_itm_prob(
-                    c["s"], c["k"], c["t"], c["sigma"], c["mu"], c["q"], call=True),
-                "realWorldPutProb": A.real_world_itm_prob(
-                    c["s"], c["k"], c["t"], c["sigma"], c["mu"], c["q"], call=False),
-            },
-        })
-
-    hold = []
-    for c in HOLD_GOLDEN:
-        h = A.hold_summary(**c)
-        hold.append({
-            "params": c,
-            "expect": {
-                "growthRate": h["growth_rate"],
-                "expectedFinal": h["expected_final"],
-                "medianFinal": h["median_final"],
-                "pBelowStart": h["p_below_start"],
-                "q05": h["q05"], "q95": h["q95"],
-            },
-        })
-
-    normals = {}
-    for seed in (42, 7):
-        randn = A.make_normal_generator(seed)
-        normals[str(seed)] = [randn() for _ in range(8)]
-
-    fam = A.simulate_wheel_family(**WHEEL_SIM_CFG)
-    wheel_sim = {
-        "config": {
-            "w0": WHEEL_SIM_CFG["w0"], "s0": WHEEL_SIM_CFG["s0"],
-            "mu": WHEEL_SIM_CFG["mu"], "sigmaRv": WHEEL_SIM_CFG["sigma_rv"],
-            "sigmaIv": WHEEL_SIM_CFG["sigma_iv"], "r": WHEEL_SIM_CFG["r"],
-            "q": WHEEL_SIM_CFG["q"], "years": WHEEL_SIM_CFG["years"],
-            "xMonths": WHEEL_SIM_CFG["x_months"], "yMonths": WHEEL_SIM_CFG["y_months"],
-            "dipPct": WHEEL_SIM_CFG["dip_pct"], "sellHaircut": WHEEL_SIM_CFG["sell_haircut"],
-            "shareSl": WHEEL_SIM_CFG["share_sl"], "callTp": WHEEL_SIM_CFG["call_tp"],
-            "stockFeePct": WHEEL_SIM_CFG["stock_fee_pct"],
-            "optFee": WHEEL_SIM_CFG["opt_fee"], "seed": WHEEL_SIM_CFG["seed"],
-        },
-        "path": fam["path"],
-        "wheelEquity": fam["wheel"]["equity"],
-        "wheelStats": fam["wheel"]["stats"],
-        "wheelEvents": fam["wheel"]["events"],
-        "putsOnlyEquity": fam["puts_only"]["equity"],
-        "dipEquity": fam["dip"],
-        "holdEquity": fam["hold"],
-    }
-
-    sweep_xs, sweep_gs = A.wheel_iv_sweep(**WHEEL_SWEEP_CFG)
-    wheel_sweep = {
-        "config": {
-            "w0": WHEEL_SWEEP_CFG["w0"], "s0": WHEEL_SWEEP_CFG["s0"],
-            "mu": WHEEL_SWEEP_CFG["mu"], "sigmaRv": WHEEL_SWEEP_CFG["sigma_rv"],
-            "r": WHEEL_SWEEP_CFG["r"], "q": WHEEL_SWEEP_CFG["q"],
-            "years": WHEEL_SWEEP_CFG["years"], "xMonths": WHEEL_SWEEP_CFG["x_months"],
-            "yMonths": WHEEL_SWEEP_CFG["y_months"], "dipPct": WHEEL_SWEEP_CFG["dip_pct"],
-            "sellHaircut": WHEEL_SWEEP_CFG["sell_haircut"],
-            "shareSl": WHEEL_SWEEP_CFG["share_sl"],
-            "callTp": WHEEL_SWEEP_CFG["call_tp"],
-            "stockFeePct": WHEEL_SWEEP_CFG["stock_fee_pct"], "optFee": WHEEL_SWEEP_CFG["opt_fee"],
-            "points": WHEEL_SWEEP_CFG["points"], "nSeeds": WHEEL_SWEEP_CFG["n_seeds"],
-            "spreadLo": WHEEL_SWEEP_CFG["spread_lo"], "spreadHi": WHEEL_SWEEP_CFG["spread_hi"],
-            "baseSeed": WHEEL_SWEEP_CFG["base_seed"],
-        },
-        "xs": sweep_xs, "gs": sweep_gs,
-    }
 
     payload = {
         "prng": prng, "cases": cases, "sim": sim, "binom": binom,
@@ -2455,8 +2169,6 @@ def emit_golden():
         "twoenv": twoenv,
         "optstop": optstop, "optstopSim": optstop_sim,
         "simpsons": simpsons, "bertrand": bertrand,
-        "wheelBs": wheel_bs, "hold": hold, "normals": normals,
-        "wheelSim": wheel_sim, "wheelSweep": wheel_sweep,
     }
     out = os.path.join(ROOT, "js", "golden.js")
     with open(out, "w") as fh:
@@ -2486,7 +2198,6 @@ if __name__ == "__main__":
     verify_monty()
     verify_shannon()
     verify_insurance()
-    verify_wheel()
     verify_parrondo()
     verify_base_rates()
     verify_birthday()

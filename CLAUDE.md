@@ -31,15 +31,13 @@ That is a deliberate constraint, not an oversight:
 
 | Path | Role |
 |---|---|
-| `lab/analytics.py` | **Source of truth.** Fourteen numbered sections: the multiplicative coin, gambler's ruin, St Petersburg, the prisoner's dilemma, Monty Hall, Shannon's demon, insurance and risk pooling, the wheel strategy, Parrondo's paradox, base rates, the birthday problem, the secretary problem, the two-envelope paradox, optional stopping. |
+| `lab/analytics.py` | **Source of truth.** Fifteen numbered sections: the multiplicative coin, gambler's ruin, St Petersburg, the prisoner's dilemma, Monty Hall, Shannon's demon, insurance and risk pooling, Parrondo's paradox, base rates, the birthday problem, the secretary problem, the two-envelope paradox, optional stopping, Simpson's paradox, Bertrand's paradox. |
 | `lab/verify.py` | Checks the closed forms against Monte Carlo, then writes `js/golden.js`. |
 | `js/engine.js` | Simulation + the same closed forms, mirroring `analytics.py` section for section. |
 | `js/scenarios.js` | The scenario registry. Adding a scenario touches only this file plus a chart if it needs a new form. |
 | `js/charts.js` | Plotly wrappers. Reads all colour from CSS custom properties. |
 | `js/app.js` | Page wiring: the `CHART_KINDS` registry, controls, tiles, legends, table views, theme. |
 | `tests.html` | Runs `engine.js` against `js/golden.js` in the browser. |
-| `lab/fetch_market_data.py` | Offline, one-shot: fetches real daily prices from Yahoo Finance and writes `js/market_data.js`. Not part of the Python-derives-JS-ships contract above — there is no closed form to check a price against, so it has no `verify.py` case. Re-run it to move "present day" forward. |
-| `js/market_data.js` | **Generated, not hand-edited.** `window.EP_MARKET`: real daily closes (2009–present) for 5 indices and 20 stocks, for the wheel scenario's "choose your underlying" control. |
 
 If you change a formula in `engine.js`, change it in `analytics.py` and re-run
 `python lab/verify.py`. A formula that exists in only one of the two is a bug.
@@ -151,20 +149,6 @@ checked. Worth remembering when driving the page programmatically — move the
 pointer (or scroll) away from the controls row before dispatching wheel/scroll
 events.
 
-**Two different tolerance classes exist now, not one.** Every scenario before
-the wheel checked JS against Python at 1e-8/1e-9, because every quantity was
-either exact arithmetic or the shared mulberry32 PRNG, and both sides compute
-those bit-for-bit identically. The wheel introduces a second class: `normCdf`
-and `normPpf` are *approximations* in `engine.js` (Abramowitz-Stegun and
-Acklam) checked against scipy's exact routines in `analytics.py`, and every
-Black-Scholes price, real-world ITM probability, and buy-and-hold quantile
-runs through one of them. `tests.html` holds that whole family to 1e-5/1e-6,
-deliberately looser than the PRNG-only bar (`path[i]`, dip and hold equity
-never call either function, so they stay at 1e-9). Adding a scenario with its
-own transcendental approximation should reuse this split rather than
-discovering it again by watching an all-green suite turn red at 1e-9 for a
-value that is correct to six decimal places.
-
 **A relative tolerance cannot compare two numbers that are each "zero plus
 floating-point noise."** Shannon's demon's `stockGrowth` is analytically zero
 for a symmetric coin; Python and JS each land within 1 ULP of it but not of
@@ -172,74 +156,6 @@ each other, and `abs(got-want)/abs(want)` explodes when `want` is ~1e-17. Same
 failure mode as the St Petersburg infinity case above, same fix: `tests.html`
 now switches to `absTol` whenever the golden value itself is smaller than
 1e-9, rather than trusting a relative bar to mean anything near a true zero.
-
-**A helper's own parameter name is not the scenario's field name, and passing
-`pr` straight through hides the mismatch instead of erroring on it.**
-`holdSummary`/`hold_summary` take a parameter called `sigma`, standalone; the
-wheel's own params object calls the same quantity `sigmaRv`, because `sigmaIv`
-also exists and both need distinct names. Calling `holdSummary(pr)` directly
-compiles, runs, and returns `NaN` propagated all the way through -- `pr.sigma`
-is `undefined`, and `undefined * dt` degrades to `NaN` silently rather than
-throwing. `simulateGbmPath` had the identical trap for the same reason.
-Neither was caught by writing the code carefully; both were caught by running
-it and finding `NaN`/`null` in the output. Map field names explicitly at the
-call site (`holdSummary({ sigma: pr.sigmaRv, ... })`) whenever a shared helper
-predates a scenario that needs a more specific name for the same quantity.
-
-**A risk control defined on the wrong variable can silently delete the
-strategy it protects, and every test will still pass — and this bit the wheel
-*twice*, from two different stop thresholds.** A stop on the put's own marked
-value is incompatible with the wheel's purpose: any path ending in assignment
-must first push the short put deep enough into the money to trip the stop, so
-the stop fires first, essentially always. This is not a knife-edge -30%
-threshold either — -30%, -50%, and even -100% (a threshold that cannot be
-reached by a real short position, since 100% of premium is the max possible
-gain) *all* produced zero assignments over the S&P's 2009-2026 history. Only
-around -200% did the stop stop blocking assignment, by which point it is not
-meaningfully a stop. The fix that finally held: no stop on the put at all —
-its premium is banked the moment it is sold, so there is nothing left on that
-leg to protect — and the one loss cap in the strategy sits on the *shares*
-instead, which carry a real, unbanked, open-ended mark that a stop can
-meaningfully cut. Nothing about bookkeeping or parity testing catches this
-kind of bug: the identities balance (zero is a valid count), Python and JS
-agree (both sides are equally wrong), and the equity curve looks smooth and
-plausible. What catches it is printing the event counts and reading them, and
-asserting the scenario's stated goal actually happens — `verify_wheel` checks
-that assignments across a batch of seeds is greater than zero.
-
-**The same class of bug then bit the wheel twice more, and both times the
-symptom was the return, not a failing test. For a strategy scenario, measure
-*time in the position* and put it on a tile — it is the number that moves the
-result, and nothing else on the page reveals it.** Two rules, each of which
-reads as ordinary risk discipline, each of which quietly deleted most of the
-return:
-
-- **Gating put re-entry on a dip.** Waiting for price to fall 5% below its
-  rolling high before selling the *next* put left the account flat 95% of the
-  time over the S&P's 2009–2026 history, earning the cash rate through an
-  eightfold rally. The error is conceptual: the cash-secured put is the
-  instrument that pays you to wait, so waiting in cash *before* selling one is
-  strictly dominated. Puts now sell from any idle cash, immediately, whether
-  or not shares are already held.
-- **Writing the covered call as soon as the shares arrive.** Assignment
-  happens precisely when the put finished in the money — i.e. with spot
-  *below* the strike that bought the shares — so the protective floor
-  `max(spot, basis)` collapses to `basis` on exactly the paths that reach it.
-  100% of calls were struck at cost, being called away realised exactly zero
-  on the shares, and the arm could earn premium and nothing else. Calls are
-  now written only at a **record high**, which is by construction above every
-  price that ever bought shares, so the strike is always above cost.
-
-Together those two took the S&P arm from +8.8%/yr holding stock 4.6% of the
-time to +14.1%/yr holding it 100% of the time, against buy-and-hold's +12.1%.
-`verify_wheel` now guards all three properties: assignments happen, calls are
-struck above the basis, and the idle-cash fraction stays under 5%.
-
-Note the tension with the all-time-high trap recorded below: gating calls on a
-record high is safe *here* only because idle cash also buys stock outright, so
-the account is always long and a record high always finds shares to write
-against. The earlier version had no such floor, and the same gate shut the
-call leg for good after a drawdown.
 
 **A closed form should not clamp its own inputs — `derive()` should.** Several
 formulas here are only meaningful on a restricted domain: Simpson's needs
@@ -260,46 +176,6 @@ values. The endpoint and midpoint rules genuinely cross at exactly
 `c = 1/sqrt(2)`, where both equal 1/2; the classical ordering holds only
 because `sqrt(3)/2` sits above that crossing. The test now asserts the true
 statement plus the exact crossing identity.
-
-**Two arms that are supposed to differ can collapse onto each other, and a
-chart will not tell you.** Two different versions of this scenario produced a
-wheel that was, on the default seed, pixel-identical to the puts-only arm —
-once because the covered-call leg was gated on a fresh *all-time* high (which
-a drawdown can leave shut for good), and again because the put's stop-loss
-above made assignment near-impossible in the first place, so there was rarely
-a share position for the call leg to act on at all. A comparison scenario
-should assert its arms actually diverge; identical lines read as a rendering
-bug, and worse, read as a *finding*.
-
-**A cohort still open when the horizon ends is a fourth outcome, not a
-missing one.** `simulateWheel`'s bookkeeping identity is `sold = closed early
-+ expired + assigned/called-away + still-open` -- the last term exists because
-a six-month put tenor and a five-year horizon routinely land mid-cohort at the
-last day simulated. Dropping it made `puts_sold` disagree with the sum of
-every *other* bucket by exactly the size of the last cohort, which reads like
-a bookkeeping bug and is actually just an unfinished trade at the edge of the
-chart.
-
-**Real market data is baked in once, offline — never fetched at request time.**
-This is a static GitHub Pages site with no backend, so `js/market_data.js` is
-generated by running `lab/fetch_market_data.py` against Yahoo Finance's public
-chart endpoint and committing the output, the same way `js/golden.js` is
-generated by `verify.py` rather than hand-written. Two consequences worth
-remembering: (1) "present day" on the wheel's real-data option is frozen at
-whenever the script last ran, not actually live — re-run it to move that
-forward; (2) it is `adjclose`, not `close` — split- and dividend-adjusted —
-because an unadjusted close would silently show a fake price collapse on every
-split date and understate a stock's real total return by however much it has
-paid in dividends since 2009.
-
-**A real price series has its own scale and currency; the wheel's contract
-math assumes neither.** 100-shares-per-contract sizing against the S&P 500's
-raw level (~4 digits) or the Nikkei's (~5 digits, in yen) would price a single
-lot far outside any sane starting-capital slider. `derive()` in the wheel's
-scenario entry rebases every real series to start at `s0` before handing it to
-`simulateWheelFamily` — indexed-to-100 is standard practice for comparing
-returns across securities, and it means the mechanics never need to know or
-care what the real security's price level or currency was.
 
 **A literal `*/` inside a `/** ... */` docstring ends the comment early, and
 the syntax error it produces is not near the mistake.** Two-envelope's

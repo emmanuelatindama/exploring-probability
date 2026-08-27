@@ -1546,464 +1546,6 @@ window.EP = window.EP || {};
   }
 
   // ==========================================================================
-  // The wheel strategy -- mirrors lab/analytics.py section 8
-  // ==========================================================================
-  // No closed form for the strategy itself -- see the section note in
-  // analytics.py. What is exact: Black-Scholes prices, the real-world (not
-  // risk-neutral) probability a single option finishes ITM, and buy-and-hold's
-  // terminal distribution. Everything else is a seeded simulation.
-  //
-  // Phi and its inverse are approximated here (Abramowitz-Stegun 7.1.26 and
-  // Acklam's algorithm), not computed exactly the way scipy.stats.norm does in
-  // Python. That is a TOLERANCE-matched contract with analytics.py, not the
-  // bit-exact one mulberry32 and the normal generator below are -- 1e-6 is the
-  // bar tests.html holds this pair to, and both approximations clear it with
-  // room to spare (worst-case absolute error ~1.5e-7 for Phi itself).
-
-  const TRADING_DAYS = 252;
-  const TRADING_DAYS_PER_MONTH = 21;
-
-  /** Standard normal CDF, via the Abramowitz-Stegun rational approximation of
-   *  erf (max absolute error ~1.5e-7). */
-  function normCdf(x) {
-    const z = Math.abs(x) / Math.SQRT2;
-    const t = 1 / (1 + 0.3275911 * z);
-    const poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 +
-      t * (-1.453152027 + t * 1.061405429))));
-    const erf = 1 - poly * Math.exp(-z * z);
-    return 0.5 * (1 + (x < 0 ? -erf : erf));
-  }
-
-  /** Standard normal quantile, via Acklam's rational approximation (~2.6e-9
-   *  relative error). Used only for buy-and-hold's closed-form quantiles --
-   *  nothing path-dependent needs an inverse CDF. */
-  function normPpf(p) {
-    if (p <= 0) return -Infinity;
-    if (p >= 1) return Infinity;
-    const a = [-3.969683028665376e+01, 2.209460984245205e+02,
-      -2.759285104469687e+02, 1.383577518672690e+02,
-      -3.066479806614716e+01, 2.506628277459239e+00];
-    const b = [-5.447609879822406e+01, 1.615858368580409e+02,
-      -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01];
-    const c = [-7.784894002430293e-03, -3.223964580411365e-01,
-      -2.400758277161838e+00, -2.549732539343734e+00,
-      4.374664141464968e+00, 2.938163982698783e+00];
-    const d = [7.784695709041462e-03, 3.224671290700398e-01,
-      2.445134137142996e+00, 3.754408661907416e+00];
-    const plow = 0.02425, phigh = 1 - plow;
-    if (p < plow) {
-      const q = Math.sqrt(-2 * Math.log(p));
-      return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
-             ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
-    }
-    if (p <= phigh) {
-      const q = p - 0.5, r = q * q;
-      return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q /
-             (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
-    }
-    const q = Math.sqrt(-2 * Math.log(1 - p));
-    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
-            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
-  }
-
-  /** Black-Scholes d1 and d2. Exact, given the model's own assumptions.
-   *  d2 = d1 - sigma*sqrt(t) is the same expression real-world ITM
-   *  probability reuses with mu in place of r -- see realWorldItmProb. */
-  function bsD1D2(s, k, t, sigma, r, q) {
-    r = r || 0; q = q || 0;
-    if (t <= 0 || sigma <= 0) {
-      const d = s > k ? Infinity : (s < k ? -Infinity : 0);
-      return [d, d];
-    }
-    const vt = sigma * Math.sqrt(t);
-    const d1 = (Math.log(s / k) + (r - q + 0.5 * sigma * sigma) * t) / vt;
-    return [d1, d1 - vt];
-  }
-
-  /** Black-Scholes European call. Exact under the model's own assumptions. */
-  function bsCallPrice(s, k, t, sigma, r, q) {
-    r = r || 0; q = q || 0;
-    if (t <= 0) return Math.max(s - k, 0);
-    const [d1, d2] = bsD1D2(s, k, t, sigma, r, q);
-    return s * Math.exp(-q * t) * normCdf(d1) - k * Math.exp(-r * t) * normCdf(d2);
-  }
-
-  /** Black-Scholes European put, from the same d1/d2 the call uses. */
-  function bsPutPrice(s, k, t, sigma, r, q) {
-    r = r || 0; q = q || 0;
-    if (t <= 0) return Math.max(k - s, 0);
-    const [d1, d2] = bsD1D2(s, k, t, sigma, r, q);
-    return k * Math.exp(-r * t) * normCdf(-d2) - s * Math.exp(-q * t) * normCdf(-d1);
-  }
-
-  /** P(a single option finishes ITM) under the physical measure (drift mu),
-   *  not the risk-neutral one (rate r) Black-Scholes prices with. Exact. */
-  function realWorldItmProb(s, k, t, sigma, mu, q, call) {
-    mu = mu || 0; q = q || 0;
-    if (t <= 0) return (s > k) === call ? 1 : 0;
-    const [, d2] = bsD1D2(s, k, t, sigma, mu, q);
-    return call ? normCdf(d2) : normCdf(-d2);
-  }
-
-  /** E[ln(S_T/S_0)] / T: buy-and-hold's time-average growth rate. Exact. */
-  function holdGrowthRate(mu, sigma, q) {
-    return mu - (q || 0) - 0.5 * sigma * sigma;
-  }
-
-  /** Exact terminal-wealth statistics for buy-and-hold under GBM. Nothing
-   *  here is simulated -- contrast with the wheel, where nothing is exact. */
-  function holdSummary(pr) {
-    const { w0, mu, sigma, q, years } = pr;
-    const g = holdGrowthRate(mu, sigma, q);
-    const vt = sigma * Math.sqrt(Math.max(years, 0));
-    return {
-      growthRate: g,
-      expectedFinal: w0 * Math.exp((mu - (q || 0)) * years),
-      medianFinal: w0 * Math.exp(g * years),
-      pBelowStart: vt > 0 ? normCdf(-(g * years) / vt) : (g < 0 ? 1 : 0),
-      q05: w0 * Math.exp(g * years + vt * normPpf(0.05)),
-      q95: w0 * Math.exp(g * years + vt * normPpf(0.95)),
-    };
-  }
-
-  /** Standard-normal draws from the shared mulberry32 uniform stream, via
-   *  Box-Muller. The second of each pair is cached and returned on the next
-   *  call rather than discarded -- lab/analytics.py:make_normal_generator
-   *  caches in the same slot, which is what lets a seeded path agree beyond
-   *  its first draw. */
-  function makeNormalGenerator(seed) {
-    const rand = mulberry32(seed);
-    let spare = null;
-    return function randn() {
-      if (spare !== null) {
-        const z = spare;
-        spare = null;
-        return z;
-      }
-      const u1 = rand(), u2 = rand();
-      const r = Math.sqrt(-2 * Math.log(Math.max(u1, 1e-300)));
-      const theta = 2 * Math.PI * u2;
-      spare = r * Math.sin(theta);
-      return r * Math.cos(theta);
-    };
-  }
-
-  /** One daily-close price path under GBM. Not exact -- the shared randomness
-   *  every arm of the scenario is compared on, drawn once and read by all
-   *  four rather than once per arm. */
-  function simulateGbmPath(pr) {
-    // sigmaRv, not the generic "sigma" bsD1D2 and friends use -- this path is
-    // always drawn at the REALIZED vol; sigmaIv only prices the options
-    // written against it, in simulateWheel.
-    const { s0, mu, sigmaRv, q, years, seed } = pr;
-    const randn = makeNormalGenerator(seed);
-    const dt = 1 / TRADING_DAYS;
-    const n = Math.max(1, Math.round(years * TRADING_DAYS));
-    const drift = (mu - (q || 0) - 0.5 * sigmaRv * sigmaRv) * dt;
-    const vol = sigmaRv * Math.sqrt(dt);
-    const path = new Float64Array(n + 1);
-    path[0] = s0;
-    let s = s0;
-    for (let i = 1; i <= n; i++) {
-      s *= Math.exp(drift + vol * randn());
-      path[i] = s;
-    }
-    return path;
-  }
-
-  /** Buy the dip, sell at the next all-time high, repeat. No options -- the
-   *  options-free twin of the wheel's own entry/exit signal, continuous
-   *  rather than lot-quantized on purpose (see the scenario's story). Not
-   *  exact -- the entry/exit rule is path-dependent, same as the wheel's. */
-  function simulateDipStrategy(path, pr) {
-    const { xMonths, dipPct, stockFeePct, r, w0 } = pr;
-    const n = path.length - 1;
-    const window = Math.max(1, Math.round(xMonths * TRADING_DAYS_PER_MONTH));
-    const dt = 1 / TRADING_DAYS;
-    let cash = w0, shares = 0, ath = path[0], dipArmed = true;
-    const equity = new Float64Array(n + 1);
-    equity[0] = w0;
-    for (let t = 1; t <= n; t++) {
-      const s = path[t];
-      cash *= Math.exp(r * dt);
-      let hi = -Infinity;
-      for (let i = Math.max(0, t - window); i <= t; i++) if (path[i] > hi) hi = path[i];
-      const dipLevel = hi * (1 - dipPct);
-      if (s > dipLevel) dipArmed = true;
-      if (s > ath) ath = s;
-      if (shares === 0) {
-        if (dipArmed && s <= dipLevel) {
-          shares = (cash / (1 + stockFeePct)) / s;
-          cash = 0;
-          dipArmed = false;
-        }
-      } else if (s >= ath) {
-        cash = shares * s * (1 - stockFeePct);
-        shares = 0;
-      }
-      equity[t] = cash + shares * s;
-    }
-    return equity;
-  }
-
-  /** The wheel, or with includeCalls=false the puts-only arm. Tuned to
-   *  maximise time holding the stock: any idle cash sells a cash-secured put
-   *  whether or not shares are already held, a stub too small for a contract
-   *  buys stock outright, and covered calls are written only at a *record*
-   *  high -- a new maximum of the whole path so far, which is by construction
-   *  above every price that ever bought shares.
-   *
-   *  Mirrors analytics.py:simulate_wheel. See that docstring for the two rule
-   *  sets this replaced and why each destroyed most of the return: gating put
-   *  re-entry on a dip left the S&P arm flat 95% of 2009-2026, and writing the
-   *  call the moment the shares arrived struck 100% of calls at the cost basis
-   *  (assignment happens with spot BELOW the strike that bought them, so
-   *  max(spot, basis) collapses to basis and being called away realises zero). */
-  function simulateWheel(path, pr, includeCalls) {
-    const { xMonths, yMonths, dipPct, sellHaircut, shareSl, callTp,
-            sigmaIv, r, q, stockFeePct, optFee, w0 } = pr;
-    const n = path.length - 1;
-    const dt = 1 / TRADING_DAYS;
-    const putTenor = Math.max(1, Math.round(xMonths * TRADING_DAYS_PER_MONTH));
-    const callTenor = Math.max(1, Math.round(yMonths * TRADING_DAYS_PER_MONTH));
-
-    let cash = w0, collateral = 0, shares = 0, basis = 0;
-    let putLot = null, callLot = null;
-    let recordHigh = path[0];
-
-    const equity = new Float64Array(n + 1);
-    equity[0] = w0;
-    const events = [];
-    const stats = { putsSold: 0, putsExpired: 0, assignments: 0,
-      callsSold: 0, callsTp: 0, callsExpired: 0, calledAway: 0,
-      callsClosedOnStop: 0, sharesStopped: 0, sharesBought: 0,
-      putsStillOpen: 0, callsStillOpen: 0 };
-
-    /** Fold a new lot into the share-weighted average cost basis. */
-    const addShares = (qty, price) => {
-      basis = (basis * shares + price * qty) / (shares + qty);
-      shares += qty;
-    };
-
-    for (let t = 1; t <= n; t++) {
-      const s = path[t];
-      const g = Math.exp(r * dt);
-      cash = cash * g + collateral * (g - 1);
-
-      // A *record* high: the running maximum of the whole path so far, not a
-      // rolling window. The only moment a covered call is written.
-      const atRecord = s >= recordHigh;
-      if (atRecord) recordHigh = s;
-
-      // -- the put, held to expiry ---------------------------------------
-      if (putLot !== null && t >= putLot.expiry) {
-        const face = putLot.contracts * 100 * putLot.strike;
-        collateral -= face;
-        if (s < putLot.strike) {
-          cash -= face * stockFeePct;
-          addShares(putLot.contracts * 100, putLot.strike);
-          stats.assignments += putLot.contracts;
-          events.push({ t, kind: "assigned", contracts: putLot.contracts,
-            strike: putLot.strike });
-        } else {
-          cash += face;
-          stats.putsExpired += putLot.contracts;
-          events.push({ t, kind: "put_expired", contracts: putLot.contracts,
-            strike: putLot.strike });
-        }
-        putLot = null;
-      }
-
-      // -- any idle cash sells a put, long or flat ------------------------
-      if (putLot === null) {
-        const strike = s;
-        const nNew = Math.floor(cash / (100 * strike));
-        if (nNew > 0) {
-          const theo = bsPutPrice(s, strike, putTenor / TRADING_DAYS, sigmaIv, r, q);
-          const premium = theo * (1 - sellHaircut);
-          cash -= nNew * 100 * strike;
-          collateral += nNew * 100 * strike;
-          cash += nNew * (100 * premium - optFee);
-          putLot = { contracts: nNew, premium, strike, expiry: t + putTenor };
-          stats.putsSold += nNew;
-          events.push({ t, kind: "sell_put", contracts: nNew, strike });
-        }
-      }
-
-      // -- the stub that can never sell a contract buys stock outright ----
-      const odd = Math.floor(cash / (s * (1 + stockFeePct)));
-      if (odd > 0) {
-        cash -= odd * s * (1 + stockFeePct);
-        addShares(odd, s);
-        stats.sharesBought += odd;
-        events.push({ t, kind: "buy_shares", contracts: odd, strike: s });
-      }
-
-      // -- the share stop, the strategy's only loss cap ------------------
-      if (shares > 0 && s < basis * (1 - shareSl)) {
-        if (callLot !== null) {
-          const texp = Math.max(callLot.expiry - t, 0) / TRADING_DAYS;
-          const theo = texp > 0
-            ? bsCallPrice(s, callLot.strike, texp, sigmaIv, r, q)
-            : Math.max(s - callLot.strike, 0);
-          cash -= callLot.contracts * (100 * theo + optFee);
-          stats.callsClosedOnStop += callLot.contracts;
-          events.push({ t, kind: "close_call_on_stop",
-            contracts: callLot.contracts, strike: callLot.strike });
-          callLot = null;
-        }
-        cash += shares * s * (1 - stockFeePct);
-        events.push({ t, kind: "stop_shares", contracts: Math.floor(shares / 100),
-          strike: basis });
-        shares = 0; basis = 0;
-        stats.sharesStopped += 1;
-      }
-
-      // -- covered calls, only while long --------------------------------
-      if (shares > 0 && includeCalls) {
-        if (callLot !== null) {
-          const texp = Math.max(callLot.expiry - t, 0) / TRADING_DAYS;
-          const theo = texp > 0
-            ? bsCallPrice(s, callLot.strike, texp, sigmaIv, r, q)
-            : Math.max(s - callLot.strike, 0);
-          if (t >= callLot.expiry) {
-            if (s > callLot.strike) {
-              cash += callLot.contracts * 100 * callLot.strike * (1 - stockFeePct);
-              shares -= callLot.contracts * 100;
-              stats.calledAway += callLot.contracts;
-              events.push({ t, kind: "called_away", contracts: callLot.contracts,
-                strike: callLot.strike });
-              if (shares === 0) basis = 0;
-            } else {
-              stats.callsExpired += callLot.contracts;
-              events.push({ t, kind: "call_expired", contracts: callLot.contracts,
-                strike: callLot.strike });
-            }
-            callLot = null;
-          } else if ((callLot.premium - theo) / callLot.premium >= callTp) {
-            cash -= callLot.contracts * (100 * theo + optFee);
-            stats.callsTp += callLot.contracts;
-            events.push({ t, kind: "close_call", contracts: callLot.contracts,
-              strike: callLot.strike });
-            callLot = null;
-          }
-        }
-
-        // Only at a record high, and never below the basis. At a record high
-        // the second condition is already implied -- it is kept as a live
-        // assertion of the invariant the whole rule exists to create.
-        if (callLot === null && shares >= 100 && atRecord && s > basis) {
-          const nNew = Math.floor(shares / 100);
-          const strike = Math.max(s, basis);
-          const theo = bsCallPrice(s, strike, callTenor / TRADING_DAYS, sigmaIv, r, q);
-          const premium = theo * (1 - sellHaircut);
-          cash += nNew * (100 * premium - optFee);
-          callLot = { contracts: nNew, premium, strike, expiry: t + callTenor };
-          stats.callsSold += nNew;
-          events.push({ t, kind: "sell_call", contracts: nNew, strike });
-        }
-      }
-
-      equity[t] = cash + collateral + shares * s;
-    }
-
-    if (putLot !== null) stats.putsStillOpen = putLot.contracts;
-    if (callLot !== null) stats.callsStillOpen = callLot.contracts;
-
-    return { equity, events, stats };
-  }
-
-  function simulateWheelFamily(pr) {
-    const path = pr.realPath || simulateGbmPath(pr);
-    const wheel = simulateWheel(path, pr, true);
-    const putsOnly = simulateWheel(path, pr, false);
-    const dip = simulateDipStrategy(path, pr);
-    const holdShares = (pr.w0 / (1 + pr.stockFeePct)) / path[0];
-    const hold = new Float64Array(path.length);
-    for (let i = 0; i < path.length; i++) hold[i] = holdShares * path[i];
-    return { path, wheel, putsOnly, dip, hold };
-  }
-
-  /** Annualized log return: ln(final/initial)/years -- the metric every arm's
-   *  equity curve is reduced to, since a fixed horizon otherwise favours
-   *  whichever arm happened to be fully invested for more of it. */
-  function cagr(final, initial, years) {
-    if (final <= 0 || initial <= 0 || years <= 0) return -Infinity;
-    return Math.log(final / initial) / years;
-  }
-
-  /** Everything the wheel scenario's tiles and table need: the exact
-   *  single-contract anchors, buy-and-hold's exact distribution, and this
-   *  one seed's simulated outcome for all four arms. */
-  function wheelSummary(pr) {
-    const fam = simulateWheelFamily(pr);
-    // holdSummary's own parameter is named "sigma" (it stands alone; see the
-    // G.hold golden cases), so the wheel's sigmaRv is mapped in explicitly
-    // rather than handed over inside a same-named pr object that has no
-    // "sigma" key at all.
-    const hold = holdSummary({ w0: pr.w0, mu: pr.mu, sigma: pr.sigmaRv,
-      q: pr.q, years: pr.years });
-    const strike0 = pr.s0 * (1 - pr.dipPct);
-    const putProbNaive = realWorldItmProb(strike0, strike0, pr.xMonths / 12,
-      pr.sigmaRv, pr.mu, pr.q, false);
-    const callProbNaive = realWorldItmProb(pr.s0, pr.s0, pr.yMonths / 12,
-      pr.sigmaRv, pr.mu, pr.q, true);
-    const ws = fam.wheel.stats;
-    const assignedRate = ws.assignments / Math.max(1, ws.putsSold);
-    const last = (arr) => arr[arr.length - 1];
-    return {
-      wheelFinal: last(fam.wheel.equity),
-      putsOnlyFinal: last(fam.putsOnly.equity),
-      dipFinal: last(fam.dip),
-      holdFinalSample: last(fam.hold),
-      holdFinalExact: hold.expectedFinal,
-      holdMedianExact: hold.medianFinal,
-      wheelCagr: cagr(last(fam.wheel.equity), pr.w0, pr.years),
-      putsOnlyCagr: cagr(last(fam.putsOnly.equity), pr.w0, pr.years),
-      dipCagr: cagr(last(fam.dip), pr.w0, pr.years),
-      holdCagrSample: cagr(last(fam.hold), pr.w0, pr.years),
-      holdCagrExact: hold.growthRate,
-      putNaiveAssignProb: putProbNaive,
-      // Renamed from callNaiveCalledawayProb: nothing is ever called away
-      // now, so this is just the chance the call finishes in the money and
-      // has to be bought back.
-      callNaiveItmProb: callProbNaive,
-      simAssignRate: assignedRate,
-      putsSold: ws.putsSold,
-      putsExpired: ws.putsExpired,
-      assignments: ws.assignments,
-      callsSold: ws.callsSold,
-      callsTp: ws.callsTp,
-      calledAway: ws.calledAway,
-      callsClosedOnStop: ws.callsClosedOnStop,
-      sharesStopped: ws.sharesStopped,
-      callsExpired: ws.callsExpired,
-    };
-  }
-
-  /** Wheel CAGR against sigmaIv - sigmaRv, averaged over nSeeds paths per
-   *  point. Explicitly a Monte Carlo sweep, not a closed form -- see
-   *  lab/analytics.py:wheel_iv_sweep for why no exact version exists. */
-  function wheelIvSweep(pr) {
-    const { points, nSeeds, spreadLo, spreadHi, baseSeed, sigmaRv } = pr;
-    const xs = [], gs = [];
-    for (let i = 0; i < points; i++) {
-      const spread = spreadLo + (spreadHi - spreadLo) * i / Math.max(1, points - 1);
-      const sigmaIv = Math.max(0.01, sigmaRv + spread);
-      let total = 0;
-      for (let j = 0; j < nSeeds; j++) {
-        const fam = simulateWheelFamily(Object.assign({}, pr, {
-          sigmaIv, seed: baseSeed + i * nSeeds + j,
-        }));
-        total += cagr(fam.wheel.equity[fam.wheel.equity.length - 1], pr.w0, pr.years);
-      }
-      xs.push(spread);
-      gs.push(total / nSeeds);
-    }
-    return { xs, gs };
-  }
-
-  // ==========================================================================
   // Parrondo's paradox -- mirrors lab/analytics.py section 9
   // ==========================================================================
   /** Game A: a flat, slightly unfavourable coin. P(win) = 1/2 - eps. */
@@ -2369,12 +1911,59 @@ window.EP = window.EP || {};
     };
   }
 
+  // Inverse normal CDF (quantile function) via Acklam's approximation.
+  // Max absolute error ~1.5e-9; good enough for confidence intervals and
+  // significance tests.
+  function normPpf(p) {
+    if (p < 0 || p > 1) return NaN;
+    if (p === 0) return -Infinity;
+    if (p === 1) return Infinity;
+    const a1 = -3.969683028665376e+01;
+    const a2 =  2.221213436005305e+02;
+    const a3 = -2.821152023902548e+02;
+    const a4 =  1.340426573806121e+02;
+    const a5 = -1.621261369495933e+01;
+    const a6 =  1.637067800290565e-01;
+    const b1 = -5.447609879822406e+01;
+    const b2 =  1.615858368580409e+02;
+    const b3 = -1.556989798598866e+02;
+    const b4 =  6.680131188771972e+01;
+    const b5 = -1.328068155288572e+01;
+    const c1 = -7.784894002430293e-03;
+    const c2 = -3.223964580411365e-01;
+    const c3 = -2.400758277161838e+00;
+    const c4 = -2.549732539343734e+00;
+    const c5 =  4.374664141464968e+00;
+    const c6 =  2.938163357918633e+00;
+    const d1 =  7.784695709041462e-03;
+    const d2 =  3.224671290700398e-01;
+    const d3 =  2.445134137142996e+00;
+    const d4 =  3.754408661907416e+00;
+    const p_low = 0.02425;
+    const p_high = 1 - p_low;
+    let q, r, val;
+    if (p < p_low) {
+      q = Math.sqrt(-2 * Math.log(p));
+      val = (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+            ((((d1 * q + d2) * q + d3) * q + d4) * q + 1);
+    } else if (p <= p_high) {
+      q = p - 0.5;
+      r = q * q;
+      val = (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q /
+            (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1);
+    } else {
+      q = Math.sqrt(-2 * Math.log(1 - p));
+      val = -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+             ((((d1 * q + d2) * q + d3) * q + d4) * q + 1);
+    }
+    return val;
+  }
+
   // ==========================================================================
   // Optional stopping -- mirrors lab/analytics.py section 14
   // ==========================================================================
   /** Two-sided z critical value for a nominal per-look significance level.
-   *  Exact enough for this purpose via the same normPpf the wheel scenario
-   *  uses -- see engine.js's normPpf docstring for its own error bound. */
+   *  Exact enough for this purpose via normPpf's Acklam approximation. */
   const osZThreshold = (alpha) => normPpf(1 - alpha / 2);
 
   /**
@@ -2803,11 +2392,6 @@ window.EP = window.EP || {};
     insUninsuredGrowth, insInsuredGrowth, insBuyerMaxPremium, insSellerGrowth,
     insSellerMinPremium, insBuyerValue, insSellerValue, insPoolGrowth,
     insPoolLimit, insPoolBreakEven, insSummary, insPremiumCurve, insPoolCurve,
-    // the wheel strategy
-    normCdf, normPpf, bsD1D2, bsCallPrice, bsPutPrice, realWorldItmProb,
-    holdGrowthRate, holdSummary, makeNormalGenerator, simulateGbmPath,
-    simulateDipStrategy, simulateWheel, simulateWheelFamily, cagr,
-    wheelSummary, wheelIvSweep,
     // Parrondo's paradox
     paWinProbA, paWinProbB, paEffectiveWinProb, paTransition, paStationary,
     paDrift, paDriftCurve, paSummary, simulateParrondo,

@@ -697,60 +697,6 @@
       }),
     },
 
-    "wheel-paths": {
-      title: "One account, four strategies, the same stock",
-      cap: "Log scale. Markers show the wheel's own major transitions — worthless expiries and take-profit closes are far too frequent to mark, and are left to the table view.",
-      render: (node, d, pr) => ({
-        plot: EP.wheelPaths(node, d, pr),
-        legend: [
-          { color: getVar("--deemphasis"), label: "Buy and hold" },
-          { color: getVar("--series-4"), label: "Buy the dip, sell the high" },
-          { color: getVar("--series-2"), label: "Puts only (no covered calls)" },
-          { color: getVar("--series-1"), label: "The wheel" },
-          // Shapes mirror WHEEL_EVENT_MARKS in charts.js, not a generic dot:
-          // assigned and called-away share a hue and differ only filled-vs-open
-          // on the chart, so a dot for both made them indistinguishable here.
-          { color: getVar("--series-1"), shape: "tri-down", label: "Put sold" },
-          { color: getVar("--series-3"), shape: "dot", label: "Assigned" },
-          { color: getVar("--series-2"), shape: "tri-up", label: "Call sold" },
-          { color: getVar("--series-3"), shape: "dot-open", label: "Called away" },
-          { color: getVar("--diverging-neg"), shape: "cross", label: "Shares stopped out" },
-        ],
-        table: tableWheelPaths(d, pr),
-      }),
-    },
-
-    "wheel-bars": {
-      title: "Who won, on this one path",
-      cap: "Annualized growth rate. Rerun with a new seed and any of the four can come out on top.",
-      short: true,
-      render: (node, d) => ({
-        plot: EP.wheelBars(node, d),
-        legend: [
-          { color: getVar("--series-1"), shape: "rect", label: "The wheel" },
-          { color: getVar("--series-2"), shape: "rect", label: "Puts only" },
-          { color: getVar("--series-4"), shape: "rect", label: "Buy the dip, sell the high" },
-          { color: getVar("--deemphasis"), shape: "rect", label: "Buy and hold" },
-        ],
-        table: tableWheelBars(d),
-      }),
-    },
-
-    "wheel-sweep": {
-      title: "The wheel's growth rate vs its own edge",
-      cap: "Monte Carlo, not closed form — averaged over several seeds per point, because the assignment cycle, the record-high call trigger and the share stop are all path-dependent.",
-      short: true,
-      render: (node, d, pr) => ({
-        plot: EP.wheelSweep(node, d, pr),
-        legend: [
-          { color: getVar("--series-1"), label: "The edge wins" },
-          { color: getVar("--diverging-neg"), label: "Frictions win" },
-          { color: getVar("--series-1"), shape: "dot", label: "Your dialled-in spread" },
-        ],
-        table: tableWheelSweep(d, pr),
-      }),
-    },
-
     "pa-drift": {
       title: "Drift vs how often you play game B",
       cap: "Closed form — the stationary distribution of a 3-state Markov chain, not a simulated average.",
@@ -1542,50 +1488,6 @@
       rows.push([String(sizes[i]), F().pctSigned(growth[i])]);
     }
     return { head: ["Pool size", "Growth per period"], rows };
-  }
-
-  /** Every event on the wheel's own path, not just the ones the chart marks
-   *  -- top-ups and individual stop-outs live here, since they are too
-   *  frequent to mark on the plot without turning into visual noise. */
-  function tableWheelPaths(d, pr) {
-    const { wheel } = d.fam;
-    const EVENT_LABELS = {
-      sell_put: "Sold put",
-      put_expired: "Put expired worthless",
-      assigned: "Assigned",
-      sell_call: "Sold covered call",
-      close_call: "Call bought back at a profit",
-      close_call_on_stop: "Call bought back — shares stopping out",
-      call_expired: "Call expired worthless",
-      called_away: "Called away — shares sold",
-      stop_shares: "Shares stopped out",
-    };
-    const rows = wheel.events.map((e) => [
-      String(e.t), EVENT_LABELS[e.kind] || e.kind, String(e.contracts),
-      e.strike !== undefined ? F().money(e.strike) : "—",
-      F().money(wheel.equity[e.t]),
-    ]);
-    return { head: ["Day", "Event", "Contracts", "Strike", "Account value"], rows };
-  }
-
-  function tableWheelBars(d) {
-    const labels = { wheel: "The wheel", putsOnly: "Puts only",
-      dip: "Buy the dip, sell the high", hold: "Buy and hold" };
-    const rows = Object.keys(labels)
-      .map((k) => ({ k, cagr: d.stats.cagrs[k] }))
-      .sort((a, b) => b.cagr - a.cagr)
-      .map((r, i) => [`${i + 1}. ${labels[r.k]}`, F().pctSigned(r.cagr)]);
-    return { head: ["Strategy", "Annualized growth"], rows };
-  }
-
-  function tableWheelSweep(d, pr) {
-    const { xs, gs } = d.sweep;
-    const step = Math.max(1, Math.round(xs.length / 14));
-    const rows = [];
-    for (let i = 0; i < xs.length; i += step) {
-      rows.push([F().pctSigned(xs[i]), F().pctSigned(gs[i])]);
-    }
-    return { head: ["Implied − realized vol", "Wheel's growth rate"], rows };
   }
 
   function tablePaDrift(d) {
