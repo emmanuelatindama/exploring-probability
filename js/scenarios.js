@@ -2198,6 +2198,291 @@ window.EP = window.EP || {};
         "(O'Brien-Fleming and Pocock boundaries chief among them) that let " +
         "researchers look early and often without this bill coming due.",
     },
+    {
+      id: "coupon-collector",
+      status: "planned",
+      name: "The coupon collector's problem",
+      blurb:
+        "The first few prizes come fast. The last few take forever, and the " +
+        "gap is bigger than intuition expects.",
+      story:
+        "A cereal box holds one of n prizes, chosen at random each purchase. " +
+        "How many boxes before you have the full set? The first few prizes " +
+        "arrive almost every time you buy one; the last few take, on " +
+        "average, n purchases apiece. The total is n times the n-th harmonic " +
+        "number — about n ln n, not n — a fact folded into everything from " +
+        "quality-assurance test coverage to the mathematics behind vintage " +
+        "'double dixie cup' cereal promotions that some manufacturers used " +
+        "to slow collectors down on purpose.",
+      note:
+        "Will show expected draws to complete the set against n, alongside " +
+        "the naive-but-wrong guess of n itself, and the draw-by-draw curve " +
+        "of how long each successive new item takes to find — flat and " +
+        "fast at first, then swinging sharply upward as the collection " +
+        "nears completion.",
+    },
+    {
+      id: "sleeping-beauty",
+      status: "planned",
+      name: "The Sleeping Beauty problem",
+      blurb:
+        "She wakes up not knowing what day it is. Should she believe the " +
+        "coin came up heads with probability 1/2, or 1/3?",
+      story:
+        "Sleeping Beauty is put to sleep on Sunday. A fair coin is tossed: " +
+        "heads, she is woken once, on Monday; tails, she is woken Monday " +
+        "and Tuesday, with her memory of the Monday waking erased before " +
+        "Tuesday. Each time she wakes, she is asked her credence that the " +
+        "coin came up heads. Halfers say the coin is fair, so 1/2. Thirders " +
+        "say two of every three wakings follow tails, so 1/3. Adam Elga " +
+        "posed the problem in 2000, and philosophers have not agreed on an " +
+        "answer since — both sides can point to a self-consistent way of " +
+        "counting.",
+      note:
+        "Will run the experiment over many trials both ways — counting per " +
+        "coin toss and counting per waking — so the halfer and thirder " +
+        "answers each fall out of a genuine long-run frequency, and the " +
+        "disagreement is shown to be about which frequency the question is " +
+        "actually asking for.",
+    },
+    {
+      id: "three-prisoners",
+      status: "planned",
+      name: "The three prisoners problem",
+      blurb:
+        "Learning a rival will go free feels like good news for you too. " +
+        "Whether it actually is depends entirely on how you learned it.",
+      story:
+        "Three prisoners, A, B and C, and one will be pardoned at random. A " +
+        "asks the warden to name a prisoner other than himself who will be " +
+        "executed — surely harmless, since at least one of B or C always " +
+        "qualifies. The warden says B. Has A's own chance of pardon changed? " +
+        "Martin Gardner posed this in 1959, decades before Monty Hall made " +
+        "the same structure famous with doors and goats. The answer turns " +
+        "entirely on the rule the warden follows when both B and C are " +
+        "guilty — name one at random, or always favour a particular one — " +
+        "and different rules give genuinely different answers.",
+      note:
+        "Will let the warden's disclosure rule be dialled between 'names a " +
+        "loser uniformly at random' and 'always names a fixed prisoner when " +
+        "possible', showing A's updated probability of pardon shift with " +
+        "it — the same mechanism the Monty Hall tab isolates, one level " +
+        "more general.",
+    },
+    {
+      id: "boy-or-girl",
+      status: "planned",
+      name: "The boy-or-girl paradox",
+      blurb:
+        "\"At least one is a boy.\" The chance of two boys is 1/3 — until " +
+        "you change, very slightly, how you learned that fact.",
+      story:
+        "A family has two children, and you learn at least one is a boy. " +
+        "What is the probability both are boys? Not 1/2 — the family could " +
+        "be (boy, boy), (boy, girl) or (girl, boy), equally likely, and only " +
+        "one of those three has two boys, so 1/3. Martin Gardner popularised " +
+        "the puzzle in 1959, and it has kept being reinvented since: tell " +
+        "the same story as 'I met one of the children, a boy' instead of " +
+        "'at least one is a boy', and the answer moves to 1/2. Specify a day " +
+        "of the week the boy was born on and, notoriously, it moves again.",
+      note:
+        "Will run several different ways of *learning* the same fact — " +
+        "canvassing every family for 'at least one boy', versus meeting one " +
+        "randomly chosen child who happens to be a boy — side by side, so " +
+        "the different answers are traced to the different sampling " +
+        "processes rather than to the fact itself.",
+    },
+    {
+      id: "random-walk-recurrence",
+      status: "planned",
+      name: "Random walk recurrence",
+      blurb:
+        "A drunk man on a line or a plane always finds his way home. A " +
+        "drunk bird in three dimensions might not.",
+      story:
+        "Take a step left or right, each with probability 1/2, forever. Do " +
+        "you return to where you started? On a line, yes — with probability " +
+        "1. Wandering a two-dimensional grid the same way, still yes, " +
+        "probability 1. Let the walk loose in three dimensions or more and " +
+        "the answer flips: there is a positive chance of wandering off and " +
+        "never coming back. George Pólya proved this in 1921 and is said to " +
+        "have summarised it as 'a drunk man will find his way home, but a " +
+        "drunk bird may get lost forever.'",
+      note:
+        "Will simulate the walk in 1, 2, 3 and 4 dimensions from the same " +
+        "seed and track the running fraction of paths that have returned to " +
+        "the origin at least once, alongside the exact return probabilities " +
+        "in each dimension, so the 1D/2D-vs-3D-and-up divide is something " +
+        "you watch happen rather than take on faith.",
+    },
+    {
+      id: "waiting-time-paradox",
+      status: "planned",
+      name: "The waiting-time paradox",
+      blurb:
+        "Buses that arrive irregularly make your average wait longer than " +
+        "the average gap between them.",
+      story:
+        "If buses arrive every 10 minutes on average but irregularly, how " +
+        "long should you expect to wait? Naive answer: 5 minutes, half the " +
+        "gap. Actual answer: longer, often much longer — because you are " +
+        "more likely to arrive during a long gap than a short one, simply " +
+        "because long gaps take up more clock time. This is the inspection " +
+        "paradox, and it is not really about buses: it shows up wherever " +
+        "you sample an interval by landing inside it rather than by picking " +
+        "one uniformly at random, from server response times to the size of " +
+        "the household you grew up in.",
+      note:
+        "Will generate bus arrivals from an irregular (variance drives the " +
+        "effect) interval distribution and show a random passenger's " +
+        "expected wait pulling ahead of half the mean gap as the gaps get " +
+        "more irregular — collapsing back to the naive answer only in the " +
+        "special case where arrivals are perfectly regular.",
+    },
+    {
+      id: "matching-problem",
+      status: "planned",
+      name: "The matching problem",
+      blurb:
+        "Shuffle everyone's name tags and hand them back at random. The " +
+        "chance nobody gets their own converges to about 37%, not 0%.",
+      story:
+        "n people's name tags are shuffled and redealt at random. What is " +
+        "the probability not one person gets their own tag back? Intuition " +
+        "expects this to get harder — vanishingly likely — as n grows. It " +
+        "does not: the probability converges to 1/e, about 36.8%, and " +
+        "settles there almost immediately, differing from its limit by less " +
+        "than 1% once n reaches double digits. The problem dates to " +
+        "Pierre RĂ©mond de Montmort's 1708 'problème des rencontres', and a " +
+        "permutation with no matches at all is called a derangement.",
+      note:
+        "Will show P(zero matches) against n converging to 1/e almost " +
+        "immediately, next to the exact finite-n formula it is converging " +
+        "from, plus the full distribution of match counts — which turns " +
+        "out to be very nearly Poisson(1), a second coincidence sitting " +
+        "next to the first.",
+    },
+    {
+      id: "hat-check-problem",
+      status: "planned",
+      name: "The hat-check problem",
+      blurb:
+        "However many guests hand in a hat, the expected number who get " +
+        "their own back is exactly 1 — not approximately, exactly.",
+      story:
+        "The same shuffle as the matching problem, asked a different " +
+        "question: not 'does anyone match', but 'how many people, on " +
+        "average, get their own hat back'. Whether there are 10 guests or " +
+        "10 million, the expected count is exactly 1, on the nose, for " +
+        "every single n — a clean exact answer sitting right next door to " +
+        "the matching problem's converging-but-never-quite-arriving 1/e. " +
+        "Linearity of expectation is what makes it exact: each guest has " +
+        "probability 1/n of a correct return, and n of those sum to 1 " +
+        "however large n gets.",
+      note:
+        "Will show the expected number of correct returns pinned at " +
+        "exactly 1 across a sweep of party sizes from 2 to a few thousand, " +
+        "against the full distribution of how many people actually get " +
+        "their own hat in any one shuffle — usually 0 or 1, only rarely " +
+        "more, despite the mean sitting fixed at exactly 1 throughout.",
+    },
+    {
+      id: "absent-minded-passenger",
+      status: "planned",
+      name: "The absent-minded passenger problem",
+      blurb:
+        "The first passenger sits at random. The last one still has a 50% " +
+        "chance of getting their own seat back — whatever the plane's size.",
+      story:
+        "n passengers board a plane one at a time. The first has lost their " +
+        "boarding pass and sits in a random seat. Every passenger after " +
+        "that sits in their own assigned seat if it is free, and picks a " +
+        "random free seat if it is not. What is the probability the very " +
+        "last passenger ends up in their own seat? The answer is exactly " +
+        "1/2, for a 2-seat plane or a 500-seat one — a fixed constant where " +
+        "intuition expects the answer to erode as the plane gets bigger.",
+      note:
+        "Will simulate the boarding process at plane sizes from 2 to " +
+        "several hundred and hold the last passenger's own-seat " +
+        "probability up against a flat 50% line, then show why: the last " +
+        "seat's fate is decided the moment anyone sits in either the first " +
+        "or the last passenger's assigned seat, and by symmetry those two " +
+        "events are equally likely at every step along the way.",
+    },
+    {
+      id: "survivorship-bias",
+      status: "planned",
+      name: "Survivorship and observer selection",
+      blurb:
+        "Conditioning on being around to observe something can badly bias " +
+        "what you conclude about it.",
+      story:
+        "In World War II, the statistician Abraham Wald was asked where to " +
+        "add armour to bomber aircraft, using bullet-hole patterns mapped " +
+        "on planes that returned from missions. The obvious answer — " +
+        "reinforce where the holes are — was exactly backwards: those " +
+        "planes survived their holes. The panels with no holes on returning " +
+        "aircraft were the panels where a hit meant the plane never came " +
+        "back at all. The data that never returns is invisible by " +
+        "construction, and every conclusion drawn only from survivors " +
+        "inherits that blind spot — the same structure lurking behind fund " +
+        "performance tables missing the funds that closed, and behind " +
+        "anthropic arguments about why the universe looks fit for observers.",
+      note:
+        "Will simulate a population under attrition, show the damage " +
+        "pattern the naive survivors-only analysis sees, and hold it " +
+        "against the true pattern reconstructed once the non-survivors are " +
+        "put back in — the gap between the two is Wald's correction, " +
+        "drawn rather than just described.",
+    },
+    {
+      id: "martingale-doubling",
+      status: "planned",
+      name: "The martingale (doubling) betting system",
+      blurb:
+        "Double your bet after every loss and a win always makes you " +
+        "whole. The strategy hides an assumption nobody actually has: " +
+        "infinite money.",
+      story:
+        "Bet $1 on a coin flip. Lose, and bet $2 next time; lose again, bet " +
+        "$4; keep doubling until a win finally arrives and recoups every " +
+        "loss plus the original $1. On paper this is a sure thing — you " +
+        "stop the moment you are ahead, and a fair coin lands heads " +
+        "eventually with probability 1. In practice, the required bet after " +
+        "a run of k losses is 2^k, which reaches a casino's table limit or " +
+        "a gambler's actual bankroll after a surprisingly short losing " +
+        "streak, and the strategy's entire 'sure thing' is an average that " +
+        "quietly assumes losses of unbounded size never actually happen.",
+      note:
+        "Will run the doubling strategy against a bankroll and a table " +
+        "limit, both finite, and show the near-certain small wins " +
+        "accumulating right up until the rare ruinous streak arrives and " +
+        "erases them all at once — the same expectation-vs-typical-outcome " +
+        "gap the ergodic coin flip opens with, wearing a casino's clothes.",
+    },
+    {
+      id: "nontransitive-dice",
+      status: "planned",
+      name: "Nontransitive dice",
+      blurb:
+        "Die A tends to beat die B, B tends to beat C, and C tends to beat " +
+        "A. \"Better than\" does not have to line up in a row.",
+      story:
+        "Ordinary numbers are transitive: if A > B and B > C, then A > C, " +
+        "no exceptions. A set of dice, compared by which one rolls higher " +
+        "more often, does not have to obey the same rule. Bradley Efron " +
+        "built sets of four dice in the 1970s, popularised by Martin " +
+        "Gardner, where A beats B, B beats C, C beats D, and D turns around " +
+        "and beats A — a cycle with no top die. Offer to let an opponent " +
+        "choose first from such a set and hand them the apparent advantage " +
+        "of picking last; whichever they choose, another die in the set " +
+        "beats it more often than not.",
+      note:
+        "Will let you build a custom set of dice face by face and see the " +
+        "full head-to-head win-probability matrix update live, so " +
+        "constructing an actual nontransitive cycle is something you can " +
+        "do yourself rather than take on the page's word for.",
+    },
   ];
 
   /** Merge a scenario's fixed params with the live control values. */
